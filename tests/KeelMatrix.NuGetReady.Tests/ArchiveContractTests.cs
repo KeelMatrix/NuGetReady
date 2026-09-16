@@ -105,6 +105,20 @@ public sealed class ArchiveContractTests
     }
 
     [Fact]
+    public void Symbol_archive_without_a_portable_pdb_fails()
+    {
+        using var fixture = PackageFixture.Create();
+        fixture.AddSymbols("example-tool.1.2.3.snupkg", "example-tool", "1.2.3", includePdb: false);
+
+        var report = CheckRunner.Run(
+            Config("example-tool", "dotnetTool", "1.2.3", "example-tool.1.2.3.snupkg"),
+            fixture.ArtifactsPath);
+
+        Assert.Equal(1, report.ExitCode);
+        Assert.Contains(report.Failures, failure => failure.Message.Contains("symbol file", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public void Tool_command_must_match_the_configured_command()
     {
         using var fixture = PackageFixture.Create();
