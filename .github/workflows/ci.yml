@@ -1,0 +1,220 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+      DOTNET_NOLOGO: '1'
+      NUGET_XMLDOC_MODE: skip
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          global-json-file: global.json
+
+      - name: Restore and audit dependencies
+        shell: pwsh
+        run: |
+          dotnet restore KeelMatrix.NuGetReady.sln --configfile NuGet.config --nologo -p:NuGetAuditMode=all -p:NuGetAuditLevel=low -p:TreatWarningsAsErrors=true
+          if ($LASTEXITCODE -ne 0) { throw "Dependency restore or NuGet audit failed." }
+          dotnet list KeelMatrix.NuGetReady.sln package --vulnerable --include-transitive --configfile NuGet.config
+          if ($LASTEXITCODE -ne 0) { throw "Vulnerability audit command failed." }
+
+      - name: Verify format and static analysis
+        shell: pwsh
+        run: |
+          dotnet format KeelMatrix.NuGetReady.sln --verify-no-changes --no-restore --verbosity minimal
+          if ($LASTEXITCODE -ne 0) { throw "Formatting or code-style verification failed." }
+
+      - name: Build Release
+        shell: pwsh
+        run: |
+          dotnet build KeelMatrix.NuGetReady.sln --configuration Release --no-restore --nologo -p:UseSharedCompilation=false
+          if ($LASTEXITCODE -ne 0) { throw "Release build failed." }
+
+      - name: Run fixture corpus and regression tests
+        shell: pwsh
+        run: |
+          dotnet test KeelMatrix.NuGetReady.sln --configuration Release --no-build --no-restore --nologo --logger "console;verbosity=minimal"
+          if ($LASTEXITCODE -ne 0) { throw "Fixture corpus or regression tests failed." }
+
+      - name: Build Phase 0 fixture corpus
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = $env:GITHUB_WORKSPACE
+          $fixtureRoot = Join-Path $root 'tests/Fixtures/ReleaseCorpus'
+          $corpus = Join-Path $root 'artifacts/corpus'
+          $env:NUGET_PACKAGES = Join-Path $env:RUNNER_TEMP 'nugetready-corpus-packages'
+          $env:NUGET_HTTP_CACHE_PATH = Join-Path $env:RUNNER_TEMP 'nugetready-corpus-http-cache'
+          New-Item $env:NUGET_PACKAGES, $env:NUGET_HTTP_CACHE_PATH -ItemType Directory -Force | Out-Null
+          if (Test-Path $corpus) { Remove-Item $corpus -Recurse -Force }
+          New-Item $corpus -ItemType Directory -Force | Out-Null
+
+          $fixtures = @(
+            @{ Id = 'Fixture.Standard'; Kind = 'library'; Project = 'Standard/Standard.csproj' },
+            @{ Id = 'Fixture.MultiTarget'; Kind = 'multiTargetLibrary'; Project = 'MultiTarget/MultiTarget.csproj' },
+            @{ Id = 'Fixture.BuildAssets'; Kind = 'library'; Project = 'BuildAssets/BuildAssets.csproj' },
+            @{ Id = 'Fixture.Tool'; Kind = 'dotnetTool'; Project = 'Tool/Tool.csproj'; Command = 'fixture-tool'; Smoke = @('--help') },
+            @{ Id = 'Fixture.Related.Core'; Kind = 'library'; Project = 'Related.Core/Related.Core.csproj' },
+            @{ Id = 'Fixture.Related.Consumer'; Kind = 'library'; Project = 'Related.Consumer/Related.Consumer.csproj'; LocalSource = $true },
+            @{ Id = 'Fixture.Public.Source'; Kind = 'library'; Project = 'PublicSource/PublicSource.csproj' },
+            @{ Id = 'Fixture.PublicDependency'; Kind = 'library'; Project = 'PublicDependency/PublicDependency.csproj'; LocalSource = $true }
+          )
+
+          $expectations = @()
+          foreach ($fixture in $fixtures) {
+            $project = Join-Path $fixtureRoot $fixture.Project
+            $arguments = @(
+              'pack', $project,
+              '--configuration', 'Release',
+              '--output', $corpus,
+              '--include-symbols',
+              '-p:SymbolPackageFormat=snupkg',
+              '--configfile', (Join-Path $root 'NuGet.config'),
+              '--ignore-failed-sources',
+              '--disable-parallel',
+              '--nologo',
+              '-p:UseSharedCompilation=false'
+            )
+            if ($fixture.LocalSource) { $arguments += @('--source', $corpus) }
+            & dotnet @arguments
+            if ($LASTEXITCODE -ne 0) { throw "Fixture pack failed: $($fixture.Id)." }
+
+            $package = Get-ChildItem $corpus -Filter "$($fixture.Id).1.0.0.nupkg" -File | Select-Object -First 1
+            $symbols = Get-ChildItem $corpus -Filter "$($fixture.Id).1.0.0.snupkg" -File | Select-Object -First 1
+            if ($null -eq $package -or $null -eq $symbols) { throw "Fixture pack did not produce both archives: $($fixture.Id)." }
+            $expectation = [ordered]@{
+              id = $fixture.Id
+              kind = $fixture.Kind
+              version = '1.0.0'
+              artifacts = @($package.Name, $symbols.Name)
+            }
+            if ($fixture.Command) { $expectation.command = $fixture.Command }
+            if ($fixture.Smoke) { $expectation.smoke = $fixture.Smoke }
+            $expectations += $expectation
+          }
+
+          [ordered]@{ schemaVersion = 1; packages = $expectations } |
+            ConvertTo-Json -Depth 6 |
+            Set-Content (Join-Path $corpus 'nugetready.json') -Encoding utf8
+
+      - name: Create and inspect the tool package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $packages = Join-Path $env:GITHUB_WORKSPACE 'artifacts/packages'
+          if (Test-Path $packages) { Remove-Item $packages -Recurse -Force }
+          New-Item $packages -ItemType Directory -Force | Out-Null
+          dotnet pack src/KeelMatrix.NuGetReady/KeelMatrix.NuGetReady.csproj --configuration Release --no-build --no-restore --include-symbols -p:SymbolPackageFormat=snupkg --output $packages --nologo -p:UseSharedCompilation=false
+          if ($LASTEXITCODE -ne 0) { throw "Tool package creation failed." }
+          dotnet run --project src/KeelMatrix.NuGetReady/KeelMatrix.NuGetReady.csproj --configuration Release --no-build --no-restore -- check --config nugetready.json --artifacts $packages --format json
+          if ($LASTEXITCODE -ne 0) { throw "Built tool package inspection failed." }
+
+      - name: Install and use the built tool from an isolated feed
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = $env:GITHUB_WORKSPACE
+          $runRoot = Join-Path $env:RUNNER_TEMP 'nugetready-self-install'
+          if (Test-Path $runRoot) { Remove-Item $runRoot -Recurse -Force }
+          $feed = Join-Path $runRoot 'feed'
+          $cache = Join-Path $runRoot 'packages'
+          $httpCache = Join-Path $runRoot 'http-cache'
+          $cliHome = Join-Path $runRoot 'cli-home'
+          $toolPath = Join-Path $runRoot 'tool'
+          $publicSubstitute = Join-Path $runRoot 'public-substitute'
+          $negativeLocal = Join-Path $runRoot 'negative-local'
+          New-Item $feed, $cache, $httpCache, $cliHome, $toolPath, $publicSubstitute, $negativeLocal -ItemType Directory -Force | Out-Null
+          Copy-Item (Join-Path $root 'artifacts/packages/KeelMatrix.NuGetReady.0.1.0.nupkg') $feed
+
+          $config = Join-Path $runRoot 'NuGet.config'
+          @"
+          <?xml version="1.0" encoding="utf-8"?>
+          <configuration>
+            <packageSources>
+              <clear />
+              <add key="local" value="$($feed.Replace('&', '&amp;'))" />
+              <add key="public" value="https://api.nuget.org/v3/index.json" />
+            </packageSources>
+            <packageSourceMapping>
+              <clear />
+              <packageSource key="local"><package pattern="KeelMatrix.NuGetReady" /></packageSource>
+              <packageSource key="public">
+                <package pattern="NuGet.*" />
+                <package pattern="Microsoft.*" />
+                <package pattern="System.*" />
+                <package pattern="runtime.*" />
+                <package pattern="NETStandard.Library" />
+                <package pattern="NETCore.App.*" />
+              </packageSource>
+            </packageSourceMapping>
+          </configuration>
+          "@ | Set-Content $config -Encoding utf8
+
+          $env:NUGET_PACKAGES = $cache
+          $env:NUGET_HTTP_CACHE_PATH = $httpCache
+          $env:DOTNET_CLI_HOME = $cliHome
+          $env:DOTNET_SKIP_FIRST_TIME_EXPERIENCE = '1'
+          dotnet tool install KeelMatrix.NuGetReady --version 0.1.0 --tool-path $toolPath --configfile $config --no-cache --verbosity quiet
+          if ($LASTEXITCODE -ne 0) { throw "Isolated local-feed tool installation failed." }
+
+          $toolName = if ($IsWindows) { 'nugetready.exe' } else { 'nugetready' }
+          $tool = Join-Path $toolPath $toolName
+          if (-not (Test-Path $tool)) { throw "The isolated tool executable was not created." }
+          $corpusConfig = Join-Path $root 'artifacts/corpus/nugetready.json'
+          $corpus = Join-Path $root 'artifacts/corpus'
+          & $tool check --config $corpusConfig --artifacts $corpus --format json
+          if ($LASTEXITCODE -ne 0) { throw "The installed tool failed the end-to-end Phase 0 corpus rehearsal." }
+
+          # A copy in a published-looking source must not satisfy the exact local mapping.
+          Copy-Item (Join-Path $root 'artifacts/packages/KeelMatrix.NuGetReady.0.1.0.nupkg') $publicSubstitute
+          $negativeConfig = Join-Path $runRoot 'negative.config'
+          @"
+          <?xml version="1.0" encoding="utf-8"?>
+          <configuration>
+            <packageSources>
+              <clear />
+              <add key="local" value="$($negativeLocal.Replace('&', '&amp;'))" />
+              <add key="published" value="$($publicSubstitute.Replace('&', '&amp;'))" />
+            </packageSources>
+            <packageSourceMapping>
+              <clear />
+              <packageSource key="local"><package pattern="KeelMatrix.NuGetReady" /></packageSource>
+              <packageSource key="published"><package pattern="NuGet.*" /></packageSource>
+            </packageSourceMapping>
+          </configuration>
+          "@ | Set-Content $negativeConfig -Encoding utf8
+          $negativeToolPath = Join-Path $runRoot 'negative-tool'
+          New-Item $negativeToolPath -ItemType Directory -Force | Out-Null
+          dotnet tool install KeelMatrix.NuGetReady --version 0.1.0 --tool-path $negativeToolPath --configfile $negativeConfig --no-cache --verbosity quiet
+          if ($LASTEXITCODE -eq 0) { throw "A published-looking substitute satisfied the exact local package mapping." }
+
+      - name: Verify cached substitution is rejected
+        shell: pwsh
+        run: |
+          dotnet test tests/KeelMatrix.NuGetReady.Tests/KeelMatrix.NuGetReady.Tests.csproj --configuration Release --no-build --no-restore --nologo --filter "FullyQualifiedName~Preexisting_cached_copy_is_rejected_before_restore"
+          if ($LASTEXITCODE -ne 0) { throw "Cached package substitution regression failed." }
