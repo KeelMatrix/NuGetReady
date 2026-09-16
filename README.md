@@ -2,10 +2,15 @@
 
 `dotnet pack` succeeding does not prove your release is ready. NuGetReady checks the exact artifact set and package archive, then rehearses isolated consumer restore or tool installation from the artifacts you just built.
 
-## Install and first check
+## Install
 
 ```bash
 dotnet tool install --global KeelMatrix.NuGetReady
+```
+
+## Quick Start
+
+```bash
 nugetready check --artifacts ./artifacts/packages
 ```
 
