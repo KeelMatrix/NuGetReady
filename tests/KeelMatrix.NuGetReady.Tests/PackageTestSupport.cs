@@ -65,7 +65,9 @@ internal sealed partial class PackedCorpus : IDisposable
                 ["DOTNET_NOLOGO"] = "1",
                 ["NUGET_PACKAGES"] = PackageCachePath,
                 ["NUGET_HTTP_CACHE_PATH"] = Path.Combine(Root.FullName, "http-cache"),
-                ["NUGET_XMLDOC_MODE"] = "skip"
+                ["NUGET_XMLDOC_MODE"] = "skip",
+                ["MSBUILDDISABLENODEREUSE"] = "1",
+                ["DOTNET_CLI_TELEMETRY_OPTOUT"] = "1"
             },
             TimeSpan.FromMinutes(3)).GetAwaiter().GetResult();
         if (!result.Started || result.TimedOut || result.ExitCode != 0)

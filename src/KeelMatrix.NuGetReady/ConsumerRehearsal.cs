@@ -85,7 +85,9 @@ internal static class ConsumerRehearsal
                 ["NUGET_HTTP_CACHE_PATH"] = Path.Combine(root.FullName, "http-cache"),
                 ["DOTNET_CLI_HOME"] = cliHome,
                 ["DOTNET_NOLOGO"] = "1",
-                ["NUGET_XMLDOC_MODE"] = "skip"
+                ["NUGET_XMLDOC_MODE"] = "skip",
+                ["MSBUILDDISABLENODEREUSE"] = "1",
+                ["DOTNET_CLI_TELEMETRY_OPTOUT"] = "1"
             };
 
             foreach (var package in config.Packages!)
@@ -162,7 +164,7 @@ internal static class ConsumerRehearsal
         }
 
         var build = await RunDotnetAsync(
-            ["build", projectPath, "--no-restore", "--nologo", "--configuration", "Release"],
+            ["build", projectPath, "--no-restore", "--nologo", "--configuration", "Release", "-p:UseSharedCompilation=false"],
             packageRoot,
             environment,
             timeout).ConfigureAwait(false);

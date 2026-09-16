@@ -1,5 +1,7 @@
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
 using System.Text;
 
 namespace KeelMatrix.NuGetReady;
@@ -59,26 +61,36 @@ internal static class BoundedProcess
             return new ProcessResult(false, -1, false, string.Empty, "The required process was not found.");
         }
 
-        var standardOutput = CaptureAsync(process.StandardOutput, outputLimit, cancellationToken);
-        var standardError = CaptureAsync(process.StandardError, outputLimit, cancellationToken);
-        var waitForExit = process.WaitForExitAsync(cancellationToken);
-        var timeoutTask = Task.Delay(timeout, cancellationToken);
-        var completed = await Task.WhenAny(waitForExit, timeoutTask).ConfigureAwait(false);
-        var timedOut = completed != waitForExit;
-
-        if (timedOut)
+        WindowsProcessJob? processJob = WindowsProcessJob.TryAttach(process);
+        try
         {
-            TryKill(process);
-            await process.WaitForExitAsync(CancellationToken.None).ConfigureAwait(false);
-        }
+            var standardOutput = CaptureAsync(process.StandardOutput, outputLimit, cancellationToken);
+            var standardError = CaptureAsync(process.StandardError, outputLimit, cancellationToken);
+            var waitForExit = process.WaitForExitAsync(cancellationToken);
+            var timeoutTask = Task.Delay(timeout, cancellationToken);
+            var completed = await Task.WhenAny(waitForExit, timeoutTask).ConfigureAwait(false);
+            var timedOut = completed != waitForExit;
 
-        await Task.WhenAll(standardOutput, standardError).ConfigureAwait(false);
-        return new ProcessResult(
-            true,
-            timedOut ? -1 : process.ExitCode,
-            timedOut,
-            standardOutput.Result,
-            standardError.Result);
+            if (timedOut)
+            {
+                TryKill(process);
+                await process.WaitForExitAsync(CancellationToken.None).ConfigureAwait(false);
+            }
+
+            processJob?.Dispose();
+            processJob = null;
+            await Task.WhenAll(standardOutput, standardError).ConfigureAwait(false);
+            return new ProcessResult(
+                true,
+                timedOut ? -1 : process.ExitCode,
+                timedOut,
+                standardOutput.Result,
+                standardError.Result);
+        }
+        finally
+        {
+            processJob?.Dispose();
+        }
     }
 
     private static async Task<string> CaptureAsync(StreamReader reader, int limit, CancellationToken cancellationToken)
@@ -129,6 +141,149 @@ internal static class BoundedProcess
         }
         catch (System.ComponentModel.Win32Exception)
         {
+        }
+    }
+
+    private sealed class WindowsProcessJob : IDisposable
+    {
+        private SafeJobHandle? handle;
+
+        private WindowsProcessJob(SafeJobHandle handle)
+        {
+            this.handle = handle;
+        }
+
+        public static WindowsProcessJob? TryAttach(Process process)
+        {
+            if (!OperatingSystem.IsWindows())
+            {
+                return null;
+            }
+
+            SafeJobHandle? job = null;
+            try
+            {
+                job = CreateJobObject(IntPtr.Zero, null);
+                if (job is null || job.IsInvalid)
+                {
+                    return null;
+                }
+
+                var limits = new JobObjectExtendedLimitInformation
+                {
+                    BasicLimitInformation = new JobObjectBasicLimitInformation
+                    {
+                        LimitFlags = JobObjectLimitKillOnJobClose
+                    }
+                };
+
+                if (!SetInformationJobObject(
+                        job,
+                        JobObjectExtendedLimitInformationClass,
+                        ref limits,
+                        checked((uint)Marshal.SizeOf<JobObjectExtendedLimitInformation>())))
+                {
+                    return null;
+                }
+
+                if (!AssignProcessToJobObject(job, process.Handle))
+                {
+                    return null;
+                }
+
+                var attachedJob = new WindowsProcessJob(job);
+                job = null;
+                return attachedJob;
+            }
+            catch (InvalidOperationException)
+            {
+                return null;
+            }
+            catch (Win32Exception)
+            {
+                return null;
+            }
+            finally
+            {
+                job?.Dispose();
+            }
+        }
+
+        public void Dispose()
+        {
+            handle?.Dispose();
+            handle = null;
+        }
+
+        private const int JobObjectExtendedLimitInformationClass = 9;
+        private const uint JobObjectLimitKillOnJobClose = 0x2000;
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern SafeJobHandle CreateJobObject(IntPtr jobAttributes, string? name);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool SetInformationJobObject(
+            SafeJobHandle job,
+            int informationClass,
+            ref JobObjectExtendedLimitInformation limits,
+            uint limitsLength);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool AssignProcessToJobObject(SafeJobHandle job, IntPtr process);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct JobObjectBasicLimitInformation
+        {
+            public long PerProcessUserTimeLimit;
+            public long PerJobUserTimeLimit;
+            public uint LimitFlags;
+            public UIntPtr MinimumWorkingSetSize;
+            public UIntPtr MaximumWorkingSetSize;
+            public uint ActiveProcessLimit;
+            public UIntPtr Affinity;
+            public uint PriorityClass;
+            public uint SchedulingClass;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct IoCounters
+        {
+            public ulong ReadOperationCount;
+            public ulong WriteOperationCount;
+            public ulong OtherOperationCount;
+            public ulong ReadTransferCount;
+            public ulong WriteTransferCount;
+            public ulong OtherTransferCount;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct JobObjectExtendedLimitInformation
+        {
+            public JobObjectBasicLimitInformation BasicLimitInformation;
+            public IoCounters IoInfo;
+            public UIntPtr ProcessMemoryLimit;
+            public UIntPtr JobMemoryLimit;
+            public UIntPtr PeakProcessMemoryUsed;
+            public UIntPtr PeakJobMemoryUsed;
+        }
+
+        private sealed class SafeJobHandle : SafeHandleZeroOrMinusOneIsInvalid
+        {
+            public SafeJobHandle()
+                : base(ownsHandle: true)
+            {
+            }
+
+            protected override bool ReleaseHandle()
+            {
+                return CloseHandle(handle);
+            }
+
+            [DllImport("kernel32.dll", SetLastError = true)]
+            [return: MarshalAs(UnmanagedType.Bool)]
+            private static extern bool CloseHandle(IntPtr handle);
         }
     }
 }
