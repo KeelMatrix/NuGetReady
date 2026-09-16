@@ -1,3 +1,6 @@
+using System.Reflection;
+using System.Reflection.Metadata;
+using System.Reflection.PortableExecutable;
 using System.Xml.Linq;
 using NuGet.Packaging;
 
@@ -9,6 +12,10 @@ internal sealed record ConsumerRehearsalOptions(
     string? PublicFeedPath = null);
 
 internal sealed record RehearsalOutcome(RehearsalResult Result, string Diagnostic);
+
+internal sealed record LibraryTarget(string Framework, IReadOnlyList<string> ApiTypes);
+
+internal sealed record TargetRehearsalOutcome(bool Passed, bool IsError, string Diagnostic);
 
 internal static class ConsumerRehearsal
 {
@@ -107,7 +114,7 @@ internal static class ConsumerRehearsal
                 var packageRoot = Directory.CreateDirectory(Path.Combine(root.FullName, SanitizeDirectoryName(package.Id!))).FullName;
                 var packageResult = package.Kind!.Equals("dotnetTool", StringComparison.OrdinalIgnoreCase)
                     ? RunToolAsync(package, packagePath, packageRoot, configPath, environment, timeout).GetAwaiter().GetResult()
-                    : RunLibraryAsync(package, packageRoot, configPath, environment, timeout).GetAwaiter().GetResult();
+                    : RunLibraryAsync(package, packagePath, packageRoot, configPath, environment, timeout).GetAwaiter().GetResult();
                 results.Add(packageResult);
             }
 
@@ -130,6 +137,62 @@ internal static class ConsumerRehearsal
 
     private static async Task<RehearsalOutcome> RunLibraryAsync(
         PackageExpectation package,
+        string packagePath,
+        string packageRoot,
+        string configPath,
+        IReadOnlyDictionary<string, string?> environment,
+        TimeSpan timeout)
+    {
+        IReadOnlyList<LibraryTarget> targets;
+        try
+        {
+            targets = ReadLibraryTargets(packagePath);
+        }
+        catch (BadImageFormatException)
+        {
+            return Failure(package, "The package contains an invalid library assembly.", false);
+        }
+        catch (InvalidDataException)
+        {
+            return Failure(package, "The package does not contain a usable public library contract.", false);
+        }
+        catch (IOException)
+        {
+            return Failure(package, "The package library assemblies could not be inspected.", true);
+        }
+
+        var diagnostics = new List<string>();
+        foreach (var target in targets)
+        {
+            var targetRoot = Directory.CreateDirectory(Path.Combine(packageRoot, SanitizeDirectoryName(target.Framework))).FullName;
+            var outcome = await RunLibraryTargetAsync(
+                package,
+                target,
+                targetRoot,
+                configPath,
+                environment,
+                timeout).ConfigureAwait(false);
+            if (!outcome.Passed)
+            {
+                var message = $"The isolated library consumer did not complete for target framework '{target.Framework}'.";
+                return Failure(package, message, outcome.IsError, outcome.Diagnostic);
+            }
+
+            if (!string.IsNullOrWhiteSpace(outcome.Diagnostic))
+            {
+                diagnostics.Add($"[{target.Framework}]\n{outcome.Diagnostic}");
+            }
+        }
+
+        return Success(
+            package,
+            $"Isolated library consumer restored and built against the public API for {string.Join(", ", targets.Select(target => target.Framework))}.",
+            string.Join("\n", diagnostics));
+    }
+
+    private static async Task<TargetRehearsalOutcome> RunLibraryTargetAsync(
+        PackageExpectation package,
+        LibraryTarget target,
         string packageRoot,
         string configPath,
         IReadOnlyDictionary<string, string?> environment,
@@ -137,30 +200,52 @@ internal static class ConsumerRehearsal
     {
         var projectPath = Path.Combine(packageRoot, "Consumer.csproj");
         var sourcePath = Path.Combine(packageRoot, "Program.cs");
+        var outputType = IsRunnableConsumerTargetFramework(target.Framework) ? "Exe" : "Library";
+        var apiTypes = string.Join(", ", target.ApiTypes.Select(type => $"typeof({type})"));
+        var source = $$"""
+            using System;
+
+            public static class ConsumerProbe
+            {
+                public static Type[] ShippedApiTypes { get; } = new[] { {{apiTypes}} };
+            }
+            """;
+        if (outputType.Equals("Exe", StringComparison.Ordinal))
+        {
+            source += """
+
+            internal static class Program
+            {
+                public static void Main() => Console.WriteLine($"consumer-api:{ConsumerProbe.ShippedApiTypes.Length}");
+            }
+            """;
+        }
+
         await File.WriteAllTextAsync(projectPath, $"""
             <Project Sdk="Microsoft.NET.Sdk">
               <PropertyGroup>
-                <OutputType>Exe</OutputType>
-                <TargetFramework>net8.0</TargetFramework>
-                <ImplicitUsings>enable</ImplicitUsings>
+                <OutputType>{outputType}</OutputType>
+                <TargetFramework>{EscapeXml(target.Framework)}</TargetFramework>
+                <ImplicitUsings>disable</ImplicitUsings>
                 <UseAppHost>false</UseAppHost>
                 <RestoreNoCache>true</RestoreNoCache>
+                <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
               </PropertyGroup>
               <ItemGroup>
                 <PackageReference Include="{EscapeXml(package.Id!)}" Version="{EscapeXml(VersionText.Normalize(package.Version!))}" />
               </ItemGroup>
             </Project>
             """).ConfigureAwait(false);
-        await File.WriteAllTextAsync(sourcePath, "Console.WriteLine(\"consumer-ok\");\n").ConfigureAwait(false);
+        await File.WriteAllTextAsync(sourcePath, source).ConfigureAwait(false);
 
         var restore = await RunDotnetAsync(
             ["restore", projectPath, "--configfile", configPath, "--no-cache", "--force-evaluate", "--nologo"],
             packageRoot,
             environment,
             timeout).ConfigureAwait(false);
-        if (!Succeeded(restore))
+        if (!Succeeded(restore) || HasUnusableAssetDiagnostic(restore))
         {
-            return Failure(package, "The isolated library consumer could not restore the exact package.", IsInfrastructure(restore), Combine(restore));
+            return new TargetRehearsalOutcome(false, IsInfrastructure(restore), Combine(restore));
         }
 
         var build = await RunDotnetAsync(
@@ -168,9 +253,30 @@ internal static class ConsumerRehearsal
             packageRoot,
             environment,
             timeout).ConfigureAwait(false);
-        return Succeeded(build)
-            ? Success(package, "Isolated library consumer restored and built.", Combine(build))
-            : Failure(package, "The isolated library consumer did not build.", IsInfrastructure(build), Combine(build));
+        if (!Succeeded(build) || HasUnusableAssetDiagnostic(build))
+        {
+            return new TargetRehearsalOutcome(false, IsInfrastructure(build), Combine(build));
+        }
+
+        if (!IsRunnableConsumerTargetFramework(target.Framework))
+        {
+            return new TargetRehearsalOutcome(true, false, Combine(build));
+        }
+
+        var outputAssembly = Path.Combine(packageRoot, "bin", "Release", target.Framework, "Consumer.dll");
+        if (!File.Exists(outputAssembly))
+        {
+            return new TargetRehearsalOutcome(false, false, "The built consumer assembly was not found.");
+        }
+
+        var run = await RunDotnetAsync(
+            [outputAssembly],
+            packageRoot,
+            environment,
+            timeout).ConfigureAwait(false);
+        return Succeeded(run) && !HasUnusableAssetDiagnostic(run)
+            ? new TargetRehearsalOutcome(true, false, Combine(run))
+            : new TargetRehearsalOutcome(false, IsInfrastructure(run), Combine(run));
     }
 
     private static async Task<RehearsalOutcome> RunToolAsync(
@@ -225,6 +331,23 @@ internal static class ConsumerRehearsal
         return result.Started && !result.TimedOut && result.ExitCode == 0;
     }
 
+    private static bool HasUnusableAssetDiagnostic(ProcessResult result)
+    {
+        var output = string.Join("\n", result.StandardOutput, result.StandardError);
+        return UnusableAssetMarkers.Any(marker => output.Contains(marker, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static readonly string[] UnusableAssetMarkers =
+    {
+        "MSB3246",
+        "bad image",
+        "bad-image",
+        "image is too small",
+        "could not load file or assembly",
+        "is not a valid win32 application",
+        "metadata is invalid"
+    };
+
     private static bool IsInfrastructure(ProcessResult result)
     {
         return !result.Started || result.TimedOut;
@@ -257,6 +380,133 @@ internal static class ConsumerRehearsal
         }
 
         return null;
+    }
+
+    private static LibraryTarget[] ReadLibraryTargets(string packagePath)
+    {
+        using var reader = new PackageArchiveReader(packagePath);
+        var assemblyPaths = reader.GetFiles()
+            .Select(NormalizeArchivePath)
+            .Select(path => (Path: path, Parts: path.Split('/')))
+            .Where(item => item.Parts.Length == 3 &&
+                           (item.Parts[0].Equals("lib", StringComparison.OrdinalIgnoreCase) ||
+                            item.Parts[0].Equals("ref", StringComparison.OrdinalIgnoreCase)) &&
+                           item.Parts[2].EndsWith(".dll", StringComparison.OrdinalIgnoreCase))
+            .OrderBy(item => item.Parts[1], StringComparer.OrdinalIgnoreCase)
+            .ThenBy(item => item.Parts[1], StringComparer.Ordinal)
+            .ThenBy(item => item.Path, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(item => item.Path, StringComparer.Ordinal)
+            .ToArray();
+
+        if (assemblyPaths.Length == 0)
+        {
+            throw new InvalidDataException("No library assemblies were found.");
+        }
+
+        var targets = new List<LibraryTarget>();
+        foreach (var targetGroup in assemblyPaths.GroupBy(item => item.Parts[1], StringComparer.OrdinalIgnoreCase))
+        {
+            var referenceAssets = targetGroup
+                .Where(item => item.Parts[0].Equals("ref", StringComparison.OrdinalIgnoreCase))
+                .ToArray();
+            var publicTypes = new List<string>();
+            foreach (var asset in targetGroup)
+            {
+                using var stream = reader.GetStream(asset.Path);
+                var publicType = ReadPublicType(stream);
+                if (publicType is not null && (referenceAssets.Length == 0 || asset.Parts[0].Equals("ref", StringComparison.OrdinalIgnoreCase)))
+                {
+                    publicTypes.Add(publicType);
+                }
+            }
+
+            if (publicTypes.Count == 0)
+            {
+                throw new InvalidDataException($"No public type was found for target framework '{targetGroup.Key}'.");
+            }
+
+            targets.Add(new LibraryTarget(
+                targetGroup.Key,
+                publicTypes.Distinct(StringComparer.Ordinal).OrderBy(type => type, StringComparer.Ordinal).ToArray()));
+        }
+
+        return targets
+            .OrderBy(target => target.Framework, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(target => target.Framework, StringComparer.Ordinal)
+            .ToArray();
+    }
+
+    private static string? ReadPublicType(Stream stream)
+    {
+        using var image = new MemoryStream();
+        stream.CopyTo(image);
+        image.Position = 0;
+        using var peReader = new PEReader(image);
+        if (!peReader.HasMetadata)
+        {
+            throw new BadImageFormatException("The library asset does not contain managed assembly metadata.");
+        }
+
+        var metadata = peReader.GetMetadataReader();
+        return metadata.TypeDefinitions
+            .Select(metadata.GetTypeDefinition)
+            .Where(definition => (definition.Attributes & TypeAttributes.VisibilityMask) == TypeAttributes.Public)
+            .Select(definition => (definition, Name: metadata.GetString(definition.Name)))
+            .Where(item => item.Name is not "<Module>" && !item.Name.Contains('<', StringComparison.Ordinal))
+            .Where(item => IsSupportedTypeName(item.Name))
+            .OrderBy(item => metadata.GetString(item.definition.Namespace), StringComparer.Ordinal)
+            .ThenBy(item => item.Name, StringComparer.Ordinal)
+            .Select(item => FormatTypeName(metadata, item.definition, item.Name))
+            .FirstOrDefault();
+    }
+
+    private static string FormatTypeName(MetadataReader metadata, TypeDefinition definition, string metadataName)
+    {
+        var tick = metadataName.IndexOf('`');
+        var name = EscapeCSharpIdentifier(tick >= 0 ? metadataName[..tick] : metadataName);
+        var genericCount = definition.GetGenericParameters().Count;
+        if (genericCount > 0)
+        {
+            name += $"<{new string(',', genericCount - 1)}>";
+        }
+
+        var namespaceName = metadata.GetString(definition.Namespace);
+        var qualifiedNamespace = string.IsNullOrWhiteSpace(namespaceName)
+            ? string.Empty
+            : string.Join(".", namespaceName.Split('.').Select(EscapeCSharpIdentifier));
+        return $"global::{(qualifiedNamespace.Length == 0 ? string.Empty : qualifiedNamespace + ".")}{name}";
+    }
+
+    private static bool IsSupportedTypeName(string metadataName)
+    {
+        var tick = metadataName.IndexOf('`');
+        var name = tick >= 0 ? metadataName[..tick] : metadataName;
+        return IsCSharpIdentifier(name);
+    }
+
+    private static bool IsCSharpIdentifier(string value)
+    {
+        return value.Length > 0 &&
+               (char.IsLetter(value[0]) || value[0] == '_') &&
+               value.Skip(1).All(character => char.IsLetterOrDigit(character) || character == '_');
+    }
+
+    private static string EscapeCSharpIdentifier(string value)
+    {
+        return $"@{value}";
+    }
+
+    private static bool IsRunnableConsumerTargetFramework(string framework)
+    {
+        return framework.StartsWith("net", StringComparison.OrdinalIgnoreCase) &&
+               !framework.StartsWith("netstandard", StringComparison.OrdinalIgnoreCase) &&
+               framework.Length > 3 && char.IsDigit(framework[3]) && int.TryParse(new string(framework.Skip(3).TakeWhile(char.IsDigit).ToArray()), out var major) &&
+               major >= 5;
+    }
+
+    private static string NormalizeArchivePath(string path)
+    {
+        return path.Replace('\\', '/').TrimStart('/');
     }
 
     private static HashSet<string> ReadPublicDependencyIds(

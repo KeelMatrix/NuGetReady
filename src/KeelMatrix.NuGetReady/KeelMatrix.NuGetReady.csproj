@@ -29,7 +29,7 @@
 
   <ItemGroup>
     <PackageReference Include="NuGet.Packaging" />
-    <None Include="..\..\README.md" Pack="true" PackagePath="README.md" Link="README.md" Visible="false" />
+    <None Include="README.md" Pack="true" PackagePath="README.md" />
     <None Include="..\..\icon.png" Pack="true" PackagePath="icon.png" Link="icon.png" Visible="false" />
   </ItemGroup>
 </Project>

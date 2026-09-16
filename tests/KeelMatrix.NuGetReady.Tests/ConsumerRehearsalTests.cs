@@ -1,3 +1,5 @@
+using System.IO.Compression;
+
 namespace KeelMatrix.NuGetReady.Tests;
 
 public sealed class ConsumerRehearsalTests
@@ -20,6 +22,9 @@ public sealed class ConsumerRehearsalTests
 
         Assert.Equal(4, outcomes.Count);
         Assert.All(outcomes, outcome => Assert.Equal("pass", outcome.Result.Status));
+        Assert.Contains("net8.0", outcomes.Single(outcome => outcome.Result.PackageId == "Fixture.MultiTarget").Result.Message, StringComparison.Ordinal);
+        Assert.Contains("netstandard2.1", outcomes.Single(outcome => outcome.Result.PackageId == "Fixture.MultiTarget").Result.Message, StringComparison.Ordinal);
+        Assert.Contains("consumer-api:", outcomes.Single(outcome => outcome.Result.PackageId == "Fixture.Standard").Diagnostic, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -144,6 +149,81 @@ public sealed class ConsumerRehearsalTests
         Assert.Single(outcomes);
         Assert.Equal("error", outcomes[0].Result.Status);
         Assert.Contains("cached substitution", outcomes[0].Result.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Corrupted_library_asset_for_each_declared_target_framework_fails_the_check()
+    {
+        using var corpus = PackedCorpus.Create();
+        var standard = corpus.Pack("Standard/Standard.csproj");
+        var multiTarget = corpus.Pack("MultiTarget/MultiTarget.csproj");
+        var buildAssets = corpus.Pack("BuildAssets/BuildAssets.csproj");
+        var relatedCore = corpus.Pack("Related.Core/Related.Core.csproj");
+        var relatedConsumer = corpus.Pack("Related.Consumer/Related.Consumer.csproj", corpus.OutputPath);
+        var publicSource = corpus.Pack("PublicSource/PublicSource.csproj");
+        var publicDependency = corpus.Pack("PublicDependency/PublicDependency.csproj", corpus.OutputPath);
+        var fixtures = new List<(string Id, string Kind, string PackagePath, List<(string Id, string Kind, string PackagePath)> Dependencies)>
+        {
+            ("Fixture.Standard", "library", standard, new()),
+            ("Fixture.MultiTarget", "multiTargetLibrary", multiTarget, new()),
+            ("Fixture.BuildAssets", "library", buildAssets, new()),
+            ("Fixture.Related.Core", "library", relatedCore, new()),
+            ("Fixture.Related.Consumer", "library", relatedConsumer, new() { ("Fixture.Related.Core", "library", relatedCore) }),
+            ("Fixture.Public.Source", "library", publicSource, new()),
+            ("Fixture.PublicDependency", "library", publicDependency, new() { ("Fixture.Public.Source", "library", publicSource) })
+        };
+
+        foreach (var fixture in fixtures)
+        {
+            using var archive = ZipFile.OpenRead(fixture.PackagePath);
+            var libraryAssets = archive.Entries
+                .Where(entry => entry.FullName.StartsWith("lib/", StringComparison.OrdinalIgnoreCase))
+                .Where(entry => entry.FullName.EndsWith(".dll", StringComparison.OrdinalIgnoreCase))
+                .Select(entry => entry.FullName)
+                .OrderBy(path => path, StringComparer.Ordinal)
+                .ToArray();
+
+            Assert.NotEmpty(libraryAssets);
+            foreach (var libraryAsset in libraryAssets)
+            {
+                var artifact = $"{fixture.Id}.1.0.0.nupkg";
+                var corruptedArtifact = $"corrupted-{fixture.Id}-{libraryAsset.Replace('/', '-')}.nupkg";
+                var corrupted = ArchiveMutator.ReplaceEntry(fixture.PackagePath, libraryAsset, new byte[64], corruptedArtifact);
+                var caseRoot = Directory.CreateDirectory(Path.Combine(corpus.Root.FullName, "corrupted", fixture.Id, libraryAsset.Replace('/', '-')));
+                File.Copy(corrupted, Path.Combine(caseRoot.FullName, artifact));
+                var expectations = new List<PackageExpectation>
+                {
+                    new()
+                    {
+                        Id = fixture.Id,
+                        Kind = fixture.Kind,
+                        Version = "1.0.0",
+                        Artifacts = new List<string> { artifact }
+                    }
+                };
+                foreach (var dependency in fixture.Dependencies)
+                {
+                    var dependencyArtifact = Path.GetFileName(dependency.PackagePath);
+                    File.Copy(dependency.PackagePath, Path.Combine(caseRoot.FullName, dependencyArtifact));
+                    expectations.Add(new PackageExpectation
+                    {
+                        Id = dependency.Id,
+                        Kind = dependency.Kind,
+                        Version = "1.0.0",
+                        Artifacts = new List<string> { dependencyArtifact }
+                    });
+                }
+
+                var report = CheckRunner.Run(
+                    Config(expectations.ToArray()),
+                    caseRoot.FullName,
+                    corpus.RepositoryRoot,
+                    TimeSpan.FromMinutes(2));
+
+                Assert.NotEqual("pass", report.Status);
+                Assert.NotEqual(0, report.ExitCode);
+            }
+        }
     }
 
     private static NuGetReadyConfig Config(params PackageExpectation[] packages)
