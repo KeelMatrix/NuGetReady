@@ -61,7 +61,7 @@ jobs:
           dotnet test KeelMatrix.NuGetReady.sln --configuration Release --no-build --no-restore --nologo --logger "console;verbosity=minimal"
           if ($LASTEXITCODE -ne 0) { throw "Fixture corpus or regression tests failed." }
 
-      - name: Build Phase 0 fixture corpus
+      - name: Build fixture corpus
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -188,7 +188,7 @@ jobs:
           $corpusConfig = Join-Path $root 'artifacts/corpus/nugetready.json'
           $corpus = Join-Path $root 'artifacts/corpus'
           & $tool check --config $corpusConfig --artifacts $corpus --format json
-          if ($LASTEXITCODE -ne 0) { throw "The installed tool failed the end-to-end Phase 0 corpus rehearsal." }
+          if ($LASTEXITCODE -ne 0) { throw "The installed tool failed the end-to-end corpus rehearsal." }
 
           # A copy in a published-looking source must not satisfy the exact local mapping.
           Copy-Item (Join-Path $root 'artifacts/packages/KeelMatrix.NuGetReady.0.1.0.nupkg') $publicSubstitute
