@@ -36,7 +36,7 @@ internal sealed class PackageExpectation
     public string? Command { get; set; }
 }
 
-internal sealed record Failure(string CheckId, string Message, bool IsError = false);
+internal sealed record Failure(string CheckId, string Message, bool IsError = false, bool IsWarning = false);
 
 internal sealed class CheckResult
 {
@@ -46,7 +46,9 @@ internal sealed class CheckResult
         Failures = failures.OrderBy(failure => failure.Message, StringComparer.Ordinal).ToArray();
         Status = Failures.Any(failure => failure.IsError)
             ? "error"
-            : Failures.Count == 0 ? "pass" : "fail";
+            : Failures.Any(failure => !failure.IsWarning)
+                ? "fail"
+                : Failures.Count == 0 ? "pass" : "warn";
     }
 
     public string Id { get; }
@@ -55,6 +57,13 @@ internal sealed class CheckResult
 
     public IReadOnlyList<Failure> Failures { get; }
 }
+
+internal sealed record RehearsalResult(
+    string PackageId,
+    string Kind,
+    string Status,
+    string Message,
+    bool IsError = false);
 
 internal sealed class ReadinessReport
 {
@@ -71,6 +80,8 @@ internal sealed class ReadinessReport
     public IReadOnlyList<CheckResult> Checks { get; init; } = Array.Empty<CheckResult>();
 
     public IReadOnlyList<Failure> Failures { get; init; } = Array.Empty<Failure>();
+
+    public IReadOnlyList<RehearsalResult> Rehearsals { get; init; } = Array.Empty<RehearsalResult>();
 }
 
 internal sealed class NuGetReadyInputException : Exception

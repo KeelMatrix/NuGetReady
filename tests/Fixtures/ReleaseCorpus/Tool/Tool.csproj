@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>Fixture.Tool</AssemblyName>
+    <PackageId>Fixture.Tool</PackageId>
+    <PackageVersion>1.0.0</PackageVersion>
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>fixture-tool</ToolCommandName>
+    <PackageType>DotnetTool</PackageType>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageIcon>icon.png</PackageIcon>
+    <PackageTags>fixture;nuget;dotnet-tool</PackageTags>
+    <RepositoryUrl>https://github.com/KeelMatrix/NuGetReady</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+  </PropertyGroup>
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="README.md" />
+    <None Include="../../../../icon.png" Pack="true" PackagePath="icon.png" />
+  </ItemGroup>
+</Project>

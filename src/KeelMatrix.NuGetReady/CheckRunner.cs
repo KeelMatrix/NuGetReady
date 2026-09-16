@@ -8,11 +8,32 @@ internal static class CheckRunner
         "archive-metadata",
         "archive-layout",
         "dependency-groups",
+        "dependency-coherence",
         "archive-security",
-        "archive-parse"
+        "archive-parse",
+        "workflow-policy",
+        "consumer-rehearsal"
     };
 
     public static ReadinessReport Run(NuGetReadyConfig config, string artifactsPath)
+    {
+        return RunCore(config, artifactsPath, repositoryPath: null, timeout: null);
+    }
+
+    public static ReadinessReport Run(
+        NuGetReadyConfig config,
+        string artifactsPath,
+        string repositoryPath,
+        TimeSpan timeout)
+    {
+        return RunCore(config, artifactsPath, repositoryPath, timeout);
+    }
+
+    private static ReadinessReport RunCore(
+        NuGetReadyConfig config,
+        string artifactsPath,
+        string? repositoryPath,
+        TimeSpan? timeout)
     {
         if (!Directory.Exists(artifactsPath))
         {
@@ -78,7 +99,37 @@ internal static class CheckRunner
             }
         }
 
-        return BuildReport(expectedArtifacts.Length, actualArtifacts.Values.Sum(paths => paths.Count), failures);
+        foreach (var failure in DependencyCoherence.Inspect(config, artifactsPath))
+        {
+            failures["dependency-coherence"].Add(failure);
+        }
+
+        if (repositoryPath is not null)
+        {
+            foreach (var failure in WorkflowPolicyInspector.Inspect(repositoryPath))
+            {
+                failures["workflow-policy"].Add(failure);
+            }
+        }
+
+        var rehearsals = Array.Empty<RehearsalResult>();
+        var blockingArchiveFailure = failures.Values.SelectMany(items => items).Any(failure => !failure.IsWarning);
+        if (repositoryPath is not null && timeout is not null && !blockingArchiveFailure)
+        {
+            rehearsals = ConsumerRehearsal.Run(config, artifactsPath, timeout.Value).ToArray();
+            foreach (var rehearsal in rehearsals)
+            {
+                if (!rehearsal.Status.Equals("pass", StringComparison.Ordinal))
+                {
+                    failures["consumer-rehearsal"].Add(new Failure(
+                        "consumer-rehearsal",
+                        $"{rehearsal.PackageId}: {rehearsal.Message}",
+                        rehearsal.IsError));
+                }
+            }
+        }
+
+        return BuildReport(expectedArtifacts.Length, actualArtifacts.Values.Sum(paths => paths.Count), failures, rehearsals);
     }
 
     private static Dictionary<string, List<string>> EnumerateArtifacts(string root, List<Failure> failures)
@@ -129,10 +180,14 @@ internal static class CheckRunner
         return BuildReport(0, 0, new Dictionary<string, List<Failure>>(StringComparer.Ordinal)
         {
             ["artifact-set"] = new List<Failure> { failure }
-        });
+        }, Array.Empty<RehearsalResult>());
     }
 
-    private static ReadinessReport BuildReport(int expectedCount, int foundCount, Dictionary<string, List<Failure>> failures)
+    private static ReadinessReport BuildReport(
+        int expectedCount,
+        int foundCount,
+        Dictionary<string, List<Failure>> failures,
+        IReadOnlyList<RehearsalResult> rehearsals)
     {
         var checks = CheckOrder
             .Select(id => new CheckResult(id, failures.TryGetValue(id, out var checkFailures) ? checkFailures : Array.Empty<Failure>()))
@@ -143,16 +198,18 @@ internal static class CheckRunner
             .ThenBy(failure => failure.Message, StringComparer.Ordinal)
             .ToArray();
         var hasError = allFailures.Any(failure => failure.IsError);
-        var hasFailure = allFailures.Length > 0;
+        var hasFailure = allFailures.Any(failure => !failure.IsWarning);
+        var hasWarning = allFailures.Any(failure => failure.IsWarning);
 
         return new ReadinessReport
         {
-            Status = hasError ? "error" : hasFailure ? "fail" : "pass",
+            Status = hasError ? "error" : hasFailure ? "fail" : hasWarning ? "warn" : "pass",
             ExitCode = hasError ? 2 : hasFailure ? 1 : 0,
             ExpectedArtifacts = expectedCount,
             FoundArtifacts = foundCount,
             Checks = checks,
-            Failures = allFailures
+            Failures = allFailures,
+            Rehearsals = rehearsals
         };
     }
 }

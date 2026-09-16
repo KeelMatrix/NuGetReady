@@ -48,17 +48,22 @@ internal static class ReportWriter
         if (report.Status == "pass")
         {
             lines.Add(string.Empty);
-            lines.Add("Release archive checks passed.");
+            lines.Add("Release checks passed.");
+        }
+        else if (report.Status == "warn")
+        {
+            lines.Add(string.Empty);
+            lines.Add("Release checks passed with warnings.");
         }
         else if (report.Status == "fail")
         {
             lines.Add(string.Empty);
-            lines.Add("Release archive checks found blocking readiness failures.");
+            lines.Add("Release checks found blocking readiness failures.");
         }
         else
         {
             lines.Add(string.Empty);
-            lines.Add("Release archive checks did not complete trustworthily.");
+            lines.Add("Release checks did not complete trustworthily.");
         }
 
         return string.Join("\n", lines);
@@ -72,8 +77,11 @@ internal static class ReportWriter
             "archive-metadata" => "package metadata",
             "archive-layout" => "package layout",
             "dependency-groups" => "dependency groups",
+            "dependency-coherence" => "dependency coherence",
             "archive-security" => "archive security",
             "archive-parse" => "archive parsing",
+            "workflow-policy" => "workflow policy",
+            "consumer-rehearsal" => "consumer rehearsal",
             _ => checkId
         };
     }

@@ -9,7 +9,8 @@ public static class Program
         {
             options = CliParser.Parse(args);
             var config = ConfigurationLoader.Load(options.ConfigPath);
-            var report = CheckRunner.Run(config, options.ArtifactsPath);
+            var repositoryPath = Path.GetDirectoryName(Path.GetFullPath(options.ConfigPath))!;
+            var report = CheckRunner.Run(config, options.ArtifactsPath, repositoryPath, options.Timeout);
             ReportWriter.Write(report, options.Format);
             return report.ExitCode;
         }

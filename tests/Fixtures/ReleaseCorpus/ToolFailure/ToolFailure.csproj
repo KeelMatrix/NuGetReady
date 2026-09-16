@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>Fixture.ToolFailure</AssemblyName>
+    <PackageId>Fixture.ToolFailure</PackageId>
+    <PackageVersion>1.0.0</PackageVersion>
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>fixture-tool-failure</ToolCommandName>
+    <PackageType>DotnetTool</PackageType>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageIcon>icon.png</PackageIcon>
+    <PackageTags>fixture;nuget;dotnet-tool;failure</PackageTags>
+    <RepositoryUrl>https://github.com/KeelMatrix/NuGetReady</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+  </PropertyGroup>
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="README.md" />
+    <None Include="../../../../icon.png" Pack="true" PackagePath="icon.png" />
+  </ItemGroup>
+</Project>

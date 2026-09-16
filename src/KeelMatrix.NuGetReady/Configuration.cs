@@ -121,11 +121,13 @@ internal static partial class ConfigurationLoader
         }
 
         var artifactNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var packageIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var package in config.Packages)
         {
-            if (string.IsNullOrWhiteSpace(package.Id) || package.Id.Length > 200 || package.Id.Any(char.IsControl))
+            if (string.IsNullOrWhiteSpace(package.Id) || package.Id.Length > 200 || package.Id.Any(char.IsControl) ||
+                package.Id.Contains('/') || package.Id.Contains('\\') || !packageIds.Add(package.Id))
             {
-                throw new NuGetReadyInputException("Every package must have a valid ID.");
+                throw new NuGetReadyInputException("Every package must have a valid, unique ID.");
             }
 
             if (string.IsNullOrWhiteSpace(package.Kind) || !AllowedKinds.Contains(package.Kind))

@@ -1,0 +1,158 @@
+namespace KeelMatrix.NuGetReady.Tests;
+
+public sealed class ConsumerRehearsalTests
+{
+    [Fact]
+    public void Packed_library_multitarget_build_assets_and_tool_rehearse_in_isolation()
+    {
+        using var corpus = PackedCorpus.Create();
+        var standard = corpus.Pack("Standard/Standard.csproj");
+        var multiTarget = corpus.Pack("MultiTarget/MultiTarget.csproj");
+        var buildAssets = corpus.Pack("BuildAssets/BuildAssets.csproj");
+        var tool = corpus.Pack("Tool/Tool.csproj");
+        var config = Config(
+            new PackageExpectation { Id = "Fixture.Standard", Kind = "library", Version = "1.0.0", Artifacts = Artifacts(standard) },
+            new PackageExpectation { Id = "Fixture.MultiTarget", Kind = "multiTargetLibrary", Version = "1.0.0", Artifacts = Artifacts(multiTarget) },
+            new PackageExpectation { Id = "Fixture.BuildAssets", Kind = "library", Version = "1.0.0", Artifacts = Artifacts(buildAssets) },
+            new PackageExpectation { Id = "Fixture.Tool", Kind = "dotnetTool", Version = "1.0.0", Artifacts = Artifacts(tool), Command = "fixture-tool", Smoke = new List<string> { "--help" } });
+
+        var outcomes = ConsumerRehearsal.RunDetailed(config, corpus.OutputPath, TimeSpan.FromMinutes(2));
+
+        Assert.Equal(4, outcomes.Count);
+        Assert.All(outcomes, outcome => Assert.Equal("pass", outcome.Result.Status));
+    }
+
+    [Fact]
+    public void Related_packages_rehearse_with_the_internal_dependency_from_the_local_feed()
+    {
+        using var corpus = PackedCorpus.Create();
+        var core = corpus.Pack("Related.Core/Related.Core.csproj");
+        var consumer = corpus.Pack("Related.Consumer/Related.Consumer.csproj", corpus.OutputPath);
+        var config = Config(
+            new PackageExpectation { Id = "Fixture.Related.Core", Kind = "library", Version = "1.0.0", Artifacts = Artifacts(core) },
+            new PackageExpectation { Id = "Fixture.Related.Consumer", Kind = "library", Version = "1.0.0", Artifacts = Artifacts(consumer) });
+
+        var outcomes = ConsumerRehearsal.RunDetailed(config, corpus.OutputPath, TimeSpan.FromMinutes(2));
+
+        Assert.All(outcomes, outcome => Assert.Equal("pass", outcome.Result.Status));
+    }
+
+    [Fact]
+    public void Public_dependencies_resolve_from_the_intended_public_source()
+    {
+        using var corpus = PackedCorpus.Create();
+        var publicDependency = corpus.Pack("PublicSource/PublicSource.csproj");
+        var package = corpus.Pack("PublicDependency/PublicDependency.csproj", corpus.OutputPath);
+        var publicFeed = Directory.CreateDirectory(Path.Combine(corpus.Root.FullName, "public-feed"));
+        File.Copy(publicDependency, Path.Combine(publicFeed.FullName, Path.GetFileName(publicDependency)));
+        var config = Config(new PackageExpectation
+        {
+            Id = "Fixture.PublicDependency",
+            Kind = "library",
+            Version = "1.0.0",
+            Artifacts = Artifacts(package)
+        });
+
+        var outcomes = ConsumerRehearsal.RunDetailed(
+            config,
+            corpus.OutputPath,
+            TimeSpan.FromMinutes(2),
+            new ConsumerRehearsalOptions(PublicFeedPath: publicFeed.FullName));
+
+        Assert.Single(outcomes);
+        Assert.True(outcomes[0].Result.Status == "pass", outcomes[0].Diagnostic);
+    }
+
+    [Fact]
+    public void Public_substitute_cannot_satisfy_a_missing_local_feed()
+    {
+        using var corpus = PackedCorpus.Create();
+        var package = corpus.Pack("Standard/Standard.csproj");
+        var publicFeed = Directory.CreateDirectory(Path.Combine(corpus.Root.FullName, "public-feed"));
+        File.Copy(package, Path.Combine(publicFeed.FullName, Path.GetFileName(package)));
+        var config = Config(new PackageExpectation
+        {
+            Id = "Fixture.Standard",
+            Kind = "library",
+            Version = "1.0.0",
+            Artifacts = Artifacts(package)
+        });
+
+        var outcomes = ConsumerRehearsal.RunDetailed(
+            config,
+            corpus.OutputPath,
+            TimeSpan.FromMinutes(2),
+            new ConsumerRehearsalOptions(IncludeLocalFeed: false, PublicFeedPath: publicFeed.FullName));
+
+        Assert.Single(outcomes);
+        Assert.Equal("fail", outcomes[0].Result.Status);
+        Assert.True(
+            outcomes[0].Diagnostic.Contains("NU1101", StringComparison.OrdinalIgnoreCase) ||
+            outcomes[0].Diagnostic.Contains("NU1100", StringComparison.OrdinalIgnoreCase) ||
+            outcomes[0].Diagnostic.Contains("Unable to resolve", StringComparison.OrdinalIgnoreCase) ||
+            outcomes[0].Diagnostic.Contains("Unable to find package", StringComparison.OrdinalIgnoreCase),
+            outcomes[0].Diagnostic);
+    }
+
+    [Fact]
+    public void Package_under_test_matching_a_public_pattern_cannot_use_that_source()
+    {
+        using var corpus = PackedCorpus.Create();
+        var package = ArchiveMutator.ReplaceNuspecText(
+            corpus.Pack("Standard/Standard.csproj"),
+            text => text.Replace("<id>Fixture.Standard</id>", "<id>System.Fixture.Standard</id>", StringComparison.Ordinal),
+            "system-fixture.nupkg");
+        var publicFeed = Directory.CreateDirectory(Path.Combine(corpus.Root.FullName, "public-pattern-feed"));
+        File.Copy(package, Path.Combine(publicFeed.FullName, Path.GetFileName(package)));
+        var config = Config(new PackageExpectation
+        {
+            Id = "System.Fixture.Standard",
+            Kind = "library",
+            Version = "1.0.0",
+            Artifacts = Artifacts(package)
+        });
+
+        var outcomes = ConsumerRehearsal.RunDetailed(
+            config,
+            corpus.OutputPath,
+            TimeSpan.FromMinutes(2),
+            new ConsumerRehearsalOptions(IncludeLocalFeed: false, PublicFeedPath: publicFeed.FullName));
+
+        Assert.Single(outcomes);
+        Assert.Equal("fail", outcomes[0].Result.Status);
+    }
+
+    [Fact]
+    public void Preexisting_cached_copy_is_rejected_before_restore()
+    {
+        using var corpus = PackedCorpus.Create();
+        var package = corpus.Pack("Standard/Standard.csproj");
+        var config = Config(new PackageExpectation
+        {
+            Id = "Fixture.Standard",
+            Kind = "library",
+            Version = "1.0.0",
+            Artifacts = Artifacts(package)
+        });
+
+        var outcomes = ConsumerRehearsal.RunDetailed(
+            config,
+            corpus.OutputPath,
+            TimeSpan.FromMinutes(2),
+            new ConsumerRehearsalOptions(IncludeLocalFeed: false, SeedPackageCache: true));
+
+        Assert.Single(outcomes);
+        Assert.Equal("error", outcomes[0].Result.Status);
+        Assert.Contains("cached substitution", outcomes[0].Result.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static NuGetReadyConfig Config(params PackageExpectation[] packages)
+    {
+        return new NuGetReadyConfig { SchemaVersion = 1, Packages = packages.ToList() };
+    }
+
+    private static List<string> Artifacts(string package)
+    {
+        return new List<string> { Path.GetFileName(package) };
+    }
+}

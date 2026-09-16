@@ -4,4 +4,4 @@ Please report vulnerabilities privately through [GitHub Security Advisories](htt
 
 The supported version is the latest released version. Development builds are not supported release targets.
 
-NuGetReady inspects package archives supplied by the user. It does not sandbox package code; consumer execution is outside this milestone and future execution features must be treated as running with the caller's permissions.
+NuGetReady inspects package archives supplied by the user. Library rehearsals restore and build package assets; tool rehearsals install and execute the configured smoke command. This is not a sandbox: package code and build assets run with the caller's permissions. Use trusted inputs and an appropriate account when running a rehearsal. Temporary feeds, caches, and consumer projects are isolated and bounded, and captured diagnostics are size-limited.

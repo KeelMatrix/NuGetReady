@@ -1,6 +1,6 @@
 # KeelMatrix NuGetReady
 
-`dotnet pack` succeeding does not prove your release is ready. NuGetReady checks the exact artifact set and package archive before publishing.
+`dotnet pack` succeeding does not prove your release is ready. NuGetReady checks the exact artifact set and package archive, then rehearses isolated consumer restore or tool installation from the artifacts you just built.
 
 ## Install and first check
 
@@ -33,9 +33,11 @@ The default configuration file is `nugetready.json` in the current directory. Th
 }
 ```
 
-NuGetReady validates exact expected `.nupkg`/`.snupkg` names, duplicate and unintended artifacts, package identity/version, authors, description, tags, license, README, icon, repository metadata, dependency groups, library/tool layout and command metadata, symbols, and sensitive/internal archive entries. Reports are deterministic in text or versioned JSON format.
+NuGetReady validates exact expected `.nupkg`/`.snupkg` names, duplicate and unintended artifacts, package identity/version, authors, description, tags, license, README, icon, repository metadata, dependency groups, related-package versions, library/tool layout and command metadata, symbols, and sensitive/internal archive entries. It creates a temporary local feed, controlled `NuGet.config`, isolated `NUGET_PACKAGES`, and bounded consumer processes. Package-under-test IDs are source-mapped only to that local feed; declared public dependencies may resolve from the configured public source. Reports are deterministic in text or versioned JSON format.
 
-The configuration contains no publishing credentials. Publishing, clean consumer restore/install, package execution, release-workflow checks, and telemetry are outside this milestone. Package code and build assets are executable content; inspect packages and run future consumer rehearsals with the permissions appropriate to the package.
+Supported package kinds are `library`, `multiTargetLibrary`, and `dotnetTool`. Tool expectations may declare a command and safe smoke arguments. Analyzer-only packages are not supported in this version; build assets are consumed as part of the library rehearsal.
+
+The configuration contains no publishing credentials. When a release workflow is present, NuGetReady applies narrow structural checks for version-tag gating, Trusted Publishing/OIDC permissions, long-lived API keys, exact artifact validation, and broad publish wildcards. Deterministic policy errors block the check; broad wildcard findings are warnings. The check never publishes packages. Tool smoke commands execute package code with the caller's permissions, so inspect packages and run rehearsals with appropriate permissions. Library packages are restored and built but not run.
 
 For malformed input or an unavailable artifact directory, NuGetReady returns exit code `2`. A completed check with readiness failures returns `1`; warnings never convert an unknown result into success.
 
@@ -44,6 +46,7 @@ For malformed input or an unavailable artifact directory, NuGetReady returns exi
 - Confirm the config path and artifact directory are the intended repository-local paths.
 - Declare every expected package and symbol archive explicitly; broad globs are not accepted.
 - Rebuild the package when its filename version and nuspec version disagree.
-- Treat a package parsing or filesystem error as an infrastructure/input failure, not as a passing rehearsal.
+- The rehearsal uses a fresh package cache and HTTP cache on every run; a cached or public copy cannot satisfy the package-under-test source mapping.
+- Treat a package parsing, filesystem, restore, or process-timeout error as an infrastructure/input failure, not as a passing rehearsal.
 
 See [KeelMatrix.NuGetReady.md](KeelMatrix.NuGetReady.md) for the product contract and [PRIVACY.md](PRIVACY.md) for the local data boundary.

@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <PackageId>Fixture.PublicDependency</PackageId>
+    <PackageVersion>1.0.0</PackageVersion>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageIcon>icon.png</PackageIcon>
+    <PackageTags>fixture;nuget;public-dependency</PackageTags>
+    <RepositoryUrl>https://github.com/KeelMatrix/NuGetReady</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Fixture.Public.Source" VersionOverride="1.0.0" />
+    <None Include="README.md" Pack="true" PackagePath="README.md" />
+    <None Include="../../../../icon.png" Pack="true" PackagePath="icon.png" />
+  </ItemGroup>
+</Project>
