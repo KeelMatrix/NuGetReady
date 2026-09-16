@@ -210,11 +210,12 @@ jobs:
           "@ | Set-Content $negativeConfig -Encoding utf8
           $negativeToolPath = Join-Path $runRoot 'negative-tool'
           New-Item $negativeToolPath -ItemType Directory -Force | Out-Null
-          $previousErrorActionPreference = $ErrorActionPreference
-          $ErrorActionPreference = 'Continue'
-          dotnet tool install KeelMatrix.NuGetReady --version 0.1.0 --tool-path $negativeToolPath --configfile $negativeConfig --no-cache --verbosity quiet
-          $negativeExit = $LASTEXITCODE
-          $ErrorActionPreference = $previousErrorActionPreference
+          $negativeResult = Start-Process -FilePath 'dotnet' -ArgumentList @(
+            'tool', 'install', 'KeelMatrix.NuGetReady', '--version', '0.1.0',
+            '--tool-path', $negativeToolPath, '--configfile', $negativeConfig,
+            '--no-cache', '--verbosity', 'quiet'
+          ) -NoNewWindow -Wait -PassThru
+          $negativeExit = $negativeResult.ExitCode
           if ($negativeExit -eq 0) { throw "A published-looking substitute satisfied the exact local package mapping." }
 
       - name: Verify cached substitution is rejected
