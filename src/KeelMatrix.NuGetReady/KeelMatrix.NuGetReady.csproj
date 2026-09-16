@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>KeelMatrix.NuGetReady</AssemblyName>
+    <RootNamespace>KeelMatrix.NuGetReady</RootNamespace>
+    <IsPackable>true</IsPackable>
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>nugetready</ToolCommandName>
+    <PackageId>KeelMatrix.NuGetReady</PackageId>
+    <PackageType>DotnetTool</PackageType>
+    <Authors>KeelMatrix</Authors>
+    <Copyright>KeelMatrix</Copyright>
+    <Description>Rehearse a NuGet release from the exact built artifacts and prove clean isolated consumer installation before publishing.</Description>
+    <PackageTags>nuget;packaging;release;ci;dotnet-tool;source-link;oidc;trusted-publishing</PackageTags>
+    <PackageReleaseNotes>Initial release of exact artifact and package archive readiness checks.</PackageReleaseNotes>
+    <RepositoryUrl>https://github.com/KeelMatrix/NuGetReady</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageProjectUrl>https://github.com/KeelMatrix/NuGetReady#readme</PackageProjectUrl>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageIcon>icon.png</PackageIcon>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <PublishSingleFile>false</PublishSingleFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="NuGet.Packaging" />
+    <None Include="..\..\README.md" Pack="true" PackagePath="README.md" Link="README.md" Visible="false" />
+    <None Include="..\..\icon.png" Pack="true" PackagePath="icon.png" Link="icon.png" Visible="false" />
+  </ItemGroup>
+</Project>

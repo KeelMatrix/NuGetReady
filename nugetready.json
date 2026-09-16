@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "packages": [
+    {
+      "id": "KeelMatrix.NuGetReady",
+      "kind": "dotnetTool",
+      "version": "0.1.0",
+      "artifacts": [
+        "KeelMatrix.NuGetReady.0.1.0.nupkg",
+        "KeelMatrix.NuGetReady.0.1.0.snupkg"
+      ],
+      "command": "nugetready",
+      "smoke": ["--help"]
+    }
+  ]
+}
