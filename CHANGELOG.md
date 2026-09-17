@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Classifies unavailable restore sources and related tooling infrastructure as exit-code-2 errors while preserving exit code 1 for reproducibly unready package assets, including bad-image diagnostics.
+
 ## [0.1.0] - 2026-09-16
 
 ### Added

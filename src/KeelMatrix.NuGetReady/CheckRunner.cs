@@ -24,16 +24,18 @@ internal static class CheckRunner
         NuGetReadyConfig config,
         string artifactsPath,
         string repositoryPath,
-        TimeSpan timeout)
+        TimeSpan timeout,
+        ConsumerRehearsalOptions? rehearsalOptions = null)
     {
-        return RunCore(config, artifactsPath, repositoryPath, timeout);
+        return RunCore(config, artifactsPath, repositoryPath, timeout, rehearsalOptions);
     }
 
     private static ReadinessReport RunCore(
         NuGetReadyConfig config,
         string artifactsPath,
         string? repositoryPath,
-        TimeSpan? timeout)
+        TimeSpan? timeout,
+        ConsumerRehearsalOptions? rehearsalOptions = null)
     {
         if (!Directory.Exists(artifactsPath))
         {
@@ -116,20 +118,26 @@ internal static class CheckRunner
         var blockingArchiveFailure = failures.Values.SelectMany(items => items).Any(failure => !failure.IsWarning);
         if (repositoryPath is not null && timeout is not null && !blockingArchiveFailure)
         {
-            rehearsals = ConsumerRehearsal.Run(config, artifactsPath, timeout.Value).ToArray();
-            foreach (var rehearsal in rehearsals)
+            var detailedRehearsals = ConsumerRehearsal.RunDetailed(config, artifactsPath, timeout.Value, rehearsalOptions);
+            rehearsals = detailedRehearsals.Select(outcome => outcome.Result).ToArray();
+            foreach (var outcome in detailedRehearsals)
             {
-                if (!rehearsal.Status.Equals("pass", StringComparison.Ordinal))
+                if (!outcome.Result.Status.Equals("pass", StringComparison.Ordinal))
                 {
                     failures["consumer-rehearsal"].Add(new Failure(
                         "consumer-rehearsal",
-                        $"{rehearsal.PackageId}: {rehearsal.Message}",
-                        rehearsal.IsError));
+                        $"{outcome.Result.PackageId}: {outcome.Result.Message}{FormatDiagnostic(outcome.Diagnostic)}",
+                        outcome.Result.IsError));
                 }
             }
         }
 
         return BuildReport(expectedArtifacts.Length, actualArtifacts.Values.Sum(paths => paths.Count), failures, rehearsals);
+    }
+
+    private static string FormatDiagnostic(string diagnostic)
+    {
+        return string.IsNullOrWhiteSpace(diagnostic) ? string.Empty : $" Diagnostic: {diagnostic}";
     }
 
     private static Dictionary<string, List<string>> EnumerateArtifacts(string root, List<Failure> failures)

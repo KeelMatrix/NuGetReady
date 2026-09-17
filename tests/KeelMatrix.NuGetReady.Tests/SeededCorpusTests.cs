@@ -85,7 +85,7 @@ public sealed class SeededCorpusTests : IClassFixture<RealCorpusFixture>
             TimeSpan.FromMinutes(2),
             new ConsumerRehearsalOptions(PublicFeedPath: publicFeed.FullName)).Single();
 
-        Assert.Equal("fail", outcome.Result.Status);
+        Assert.Equal("error", outcome.Result.Status);
         Assert.True(
             outcome.Diagnostic.Contains("NU1100", StringComparison.OrdinalIgnoreCase) ||
             outcome.Diagnostic.Contains("NU1101", StringComparison.OrdinalIgnoreCase) ||

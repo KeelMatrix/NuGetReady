@@ -9,7 +9,15 @@ namespace KeelMatrix.NuGetReady;
 internal sealed record ConsumerRehearsalOptions(
     bool IncludeLocalFeed = true,
     bool SeedPackageCache = false,
-    string? PublicFeedPath = null);
+    string? PublicFeedPath = null,
+    ConsumerProcessRunner? ProcessRunner = null);
+
+internal delegate Task<ProcessResult> ConsumerProcessRunner(
+    string fileName,
+    IReadOnlyList<string> arguments,
+    string workingDirectory,
+    IReadOnlyDictionary<string, string?> environment,
+    TimeSpan timeout);
 
 internal sealed record RehearsalOutcome(RehearsalResult Result, string Diagnostic);
 
@@ -113,8 +121,8 @@ internal static class ConsumerRehearsal
 
                 var packageRoot = Directory.CreateDirectory(Path.Combine(root.FullName, SanitizeDirectoryName(package.Id!))).FullName;
                 var packageResult = package.Kind!.Equals("dotnetTool", StringComparison.OrdinalIgnoreCase)
-                    ? RunToolAsync(package, packagePath, packageRoot, configPath, environment, timeout).GetAwaiter().GetResult()
-                    : RunLibraryAsync(package, packagePath, packageRoot, configPath, environment, timeout).GetAwaiter().GetResult();
+                    ? RunToolAsync(package, packagePath, packageRoot, configPath, environment, timeout, options).GetAwaiter().GetResult()
+                    : RunLibraryAsync(package, packagePath, packageRoot, configPath, environment, timeout, options).GetAwaiter().GetResult();
                 results.Add(packageResult);
             }
 
@@ -141,7 +149,8 @@ internal static class ConsumerRehearsal
         string packageRoot,
         string configPath,
         IReadOnlyDictionary<string, string?> environment,
-        TimeSpan timeout)
+        TimeSpan timeout,
+        ConsumerRehearsalOptions options)
     {
         IReadOnlyList<LibraryTarget> targets;
         try
@@ -171,7 +180,8 @@ internal static class ConsumerRehearsal
                 targetRoot,
                 configPath,
                 environment,
-                timeout).ConfigureAwait(false);
+                timeout,
+                options).ConfigureAwait(false);
             if (!outcome.Passed)
             {
                 var message = $"The isolated library consumer did not complete for target framework '{target.Framework}'.";
@@ -196,7 +206,8 @@ internal static class ConsumerRehearsal
         string packageRoot,
         string configPath,
         IReadOnlyDictionary<string, string?> environment,
-        TimeSpan timeout)
+        TimeSpan timeout,
+        ConsumerRehearsalOptions options)
     {
         var projectPath = Path.Combine(packageRoot, "Consumer.csproj");
         var sourcePath = Path.Combine(packageRoot, "Program.cs");
@@ -242,25 +253,29 @@ internal static class ConsumerRehearsal
             ["restore", projectPath, "--configfile", configPath, "--no-cache", "--force-evaluate", "--nologo"],
             packageRoot,
             environment,
-            timeout).ConfigureAwait(false);
-        if (!Succeeded(restore) || HasUnusableAssetDiagnostic(restore))
+            timeout,
+            options.ProcessRunner).ConfigureAwait(false);
+        var restoreOutcome = ClassifyProcessResult(restore, ProcessPhase.Restore);
+        if (!restoreOutcome.Passed)
         {
-            return new TargetRehearsalOutcome(false, IsInfrastructure(restore), Combine(restore));
+            return restoreOutcome;
         }
 
         var build = await RunDotnetAsync(
             ["build", projectPath, "--no-restore", "--nologo", "--configuration", "Release", "-p:UseSharedCompilation=false"],
             packageRoot,
             environment,
-            timeout).ConfigureAwait(false);
-        if (!Succeeded(build) || HasUnusableAssetDiagnostic(build))
+            timeout,
+            options.ProcessRunner).ConfigureAwait(false);
+        var buildOutcome = ClassifyProcessResult(build, ProcessPhase.Build);
+        if (!buildOutcome.Passed)
         {
-            return new TargetRehearsalOutcome(false, IsInfrastructure(build), Combine(build));
+            return buildOutcome;
         }
 
         if (!IsRunnableConsumerTargetFramework(target.Framework))
         {
-            return new TargetRehearsalOutcome(true, false, Combine(build));
+            return buildOutcome;
         }
 
         var outputAssembly = Path.Combine(packageRoot, "bin", "Release", target.Framework, "Consumer.dll");
@@ -273,10 +288,9 @@ internal static class ConsumerRehearsal
             [outputAssembly],
             packageRoot,
             environment,
-            timeout).ConfigureAwait(false);
-        return Succeeded(run) && !HasUnusableAssetDiagnostic(run)
-            ? new TargetRehearsalOutcome(true, false, Combine(run))
-            : new TargetRehearsalOutcome(false, IsInfrastructure(run), Combine(run));
+            timeout,
+            options.ProcessRunner).ConfigureAwait(false);
+        return ClassifyProcessResult(run, ProcessPhase.Run);
     }
 
     private static async Task<RehearsalOutcome> RunToolAsync(
@@ -285,17 +299,20 @@ internal static class ConsumerRehearsal
         string packageRoot,
         string configPath,
         IReadOnlyDictionary<string, string?> environment,
-        TimeSpan timeout)
+        TimeSpan timeout,
+        ConsumerRehearsalOptions options)
     {
         var toolPath = Directory.CreateDirectory(Path.Combine(packageRoot, "tool")).FullName;
         var install = await RunDotnetAsync(
             ["tool", "install", package.Id!, "--version", VersionText.Normalize(package.Version!), "--tool-path", toolPath, "--configfile", configPath, "--no-cache", "--verbosity", "quiet"],
             packageRoot,
             environment,
-            timeout).ConfigureAwait(false);
-        if (!Succeeded(install))
+            timeout,
+            options.ProcessRunner).ConfigureAwait(false);
+        var installOutcome = ClassifyProcessResult(install, ProcessPhase.ToolInstall);
+        if (!installOutcome.Passed)
         {
-            return Failure(package, "The isolated tool could not be installed from the controlled feed.", IsInfrastructure(install), Combine(install));
+            return Failure(package, "The isolated tool could not be installed from the controlled feed.", installOutcome.IsError, installOutcome.Diagnostic);
         }
 
         var command = package.Command ?? package.Id!;
@@ -312,18 +329,22 @@ internal static class ConsumerRehearsal
 
         var smoke = package.Smoke?.ToArray() ?? Array.Empty<string>();
         var run = await BoundedProcess.RunAsync(executable, smoke, packageRoot, environment, timeout).ConfigureAwait(false);
-        return Succeeded(run)
-            ? Success(package, "Isolated tool installed and safe smoke command succeeded.", Combine(run))
-            : Failure(package, "The installed tool safe smoke command failed.", IsInfrastructure(run), Combine(run));
+        var runOutcome = ClassifyProcessResult(run, ProcessPhase.ToolSmoke);
+        return runOutcome.Passed
+            ? Success(package, "Isolated tool installed and safe smoke command succeeded.", runOutcome.Diagnostic)
+            : Failure(package, "The installed tool safe smoke command failed.", runOutcome.IsError, runOutcome.Diagnostic);
     }
 
     private static async Task<ProcessResult> RunDotnetAsync(
         IReadOnlyList<string> arguments,
         string workingDirectory,
         IReadOnlyDictionary<string, string?> environment,
-        TimeSpan timeout)
+        TimeSpan timeout,
+        ConsumerProcessRunner? processRunner)
     {
-        return await BoundedProcess.RunAsync("dotnet", arguments, workingDirectory, environment, timeout).ConfigureAwait(false);
+        return processRunner is null
+            ? await BoundedProcess.RunAsync("dotnet", arguments, workingDirectory, environment, timeout).ConfigureAwait(false)
+            : await processRunner("dotnet", arguments, workingDirectory, environment, timeout).ConfigureAwait(false);
     }
 
     private static bool Succeeded(ProcessResult result)
@@ -348,9 +369,97 @@ internal static class ConsumerRehearsal
         "metadata is invalid"
     };
 
+    private enum ProcessPhase
+    {
+        Restore,
+        Build,
+        Run,
+        ToolInstall,
+        ToolSmoke
+    }
+
+    private static readonly string[] InfrastructureMarkers =
+    {
+        "NU1100",
+        "NU1101",
+        "NU1301",
+        "NU1302",
+        "NU1303",
+        "NU1900",
+        "unable to load the service index",
+        "no packages exist with this id",
+        "failed to download",
+        "connection refused",
+        "connection reset",
+        "could not resolve host",
+        "the remote name could not be resolved",
+        "network is unreachable",
+        "permission denied",
+        "access to the path",
+        "disk full",
+        "not enough space"
+    };
+
+    private static TargetRehearsalOutcome ClassifyProcessResult(ProcessResult result, ProcessPhase phase)
+    {
+        var diagnostic = Combine(result);
+        if (Succeeded(result) && !HasUnusableAssetDiagnostic(result))
+        {
+            return new TargetRehearsalOutcome(true, false, SanitizeDiagnostic(diagnostic));
+        }
+
+        var isInfrastructure = IsInfrastructure(result);
+        return new TargetRehearsalOutcome(
+            false,
+            isInfrastructure,
+            isInfrastructure
+                ? InfrastructureDiagnostic(phase, result, diagnostic)
+                : SanitizeDiagnostic(diagnostic));
+    }
+
     private static bool IsInfrastructure(ProcessResult result)
     {
-        return !result.Started || result.TimedOut;
+        if (!result.Started || result.TimedOut)
+        {
+            return true;
+        }
+
+        var output = string.Join("\n", result.StandardOutput, result.StandardError);
+        return InfrastructureMarkers.Any(marker => output.Contains(marker, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static string InfrastructureDiagnostic(ProcessPhase phase, ProcessResult result, string diagnostic)
+    {
+        var marker = InfrastructureMarkers.FirstOrDefault(candidate => diagnostic.Contains(candidate, StringComparison.OrdinalIgnoreCase));
+        var operation = phase switch
+        {
+            ProcessPhase.Restore => "package restore",
+            ProcessPhase.ToolInstall => "tool installation",
+            ProcessPhase.Build => "the consumer build",
+            ProcessPhase.Run => "the consumer run",
+            _ => "the tool smoke command"
+        };
+        var detail = !result.Started
+            ? "the required child process could not be started"
+            : result.TimedOut
+                ? "the bounded child process timed out"
+                : marker is null ? "the child process returned an infrastructure diagnostic" : $"diagnostic marker {marker}";
+        return $"The isolated {operation} could not be trusted because {detail}. Verify the package sources, dependency availability, and local tooling, then rerun NuGetReady.";
+    }
+
+    private static string SanitizeDiagnostic(string diagnostic)
+    {
+        if (string.IsNullOrWhiteSpace(diagnostic))
+        {
+            return string.Empty;
+        }
+
+        var sanitized = diagnostic.Replace("\r\n", "\n", StringComparison.Ordinal).Replace('\r', '\n');
+        sanitized = System.Text.RegularExpressions.Regex.Replace(
+            sanitized,
+            @"(?m)(?<![\w:/])(?:[A-Za-z]:[\\/]|/|\\\\)[^\r\n]*",
+            "[path]");
+        return sanitized.Length <= DiagnosticLimit ? sanitized : sanitized[..DiagnosticLimit] + "\n[output truncated]";
     }
 
     private static RehearsalOutcome Success(PackageExpectation package, string message, string diagnostic)

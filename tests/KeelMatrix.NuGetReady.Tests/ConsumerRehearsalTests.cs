@@ -1,9 +1,17 @@
 using System.IO.Compression;
+using Xunit.Abstractions;
 
 namespace KeelMatrix.NuGetReady.Tests;
 
 public sealed class ConsumerRehearsalTests
 {
+    private readonly ITestOutputHelper testOutput;
+
+    public ConsumerRehearsalTests(ITestOutputHelper testOutput)
+    {
+        this.testOutput = testOutput;
+    }
+
     [Fact]
     public void Packed_library_multitarget_build_assets_and_tool_rehearse_in_isolation()
     {
@@ -18,7 +26,11 @@ public sealed class ConsumerRehearsalTests
             new PackageExpectation { Id = "Fixture.BuildAssets", Kind = "library", Version = "1.0.0", Artifacts = Artifacts(buildAssets) },
             new PackageExpectation { Id = "Fixture.Tool", Kind = "dotnetTool", Version = "1.0.0", Artifacts = Artifacts(tool), Command = "fixture-tool", Smoke = new List<string> { "--help" } });
 
-        var outcomes = ConsumerRehearsal.RunDetailed(config, corpus.OutputPath, TimeSpan.FromMinutes(2));
+        var outcomes = ConsumerRehearsal.RunDetailed(
+            config,
+            corpus.OutputPath,
+            TimeSpan.FromMinutes(2),
+            new ConsumerRehearsalOptions(PublicFeedPath: corpus.OutputPath));
 
         Assert.Equal(4, outcomes.Count);
         Assert.All(outcomes, outcome => Assert.Equal("pass", outcome.Result.Status));
@@ -37,7 +49,11 @@ public sealed class ConsumerRehearsalTests
             new PackageExpectation { Id = "Fixture.Related.Core", Kind = "library", Version = "1.0.0", Artifacts = Artifacts(core) },
             new PackageExpectation { Id = "Fixture.Related.Consumer", Kind = "library", Version = "1.0.0", Artifacts = Artifacts(consumer) });
 
-        var outcomes = ConsumerRehearsal.RunDetailed(config, corpus.OutputPath, TimeSpan.FromMinutes(2));
+        var outcomes = ConsumerRehearsal.RunDetailed(
+            config,
+            corpus.OutputPath,
+            TimeSpan.FromMinutes(2),
+            new ConsumerRehearsalOptions(PublicFeedPath: corpus.OutputPath));
 
         Assert.All(outcomes, outcome => Assert.Equal("pass", outcome.Result.Status));
     }
@@ -69,6 +85,81 @@ public sealed class ConsumerRehearsalTests
     }
 
     [Fact]
+    public void Unavailable_public_dependency_is_reported_as_infrastructure_error()
+    {
+        using var corpus = PackedCorpus.Create();
+        corpus.Pack("PublicSource/PublicSource.csproj");
+        var package = corpus.Pack("PublicDependency/PublicDependency.csproj", corpus.OutputPath);
+        var artifactsPath = Directory.CreateDirectory(Path.Combine(corpus.Root.FullName, "unavailable-public-artifacts"));
+        File.Copy(package, Path.Combine(artifactsPath.FullName, Path.GetFileName(package)));
+        var unavailablePublicFeed = Directory.CreateDirectory(Path.Combine(corpus.Root.FullName, "unavailable-public-feed"));
+        var config = Config(new PackageExpectation
+        {
+            Id = "Fixture.PublicDependency",
+            Kind = "library",
+            Version = "1.0.0",
+            Artifacts = Artifacts(package)
+        });
+
+        var report = CheckRunner.Run(
+            config,
+            artifactsPath.FullName,
+            corpus.RepositoryRoot,
+            TimeSpan.FromMinutes(2),
+            new ConsumerRehearsalOptions(PublicFeedPath: unavailablePublicFeed.FullName));
+
+        Assert.Equal("error", report.Status);
+        Assert.Equal(2, report.ExitCode);
+        var failure = Assert.Single(report.Failures, failure => failure.CheckId == "consumer-rehearsal");
+        Assert.Contains("source", failure.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("NU1101", failure.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(corpus.Root.FullName, failure.Message, StringComparison.OrdinalIgnoreCase);
+        testOutput.WriteLine($"UNAVAILABLE_SOURCE status={report.Status} exitCode={report.ExitCode} message={failure.Message}");
+    }
+
+    [Fact]
+    public void Warning_only_bad_image_diagnostic_is_a_readiness_failure()
+    {
+        using var corpus = PackedCorpus.Create();
+        var package = corpus.Pack("Standard/Standard.csproj");
+        var artifactsPath = Directory.CreateDirectory(Path.Combine(corpus.Root.FullName, "warning-only-artifacts"));
+        File.Copy(package, Path.Combine(artifactsPath.FullName, Path.GetFileName(package)));
+        var config = Config(new PackageExpectation
+        {
+            Id = "Fixture.Standard",
+            Kind = "library",
+            Version = "1.0.0",
+            Artifacts = Artifacts(package)
+        });
+        static Task<ProcessResult> WarningOnlyBadImage(
+            string fileName,
+            IReadOnlyList<string> arguments,
+            string workingDirectory,
+            IReadOnlyDictionary<string, string?> environment,
+            TimeSpan timeout) => Task.FromResult(new ProcessResult(
+                Started: true,
+                ExitCode: 0,
+                TimedOut: false,
+                StandardOutput: string.Empty,
+                StandardError: "warning MSB3246: bad image in C:\\Users\\test user\\NuGetReady\\bad.dll; metadata is invalid"));
+
+        var report = CheckRunner.Run(
+            config,
+            artifactsPath.FullName,
+            corpus.RepositoryRoot,
+            TimeSpan.FromMinutes(2),
+            new ConsumerRehearsalOptions(ProcessRunner: WarningOnlyBadImage));
+
+        Assert.Equal("fail", report.Status);
+        Assert.Equal(1, report.ExitCode);
+        Assert.Contains(report.Failures, failure =>
+            failure.CheckId == "consumer-rehearsal" &&
+            failure.Message.Contains("MSB3246", StringComparison.Ordinal));
+        Assert.DoesNotContain("C:\\Users\\test user", report.Failures.Single(failure => failure.CheckId == "consumer-rehearsal").Message, StringComparison.OrdinalIgnoreCase);
+        testOutput.WriteLine($"WARNING_ONLY_BAD_IMAGE status={report.Status} exitCode={report.ExitCode} marker=MSB3246");
+    }
+
+    [Fact]
     public void Public_substitute_cannot_satisfy_a_missing_local_feed()
     {
         using var corpus = PackedCorpus.Create();
@@ -90,7 +181,7 @@ public sealed class ConsumerRehearsalTests
             new ConsumerRehearsalOptions(IncludeLocalFeed: false, PublicFeedPath: publicFeed.FullName));
 
         Assert.Single(outcomes);
-        Assert.Equal("fail", outcomes[0].Result.Status);
+        Assert.Equal("error", outcomes[0].Result.Status);
         Assert.True(
             outcomes[0].Diagnostic.Contains("NU1101", StringComparison.OrdinalIgnoreCase) ||
             outcomes[0].Diagnostic.Contains("NU1100", StringComparison.OrdinalIgnoreCase) ||
@@ -124,7 +215,7 @@ public sealed class ConsumerRehearsalTests
             new ConsumerRehearsalOptions(IncludeLocalFeed: false, PublicFeedPath: publicFeed.FullName));
 
         Assert.Single(outcomes);
-        Assert.Equal("fail", outcomes[0].Result.Status);
+        Assert.Equal("error", outcomes[0].Result.Status);
     }
 
     [Fact]
@@ -162,6 +253,11 @@ public sealed class ConsumerRehearsalTests
         var relatedConsumer = corpus.Pack("Related.Consumer/Related.Consumer.csproj", corpus.OutputPath);
         var publicSource = corpus.Pack("PublicSource/PublicSource.csproj");
         var publicDependency = corpus.Pack("PublicDependency/PublicDependency.csproj", corpus.OutputPath);
+        var publicFeed = Directory.CreateDirectory(Path.Combine(corpus.Root.FullName, "corruption-public-feed"));
+        foreach (var packagePath in new[] { publicSource, publicDependency, relatedCore, relatedConsumer, standard, multiTarget, buildAssets })
+        {
+            File.Copy(packagePath, Path.Combine(publicFeed.FullName, Path.GetFileName(packagePath)));
+        }
         var fixtures = new List<(string Id, string Kind, string PackagePath, List<(string Id, string Kind, string PackagePath)> Dependencies)>
         {
             ("Fixture.Standard", "library", standard, new()),
@@ -218,10 +314,12 @@ public sealed class ConsumerRehearsalTests
                     Config(expectations.ToArray()),
                     caseRoot.FullName,
                     corpus.RepositoryRoot,
-                    TimeSpan.FromMinutes(2));
+                    TimeSpan.FromMinutes(2),
+                    new ConsumerRehearsalOptions(PublicFeedPath: publicFeed.FullName));
 
                 Assert.NotEqual("pass", report.Status);
-                Assert.NotEqual(0, report.ExitCode);
+                testOutput.WriteLine($"{fixture.Id} asset={libraryAsset} status={report.Status} exitCode={report.ExitCode}");
+                Assert.True(report.ExitCode == 1, $"fixture={fixture.Id}; asset={libraryAsset}; status={report.Status}; exitCode={report.ExitCode}; failures={string.Join(" | ", report.Failures.Select(failure => failure.Message))}");
             }
         }
     }

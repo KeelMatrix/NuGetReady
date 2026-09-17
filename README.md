@@ -44,7 +44,7 @@ Supported package kinds are `library`, `multiTargetLibrary`, and `dotnetTool`. T
 
 The configuration contains no publishing credentials. When a release workflow is present, NuGetReady applies narrow structural checks for version-tag gating, Trusted Publishing/OIDC permissions, long-lived API keys, exact artifact validation, and broad publish wildcards. Deterministic policy errors block the check; broad wildcard findings are warnings. The check never publishes packages. Consumer builds and tool smoke commands execute package code or build assets with the caller's permissions, so inspect packages and run rehearsals with appropriate permissions. Non-runnable library target frameworks are build-only.
 
-For malformed input or an unavailable artifact directory, NuGetReady returns exit code `2`. A completed check with readiness failures returns `1`; warnings never convert an unknown result into success.
+For malformed input, an unavailable artifact directory, or restore/source/cache/tooling infrastructure that prevents a trustworthy rehearsal, NuGetReady returns status `error` and exit code `2` with an actionable diagnostic. A reproducibly unready package, including one with a corrupt library asset or unusable build diagnostic, returns status `fail` and exit code `1`; warnings never convert an unknown result into success.
 
 ## Troubleshooting
 
