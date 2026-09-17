@@ -25,11 +25,23 @@
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
     <PublishSingleFile>false</PublishSingleFile>
+    <NoWarn>$(NoWarn);NU5128</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="NuGet.Packaging" />
+    <PackageReference Include="KeelMatrix.Telemetry" />
     <None Include="README.md" Pack="true" PackagePath="README.md" />
     <None Include="..\..\icon.png" Pack="true" PackagePath="icon.png" Link="icon.png" Visible="false" />
   </ItemGroup>
+
+  <!-- PackAsTool suppresses dependencies by default; retain the required
+       KeelMatrix.Telemetry dependency in the generated nuspec. -->
+  <Target Name="EnableNuGetReadyPackageDependencies"
+          BeforeTargets="_GetFrameworksWithSuppressedDependencies"
+          Condition="'$(PackAsTool)' == 'true'">
+    <PropertyGroup>
+      <SuppressDependenciesWhenPacking>false</SuppressDependenciesWhenPacking>
+    </PropertyGroup>
+  </Target>
 </Project>

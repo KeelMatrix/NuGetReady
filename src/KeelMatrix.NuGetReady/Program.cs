@@ -4,7 +4,16 @@ public static class Program
 {
     public static int Main(string[] args)
     {
+        return NuGetReadyApplication.Run(args, new NuGetReadyTelemetry());
+    }
+}
+
+internal static class NuGetReadyApplication
+{
+    internal static int Run(string[] args, IUsageTelemetry telemetry)
+    {
         CliOptions? options = null;
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
         try
         {
             options = CliParser.Parse(args);
@@ -12,6 +21,7 @@ public static class Program
             var repositoryPath = Path.GetDirectoryName(Path.GetFullPath(options.ConfigPath))!;
             var report = CheckRunner.Run(config, options.ArtifactsPath, repositoryPath, options.Timeout);
             ReportWriter.Write(report, options.Format);
+            TelemetryCoordinator.RecordIfTrustworthy(config, report, stopwatch.Elapsed, telemetry);
             return report.ExitCode;
         }
         catch (HelpRequestedException)

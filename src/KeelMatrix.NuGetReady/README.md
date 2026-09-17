@@ -22,6 +22,6 @@ The check validates the declared `.nupkg` and `.snupkg` set, inspects archive me
 
 NuGetReady performs narrow structural workflow checks; it does not publish packages, create releases, or prove arbitrary GitHub Actions behavior. The consumer rehearsal is not a sandbox: package code and build assets may execute with the caller's permissions. Use trusted package inputs and an appropriate account.
 
-NuGetReady itself does not send telemetry. See the [privacy policy](https://github.com/KeelMatrix/NuGetReady/blob/main/PRIVACY.md) and [security policy](https://github.com/KeelMatrix/NuGetReady/blob/main/SECURITY.md) for the data and execution boundaries.
+NuGetReady uses `KeelMatrix.Telemetry` for anonymous activation and at-most-weekly heartbeat signals after a trustworthy completed rehearsal. Set `KEELMATRIX_NO_TELEMETRY=1` to opt out; KeelMatrix development and CI suppress telemetry. See the [privacy policy](https://github.com/KeelMatrix/NuGetReady/blob/main/PRIVACY.md) and [security policy](https://github.com/KeelMatrix/NuGetReady/blob/main/SECURITY.md) for the data and execution boundaries.
 
 See the [repository README](https://github.com/KeelMatrix/NuGetReady/blob/main/README.md) for the configuration schema, troubleshooting, and complete check-family documentation.

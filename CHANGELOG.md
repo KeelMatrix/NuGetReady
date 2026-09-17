@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Includes opt-out-aware `KeelMatrix.Telemetry` activation and at-most-weekly heartbeat requests after trustworthy completed release rehearsals, with bounded aggregate context and KeelMatrix development/CI suppression.
+
 ### Fixed
 
 - Classifies unavailable restore sources and related tooling infrastructure as exit-code-2 errors while preserving exit code 1 for reproducibly unready package assets, including bad-image diagnostics.

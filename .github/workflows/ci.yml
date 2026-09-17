@@ -23,6 +23,7 @@ jobs:
       matrix:
         os: [windows-latest, ubuntu-latest, macos-latest]
     env:
+      KEELMATRIX_NO_TELEMETRY: '1'
       DOTNET_CLI_TELEMETRY_OPTOUT: '1'
       DOTNET_NOLOGO: '1'
       NUGET_XMLDOC_MODE: skip
@@ -128,11 +129,16 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          $root = $env:GITHUB_WORKSPACE
           $packages = Join-Path $env:GITHUB_WORKSPACE 'artifacts/packages'
           if (Test-Path $packages) { Remove-Item $packages -Recurse -Force }
           New-Item $packages -ItemType Directory -Force | Out-Null
           dotnet pack src/KeelMatrix.NuGetReady/KeelMatrix.NuGetReady.csproj --configuration Release --no-build --no-restore --include-symbols -p:SymbolPackageFormat=snupkg --output $packages --nologo -p:UseSharedCompilation=false
           if ($LASTEXITCODE -ne 0) { throw "Tool package creation failed." }
+          pwsh -NoProfile -File (Join-Path $root 'scripts/inspect-package.ps1') `
+            -PackagePath (Join-Path $packages 'KeelMatrix.NuGetReady.0.1.0.nupkg') `
+            -SymbolsPackagePath (Join-Path $packages 'KeelMatrix.NuGetReady.0.1.0.snupkg')
+          if ($LASTEXITCODE -ne 0) { throw "Tool package inspection failed." }
           dotnet run --project src/KeelMatrix.NuGetReady/KeelMatrix.NuGetReady.csproj --configuration Release --no-build --no-restore -- check --config nugetready.json --artifacts $packages --format json
           if ($LASTEXITCODE -ne 0) { throw "Built tool package inspection failed." }
 
@@ -166,6 +172,7 @@ jobs:
               <clear />
               <packageSource key="local"><package pattern="KeelMatrix.NuGetReady" /></packageSource>
               <packageSource key="public">
+                <package pattern="KeelMatrix.Telemetry" />
                 <package pattern="NuGet.*" />
                 <package pattern="Microsoft.*" />
                 <package pattern="System.*" />

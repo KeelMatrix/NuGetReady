@@ -30,6 +30,7 @@ internal static class ConsumerRehearsal
     private const int DiagnosticLimit = 16 * 1024;
     private static readonly string[] PublicPackagePatterns =
     {
+        "KeelMatrix.Telemetry",
         "System.*",
         "Microsoft.*",
         "NuGet.*",

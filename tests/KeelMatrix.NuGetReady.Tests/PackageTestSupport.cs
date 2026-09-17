@@ -48,7 +48,10 @@ internal sealed partial class PackedCorpus : IDisposable
             "--ignore-failed-sources",
             "--disable-parallel",
             "--nologo",
-            "-p:UseSharedCompilation=false"
+            "-p:UseSharedCompilation=false",
+            // The harness can run inside a parent workspace that has its own
+            // Directory.Build.targets. Fixture packs must be self-contained.
+            "-p:ImportDirectoryBuildTargets=false"
         };
         foreach (var source in sources)
         {

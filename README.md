@@ -46,6 +46,10 @@ The configuration contains no publishing credentials. When a release workflow is
 
 For malformed input, an unavailable artifact directory, or restore/source/cache/tooling infrastructure that prevents a trustworthy rehearsal, NuGetReady returns status `error` and exit code `2` with an actionable diagnostic. A reproducibly unready package, including one with a corrupt library asset or unusable build diagnostic, returns status `fail` and exit code `1`; warnings never convert an unknown result into success.
 
+## Privacy and telemetry
+
+NuGetReady uses `KeelMatrix.Telemetry` for anonymous activation and at-most-weekly heartbeat signals after a trustworthy completed rehearsal. It does not send package IDs, dependency names, repository identity, package contents, source paths, workflow content, failure logs, or configuration content. Set `KEELMATRIX_NO_TELEMETRY=1` to opt out for the current process; `DOTNET_CLI_TELEMETRY_OPTOUT=1`, `DO_NOT_TRACK=1`, and the shared package's repository-local opt-out files are also honored. KeelMatrix development and CI suppress telemetry. See [PRIVACY.md](PRIVACY.md) for the full boundary.
+
 ## Troubleshooting
 
 - Confirm the config path and artifact directory are the intended repository-local paths.
