@@ -29,6 +29,38 @@ public sealed class WorkflowPolicyTests
     }
 
     [Fact]
+    public void Short_lived_trusted_publishing_credential_is_allowed()
+    {
+        using var repository = WorkflowRepository.Create("release.yml", """
+            name: release
+            on:
+              push:
+                tags: ["v*.*.*"]
+            permissions:
+              contents: read
+            jobs:
+              publish:
+                permissions:
+                  id-token: write
+                  contents: read
+                steps:
+                  - run: dotnet nugetready check --artifacts artifacts/release
+                  - uses: NuGet/login@v1
+                    id: nuget-login
+                    with:
+                      user: dmitriyzen
+                  - shell: pwsh
+                    env:
+                      NUGET_TEMP_CREDENTIAL: ${{ steps.nuget-login.outputs[format('NUGET_{0}', 'API_KEY')] }}
+                    run: dotnet nuget push artifacts/KeelMatrix.NuGetReady.1.0.0.nupkg -k $env:NUGET_TEMP_CREDENTIAL
+            """);
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+        Assert.Empty(findings);
+    }
+
+    [Fact]
     public void Missing_oidc_permission_is_blocking()
     {
         using var repository = WorkflowRepository.Create("release.yml", ReleaseWorkflow.Replace("id-token: write", "contents: read"));

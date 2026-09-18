@@ -63,7 +63,9 @@ internal static partial class WorkflowPolicyInspector
                 continue;
             }
 
-            if (LongLivedNuGetCredentialRegex().IsMatch(content))
+            var hasTrustedPublishingLogin = TrustedPublishingRegex().IsMatch(content);
+            var hasApiKeyPush = ApiKeyPushRegex().IsMatch(content);
+            if (LongLivedNuGetCredentialRegex().IsMatch(content) || (hasApiKeyPush && !hasTrustedPublishingLogin))
             {
                 failures.Add(new Failure("workflow-policy", "Release workflow contains a long-lived NuGet API-key publication path."));
             }
@@ -109,8 +111,11 @@ internal static partial class WorkflowPolicyInspector
                TrustedPublishingRegex().IsMatch(content);
     }
 
-    [GeneratedRegex("(?i)(NUGET[._-]?API[._-]?KEY|NUGETAPIKEY|--api-key|--ApiKey)")]
+    [GeneratedRegex("(?i)(?:secrets|vars)\\.[A-Z0-9._-]*NUGET[._-]?API[._-]?KEY|NUGET[._-]?API[._-]?KEY\\s*[:=]")]
     private static partial Regex LongLivedNuGetCredentialRegex();
+
+    [GeneratedRegex("(?i)(?:--api-key|--ApiKey|\\s-k\\s)")]
+    private static partial Regex ApiKeyPushRegex();
 
     [GeneratedRegex("(?ms)^\\s*on\\s*:\\s*.*?^\\s*push\\s*:\\s*.*?^\\s*tags\\s*:", RegexOptions.Multiline)]
     private static partial Regex TagTriggerRegex();

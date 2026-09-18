@@ -1,0 +1,202 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to validate against the current repository state
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      version: ${{ steps.release-version.outputs.version }}
+    env:
+      KEELMATRIX_NO_TELEMETRY: '1'
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+      DOTNET_NOLOGO: '1'
+      NUGET_XMLDOC_MODE: skip
+      MSBUILDDISABLENODEREUSE: '1'
+
+    steps:
+      - name: Check out source at the triggering ref
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.ref }}
+
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          global-json-file: global.json
+
+      - name: Restore from controlled sources
+        shell: pwsh
+        run: |
+          dotnet restore KeelMatrix.NuGetReady.sln --configfile NuGet.config --nologo -p:NuGetAuditMode=all -p:NuGetAuditLevel=low -p:TreatWarningsAsErrors=true
+          if ($LASTEXITCODE -ne 0) { throw "Dependency restore or NuGet audit failed." }
+
+      - name: Resolve and validate release version
+        id: release-version
+        shell: pwsh
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_EVENT_NAME -eq 'push') {
+            if ($env:GITHUB_REF_NAME -notmatch '^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$') {
+              throw "The pushed ref is not a supported version tag: $env:GITHUB_REF_NAME"
+            }
+            $version = $env:GITHUB_REF_NAME.Substring(1)
+            $mode = 'Tag'
+          }
+          else {
+            $version = $env:INPUT_VERSION
+            if ([string]::IsNullOrWhiteSpace($version)) { throw "workflow_dispatch requires a version input." }
+            $mode = 'PreRelease'
+          }
+
+          $arguments = @(
+            '-NoProfile', '-NonInteractive', '-File', 'scripts/validate-release-contract.ps1',
+            '-RepositoryRoot', $env:GITHUB_WORKSPACE,
+            '-Mode', $mode,
+            '-ExpectedVersion', $version
+          )
+          if ($mode -eq 'Tag') { $arguments += @('-TagVersion', $env:GITHUB_REF_NAME) }
+          & pwsh @arguments
+          if ($LASTEXITCODE -ne 0) { throw "Release contract validation failed." }
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Verify format
+        shell: pwsh
+        run: |
+          dotnet format KeelMatrix.NuGetReady.sln --verify-no-changes --no-restore --verbosity minimal
+          if ($LASTEXITCODE -ne 0) { throw "Formatting verification failed." }
+
+      - name: Build Release
+        shell: pwsh
+        run: |
+          dotnet build KeelMatrix.NuGetReady.sln --configuration Release --no-restore --nologo -p:UseSharedCompilation=false
+          if ($LASTEXITCODE -ne 0) { throw "Release build failed." }
+
+      - name: Run release tests
+        shell: pwsh
+        run: |
+          dotnet test KeelMatrix.NuGetReady.sln --configuration Release --no-build --no-restore --nologo --logger "console;verbosity=minimal"
+          if ($LASTEXITCODE -ne 0) { throw "Release tests failed." }
+
+      - name: Pack the exact release artifacts
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.release-version.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $output = Join-Path $env:GITHUB_WORKSPACE 'artifacts/release'
+          if (Test-Path -LiteralPath $output) { Remove-Item -LiteralPath $output -Recurse -Force }
+          New-Item -ItemType Directory -Path $output -Force | Out-Null
+          dotnet pack src/KeelMatrix.NuGetReady/KeelMatrix.NuGetReady.csproj --configuration Release --no-build --no-restore --include-symbols -p:SymbolPackageFormat=snupkg -p:ImportDirectoryBuildTargets=false -p:ImportDirectoryTargets=false --output $output --nologo -p:UseSharedCompilation=false
+          if ($LASTEXITCODE -ne 0) { throw "Release package creation failed." }
+
+          $expected = @(
+            "KeelMatrix.NuGetReady.$env:RELEASE_VERSION.nupkg",
+            "KeelMatrix.NuGetReady.$env:RELEASE_VERSION.snupkg"
+          )
+          $actual = @(Get-ChildItem -LiteralPath $output -File | ForEach-Object { $_.Name })
+          $difference = Compare-Object ($expected | Sort-Object) ($actual | Sort-Object)
+          if ($null -ne $difference) {
+            throw "Release output is not the exact expected artifact set. Expected: $($expected -join ', '). Actual: $($actual -join ', ')."
+          }
+
+      - name: Inspect the exact package archives
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.release-version.outputs.version }}
+        run: |
+          $output = Join-Path $env:GITHUB_WORKSPACE 'artifacts/release'
+          pwsh -NoProfile -File scripts/inspect-package.ps1 `
+            -PackagePath (Join-Path $output "KeelMatrix.NuGetReady.$env:RELEASE_VERSION.nupkg") `
+            -SymbolsPackagePath (Join-Path $output "KeelMatrix.NuGetReady.$env:RELEASE_VERSION.snupkg") `
+            -ExpectedVersion $env:RELEASE_VERSION
+          if ($LASTEXITCODE -ne 0) { throw "Package archive inspection failed." }
+
+      - name: Rehearse the built package
+        shell: pwsh
+        run: |
+          dotnet run --project src/KeelMatrix.NuGetReady/KeelMatrix.NuGetReady.csproj --configuration Release --no-build --no-restore -- check --config nugetready.json --artifacts artifacts/release --format json
+          if ($LASTEXITCODE -ne 0) { throw "Built package rehearsal failed." }
+
+      - name: Upload only the validated release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: validated-release-artifacts
+          if-no-files-found: error
+          path: |
+            artifacts/release/KeelMatrix.NuGetReady.${{ steps.release-version.outputs.version }}.nupkg
+            artifacts/release/KeelMatrix.NuGetReady.${{ steps.release-version.outputs.version }}.snupkg
+
+  publish:
+    name: Publish release
+    if: github.event_name == 'push'
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      KEELMATRIX_NO_TELEMETRY: '1'
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+      DOTNET_NOLOGO: '1'
+      NUGET_XMLDOC_MODE: skip
+      MSBUILDDISABLENODEREUSE: '1'
+
+    steps:
+      - name: Check out source at the triggering ref
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.ref }}
+
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          global-json-file: global.json
+
+      - name: Download the validated release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: validated-release-artifacts
+          path: artifacts/release
+
+      - name: Authenticate to NuGet.org with Trusted Publishing
+        id: nuget-login
+        uses: NuGet/login@v1
+        with:
+          user: dmitriyzen
+
+      - name: Publish the exact validated artifacts
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+          NUGET_TEMP_CREDENTIAL: ${{ steps.nuget-login.outputs[format('NUGET_{0}', 'API_KEY')] }}
+        run: |
+          $package = "artifacts/release/KeelMatrix.NuGetReady.$env:RELEASE_VERSION.nupkg"
+          $symbols = "artifacts/release/KeelMatrix.NuGetReady.$env:RELEASE_VERSION.snupkg"
+          dotnet nuget push $package -k $env:NUGET_TEMP_CREDENTIAL --source https://api.nuget.org/v3/index.json
+          if ($LASTEXITCODE -ne 0) { throw "NuGet package publication failed." }
+          dotnet nuget push $symbols -k $env:NUGET_TEMP_CREDENTIAL --source https://api.nuget.org/v3/index.json
+          if ($LASTEXITCODE -ne 0) { throw "NuGet symbol publication failed." }

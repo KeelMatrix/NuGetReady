@@ -46,6 +46,12 @@ jobs:
           dotnet list KeelMatrix.NuGetReady.sln package --vulnerable --include-transitive --configfile NuGet.config
           if ($LASTEXITCODE -ne 0) { throw "Vulnerability audit command failed." }
 
+      - name: Validate the pre-release contract
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File scripts/validate-release-contract.ps1 -RepositoryRoot $env:GITHUB_WORKSPACE -Mode PreRelease
+          if ($LASTEXITCODE -ne 0) { throw "Pre-release contract validation failed." }
+
       - name: Verify format and static analysis
         shell: pwsh
         run: |
