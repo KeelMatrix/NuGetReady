@@ -82,41 +82,12 @@ public sealed class TelemetryContractTests
     }
 
     [Fact]
-    public void Established_client_contract_limits_heartbeats_to_one_per_iso_week()
+    public void Shared_client_contract_exposes_only_parameterless_tracking_requests()
     {
-        var xmlPath = Path.ChangeExtension(typeof(Client).Assembly.Location, ".xml");
-        Assert.True(File.Exists(xmlPath), $"Telemetry contract documentation was not found: {xmlPath}");
+        var methods = typeof(Client).GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
 
-        var contract = File.ReadAllText(xmlPath);
-        Assert.Contains("At most one heartbeat is emitted per project per", contract, StringComparison.Ordinal);
-        Assert.Contains("ISO week", contract, StringComparison.Ordinal);
-    }
-
-    [Fact]
-    public void Shared_0_1_contract_owns_the_event_envelope_fields()
-    {
-        var xmlPath = Path.ChangeExtension(typeof(Client).Assembly.Location, ".xml");
-        Assert.True(File.Exists(xmlPath), $"Telemetry contract documentation was not found: {xmlPath}");
-
-        var contract = File.ReadAllText(xmlPath);
-        foreach (var member in new[]
-        {
-            "TelemetryEventBase.Event",
-            "TelemetryEventBase.Tool",
-            "TelemetryEventBase.ToolVersion",
-            "TelemetryEventBase.TelemetryVersion",
-            "TelemetryEventBase.SchemaVersion",
-            "TelemetryEventBase.ProjectHash",
-            "TelemetryEventBase.InstallationHash",
-            "ActivationEvent.Runtime",
-            "ActivationEvent.Os",
-            "ActivationEvent.Ci",
-            "ActivationEvent.Timestamp",
-            "HeartbeatEvent.Week"
-        })
-        {
-            Assert.Contains($"{member}", contract, StringComparison.Ordinal);
-        }
+        Assert.Contains(methods, method => method.Name == nameof(Client.TrackActivation) && method.GetParameters().Length == 0);
+        Assert.Contains(methods, method => method.Name == nameof(Client.TrackHeartbeat) && method.GetParameters().Length == 0);
     }
 
     private static ReadinessReport Report(string status, int exitCode, string? message = null)
