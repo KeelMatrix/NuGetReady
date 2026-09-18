@@ -1,4 +1,3 @@
-using System.Text.Json;
 using KeelMatrix.Telemetry;
 
 namespace KeelMatrix.NuGetReady.Tests;
@@ -9,50 +8,19 @@ public sealed class TelemetryContractTests
     public void Telemetry_is_requested_only_after_a_trustworthy_completed_rehearsal()
     {
         var telemetry = new RecordingTelemetry();
-        var config = Config("Synthetic.Package", "library");
 
-        TelemetryCoordinator.RecordIfTrustworthy(config, Report("pass", 0), TimeSpan.FromSeconds(2), telemetry);
-        TelemetryCoordinator.RecordIfTrustworthy(config, Report("fail", 1), TimeSpan.FromSeconds(3), telemetry);
-        TelemetryCoordinator.RecordIfTrustworthy(config, Report("error", 2), TimeSpan.FromSeconds(4), telemetry);
+        TelemetryCoordinator.RecordIfTrustworthy(Report("pass", 0), telemetry);
+        TelemetryCoordinator.RecordIfTrustworthy(Report("fail", 1), telemetry);
+        TelemetryCoordinator.RecordIfTrustworthy(Report("error", 2), telemetry);
 
-        Assert.Equal(2, telemetry.Usages.Count);
-        Assert.Equal("pass", telemetry.Usages[0].Outcome);
-        Assert.Equal("fail", telemetry.Usages[1].Outcome);
+        Assert.Equal(2, telemetry.CompletedRehearsals);
     }
 
     [Fact]
-    public void Telemetry_context_contains_only_bounded_approved_fields()
+    public void NuGetReady_does_not_pass_product_context_to_the_shared_client()
     {
-        var config = Config("Synthetic.Package.Id", "library");
-        config.Packages!.Add(new PackageExpectation
-        {
-            Id = "Synthetic.Dependency.Name",
-            Kind = "dotnetTool",
-            Version = "1.0.0",
-            Artifacts = ["synthetic-tool.nupkg"]
-        });
-        var report = Report("fail", 1, "C:/private/repository/config.json contains workflow content");
-
-        var usage = TelemetryUsage.Create(config, report, TimeSpan.FromSeconds(12));
-        using var json = JsonDocument.Parse(usage.ToJson());
-        var properties = json.RootElement.EnumerateObject().Select(property => property.Name).OrderBy(name => name, StringComparer.Ordinal).ToArray();
-
-        Assert.Equal(
-            new[]
-            {
-                "artifactKindDistribution",
-                "checkCountBucket",
-                "durationBucket",
-                "executionClass",
-                "outcome",
-                "packageCountBucket",
-                "productVersion"
-            },
-            properties);
-        Assert.DoesNotContain("Synthetic.Package.Id", usage.ToJson(), StringComparison.Ordinal);
-        Assert.DoesNotContain("Synthetic.Dependency.Name", usage.ToJson(), StringComparison.Ordinal);
-        Assert.DoesNotContain("C:/private/repository/config.json", usage.ToJson(), StringComparison.Ordinal);
-        Assert.DoesNotContain("workflow content", usage.ToJson(), StringComparison.Ordinal);
+        Assert.Empty(typeof(IUsageTelemetry).GetMethod(nameof(IUsageTelemetry.RecordCompletedRehearsal))!.GetParameters());
+        Assert.All(typeof(IKeelMatrixTelemetryClient).GetMethods(), method => Assert.Empty(method.GetParameters()));
     }
 
     [Fact]
@@ -66,15 +34,15 @@ public sealed class TelemetryContractTests
             return new RecordingClient();
         });
 
-        reporter.RecordCompletedRehearsal(Usage());
+        reporter.RecordCompletedRehearsal();
 
         Assert.Equal(0, created);
     }
 
     [Fact]
-    public void KeelMatrix_ci_suppresses_client_creation_and_emission()
+    public void KeelMatrix_ci_uses_the_repository_opt_out_to_suppress_emission()
     {
-        using var environment = new EnvironmentScope(("CI", "true"), ("KEELMATRIX_NO_TELEMETRY", null), ("DOTNET_CLI_TELEMETRY_OPTOUT", null), ("DO_NOT_TRACK", null));
+        using var environment = new EnvironmentScope(("CI", "true"), ("KEELMATRIX_NO_TELEMETRY", "1"), ("DOTNET_CLI_TELEMETRY_OPTOUT", null), ("DO_NOT_TRACK", null));
         var created = 0;
         var reporter = new NuGetReadyTelemetry(() =>
         {
@@ -82,7 +50,7 @@ public sealed class TelemetryContractTests
             return new RecordingClient();
         });
 
-        reporter.RecordCompletedRehearsal(Usage("ci"));
+        reporter.RecordCompletedRehearsal();
 
         Assert.Equal(0, created);
     }
@@ -91,10 +59,9 @@ public sealed class TelemetryContractTests
     public void Telemetry_failure_cannot_change_the_completed_result()
     {
         var report = Report("fail", 1);
-        var config = Config("Synthetic.Package", "library");
         var telemetry = new ThrowingTelemetry();
 
-        var exception = Record.Exception(() => TelemetryCoordinator.RecordIfTrustworthy(config, report, TimeSpan.FromSeconds(1), telemetry));
+        var exception = Record.Exception(() => TelemetryCoordinator.RecordIfTrustworthy(report, telemetry));
 
         Assert.Null(exception);
         Assert.Equal(1, report.ExitCode);
@@ -108,7 +75,7 @@ public sealed class TelemetryContractTests
         var client = new RecordingClient();
         var reporter = new NuGetReadyTelemetry(() => client);
 
-        reporter.RecordCompletedRehearsal(Usage());
+        reporter.RecordCompletedRehearsal();
 
         Assert.Equal(1, client.ActivationRequests);
         Assert.Equal(1, client.HeartbeatRequests);
@@ -125,9 +92,31 @@ public sealed class TelemetryContractTests
         Assert.Contains("ISO week", contract, StringComparison.Ordinal);
     }
 
-    private static TelemetryUsage Usage(string executionClass = "local")
+    [Fact]
+    public void Shared_0_1_contract_owns_the_event_envelope_fields()
     {
-        return new TelemetryUsage("0.1.0", "1", new Dictionary<string, int> { ["library"] = 1 }, "6-10", "pass", executionClass, "1-5s");
+        var xmlPath = Path.ChangeExtension(typeof(Client).Assembly.Location, ".xml");
+        Assert.True(File.Exists(xmlPath), $"Telemetry contract documentation was not found: {xmlPath}");
+
+        var contract = File.ReadAllText(xmlPath);
+        foreach (var member in new[]
+        {
+            "TelemetryEventBase.Event",
+            "TelemetryEventBase.Tool",
+            "TelemetryEventBase.ToolVersion",
+            "TelemetryEventBase.TelemetryVersion",
+            "TelemetryEventBase.SchemaVersion",
+            "TelemetryEventBase.ProjectHash",
+            "TelemetryEventBase.InstallationHash",
+            "ActivationEvent.Runtime",
+            "ActivationEvent.Os",
+            "ActivationEvent.Ci",
+            "ActivationEvent.Timestamp",
+            "HeartbeatEvent.Week"
+        })
+        {
+            Assert.Contains($"{member}", contract, StringComparison.Ordinal);
+        }
     }
 
     private static ReadinessReport Report(string status, int exitCode, string? message = null)
@@ -143,25 +132,16 @@ public sealed class TelemetryContractTests
         };
     }
 
-    private static NuGetReadyConfig Config(string id, string kind)
-    {
-        return new NuGetReadyConfig
-        {
-            SchemaVersion = 1,
-            Packages = [new PackageExpectation { Id = id, Kind = kind, Version = "1.0.0", Artifacts = [$"{id}.1.0.0.nupkg"] }]
-        };
-    }
-
     private sealed class RecordingTelemetry : IUsageTelemetry
     {
-        internal List<TelemetryUsage> Usages { get; } = [];
+        internal int CompletedRehearsals { get; private set; }
 
-        public void RecordCompletedRehearsal(TelemetryUsage usage) => Usages.Add(usage);
+        public void RecordCompletedRehearsal() => CompletedRehearsals++;
     }
 
     private sealed class ThrowingTelemetry : IUsageTelemetry
     {
-        public void RecordCompletedRehearsal(TelemetryUsage usage) => throw new InvalidOperationException("synthetic telemetry outage");
+        public void RecordCompletedRehearsal() => throw new InvalidOperationException("synthetic telemetry outage");
     }
 
     private sealed class RecordingClient : IKeelMatrixTelemetryClient

@@ -13,7 +13,6 @@ internal static class NuGetReadyApplication
     internal static int Run(string[] args, IUsageTelemetry telemetry)
     {
         CliOptions? options = null;
-        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
         try
         {
             options = CliParser.Parse(args);
@@ -21,7 +20,7 @@ internal static class NuGetReadyApplication
             var repositoryPath = Path.GetDirectoryName(Path.GetFullPath(options.ConfigPath))!;
             var report = CheckRunner.Run(config, options.ArtifactsPath, repositoryPath, options.Timeout);
             ReportWriter.Write(report, options.Format);
-            TelemetryCoordinator.RecordIfTrustworthy(config, report, stopwatch.Elapsed, telemetry);
+            TelemetryCoordinator.RecordIfTrustworthy(report, telemetry);
             return report.ExitCode;
         }
         catch (HelpRequestedException)

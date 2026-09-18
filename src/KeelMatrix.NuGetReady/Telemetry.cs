@@ -1,12 +1,10 @@
-using System.Text.Json;
-using System.Text.Json.Serialization;
 using KeelMatrix.Telemetry;
 
 namespace KeelMatrix.NuGetReady;
 
 internal interface IUsageTelemetry
 {
-    void RecordCompletedRehearsal(TelemetryUsage usage);
+    void RecordCompletedRehearsal();
 }
 
 internal interface IKeelMatrixTelemetryClient
@@ -31,20 +29,19 @@ internal sealed class NuGetReadyTelemetry : IUsageTelemetry
         this.clientFactory = clientFactory;
     }
 
-    public void RecordCompletedRehearsal(TelemetryUsage usage)
+    public void RecordCompletedRehearsal()
     {
         try
         {
-            // KeelMatrix CI is explicitly suppressed. Local KeelMatrix development uses
-            // the same established process opt-out as the shared telemetry client.
-            if (usage.ExecutionClass == "ci" || TelemetryOptOut.IsProcessDisabled())
+            // KeelMatrix development and CI set the shared process opt-out. Consumer CI
+            // remains a valid usage class and is represented by the shared client.
+            if (TelemetryOptOut.IsProcessDisabled())
             {
                 return;
             }
 
             client ??= clientFactory();
             client.TrackActivation();
-            // KeelMatrix.Telemetry persists the ISO-week marker and suppresses repeats.
             client.TrackHeartbeat();
         }
         catch
@@ -66,9 +63,7 @@ internal sealed class NuGetReadyTelemetry : IUsageTelemetry
 internal static class TelemetryCoordinator
 {
     internal static void RecordIfTrustworthy(
-        NuGetReadyConfig config,
         ReadinessReport report,
-        TimeSpan duration,
         IUsageTelemetry telemetry)
     {
         // A completed readiness result (pass/warn/fail) is trustworthy. An input or
@@ -80,103 +75,11 @@ internal static class TelemetryCoordinator
 
         try
         {
-            telemetry.RecordCompletedRehearsal(TelemetryUsage.Create(config, report, duration));
+            telemetry.RecordCompletedRehearsal();
         }
         catch
         {
             // A custom/test reporter must have the same failure isolation guarantee.
-        }
-    }
-}
-
-internal sealed record TelemetryUsage(
-    string ProductVersion,
-    string PackageCountBucket,
-    IReadOnlyDictionary<string, int> ArtifactKindDistribution,
-    string CheckCountBucket,
-    string Outcome,
-    string ExecutionClass,
-    string DurationBucket)
-{
-    private static readonly JsonSerializerOptions JsonOptions = new()
-    {
-        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-        Converters = { new JsonStringEnumConverter() }
-    };
-
-    internal static TelemetryUsage Create(NuGetReadyConfig config, ReadinessReport report, TimeSpan duration)
-    {
-        var packages = config.Packages ?? [];
-        var distribution = packages
-            .GroupBy(package => NormalizeArtifactKind(package.Kind), StringComparer.Ordinal)
-            .OrderBy(group => group.Key, StringComparer.Ordinal)
-            .ToDictionary(group => group.Key, group => group.Count(), StringComparer.Ordinal);
-
-        return new TelemetryUsage(
-            ProductVersion: typeof(Program).Assembly.GetName().Version?.ToString(3) ?? "unknown",
-            PackageCountBucket: Bucket(packages.Count),
-            ArtifactKindDistribution: distribution,
-            CheckCountBucket: Bucket(report.Checks.Count),
-            Outcome: report.ExitCode == 1 ? "fail" : "pass",
-            ExecutionClass: IsCi() ? "ci" : "local",
-            DurationBucket: DurationBucketFor(duration));
-    }
-
-    internal string ToJson() => JsonSerializer.Serialize(this, JsonOptions);
-
-    private static string NormalizeArtifactKind(string? kind)
-    {
-        return kind switch
-        {
-            "library" => "library",
-            "multiTargetLibrary" => "multiTargetLibrary",
-            "dotnetTool" => "dotnetTool",
-            _ => "other"
-        };
-    }
-
-    private static string Bucket(int count)
-    {
-        return count switch
-        {
-            <= 0 => "0",
-            1 => "1",
-            <= 5 => "2-5",
-            <= 10 => "6-10",
-            _ => "11+"
-        };
-    }
-
-    private static string DurationBucketFor(TimeSpan duration)
-    {
-        return duration.TotalSeconds switch
-        {
-            < 1 => "under-1s",
-            < 5 => "1-5s",
-            < 30 => "5-30s",
-            < 120 => "30-120s",
-            _ => "120s+"
-        };
-    }
-
-    private static bool IsCi()
-    {
-        return HasValue("CI") ||
-               HasValue("GITHUB_ACTIONS") ||
-               HasValue("TF_BUILD") ||
-               HasValue("BUILD_BUILDID") ||
-               HasValue("JENKINS_URL");
-    }
-
-    private static bool HasValue(string name)
-    {
-        try
-        {
-            return !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(name));
-        }
-        catch
-        {
-            return false;
         }
     }
 }

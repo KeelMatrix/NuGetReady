@@ -4,7 +4,7 @@
 
 ### Added
 
-- Includes opt-out-aware `KeelMatrix.Telemetry` activation and at-most-weekly heartbeat requests after trustworthy completed release rehearsals, with bounded aggregate context and KeelMatrix development/CI suppression.
+- Includes opt-out-aware `KeelMatrix.Telemetry` 0.1.0 activation and at-most-weekly heartbeat requests after trustworthy completed release rehearsals, with shared-contract delivery and KeelMatrix development/CI suppression.
 
 ### Fixed
 

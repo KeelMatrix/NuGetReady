@@ -48,7 +48,7 @@ For malformed input, an unavailable artifact directory, or restore/source/cache/
 
 ## Privacy and telemetry
 
-NuGetReady uses `KeelMatrix.Telemetry` for anonymous activation and at-most-weekly heartbeat signals after a trustworthy completed rehearsal. It does not send package IDs, dependency names, repository identity, package contents, source paths, workflow content, failure logs, or configuration content. Set `KEELMATRIX_NO_TELEMETRY=1` to opt out for the current process; `DOTNET_CLI_TELEMETRY_OPTOUT=1`, `DO_NOT_TRACK=1`, and the shared package's repository-local opt-out files are also honored. KeelMatrix development and CI suppress telemetry. See [PRIVACY.md](PRIVACY.md) for the full boundary.
+NuGetReady uses `KeelMatrix.Telemetry` 0.1.0 for shared activation and at-most-weekly heartbeat signals after a trustworthy completed rehearsal. NuGetReady passes no package IDs, dependency names, repository identity, package contents, source paths, workflow content, failure logs, or configuration content to the shared client. Set `KEELMATRIX_NO_TELEMETRY=1` to opt out for the current process; the shared package's other documented opt-out controls are also honored. This repository disables telemetry for development and CI. See [PRIVACY.md](PRIVACY.md) for the product-specific boundary and the shared package's [privacy policy](https://github.com/KeelMatrix/Telemetry/blob/main/PRIVACY.md) for the shared contract.
 
 ## Troubleshooting
 
