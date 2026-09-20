@@ -45,6 +45,8 @@ public sealed class WorkflowPolicyTests
                 permissions:
                   id-token: write
                   contents: read
+                env:
+                  KEELMATRIX_NO_TELEMETRY: '1'
                 steps:
                   - run: dotnet nugetready check --artifacts artifacts/release
                   - uses: NuGet/login@v1
