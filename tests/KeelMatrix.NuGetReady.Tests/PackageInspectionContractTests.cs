@@ -38,6 +38,56 @@ public sealed class PackageInspectionContractTests
         Assert.NotEqual(0, result.ExitCode);
     }
 
+    [Fact]
+    public async Task Pack_fails_closed_for_local_environment_and_telemetry_files_even_when_directory_targets_are_disabled()
+    {
+        var project = FindRepositoryFile("src", "KeelMatrix.NuGetReady", "KeelMatrix.NuGetReady.csproj");
+        var projectDirectory = Path.GetDirectoryName(project)!;
+        var sensitiveFiles = new[] { ".env.local", "keelmatrix.telemetry.json" }
+            .Select(name => Path.Combine(projectDirectory, name))
+            .ToArray();
+        var output = Directory.CreateTempSubdirectory("nugetready-pack-guard-");
+        try
+        {
+            foreach (var path in sensitiveFiles)
+            {
+                File.WriteAllText(path, "local-only");
+            }
+
+            var result = await BoundedProcess.RunAsync(
+                "dotnet",
+                [
+                    "pack",
+                    project,
+                    "-c",
+                    "Release",
+                    "--no-build",
+                    "--no-restore",
+                    "-p:ImportDirectoryBuildTargets=false",
+                    "-p:ImportDirectoryTargets=false",
+                    "-o",
+                    output.FullName
+                ],
+                FindRepositoryFile(),
+                new Dictionary<string, string?> { ["DOTNET_CLI_TELEMETRY_OPTOUT"] = "1" },
+                TimeSpan.FromSeconds(30));
+
+            Assert.NotEqual(0, result.ExitCode);
+        }
+        finally
+        {
+            foreach (var path in sensitiveFiles)
+            {
+                if (File.Exists(path))
+                {
+                    File.Delete(path);
+                }
+            }
+
+            output.Delete(recursive: true);
+        }
+    }
+
     private static string CreateArchive(string path, bool symbols, string? extraEntry)
     {
         using var stream = File.Create(path);
@@ -88,8 +138,8 @@ public sealed class PackageInspectionContractTests
         var directory = new DirectoryInfo(AppContext.BaseDirectory);
         while (directory is not null)
         {
-            var path = Path.Combine([directory.FullName, .. parts]);
-            if (File.Exists(path))
+            var path = parts.Length == 0 ? directory.FullName : Path.Combine([directory.FullName, .. parts]);
+            if ((parts.Length == 0 && File.Exists(Path.Combine(path, "KeelMatrix.NuGetReady.sln"))) || File.Exists(path))
             {
                 return path;
             }

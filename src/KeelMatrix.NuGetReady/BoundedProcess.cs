@@ -16,6 +16,14 @@ internal sealed record ProcessResult(
 internal static class BoundedProcess
 {
     private const int DefaultOutputLimit = 16 * 1024;
+    private static readonly TimeSpan TerminationGracePeriod = TimeSpan.FromMilliseconds(500);
+    private static readonly string[] RestoreEnvironmentOverrides =
+    {
+        "NUGET_FALLBACK_PACKAGES",
+        "RestoreFallbackFolders",
+        "RestoreSources",
+        "RestoreAdditionalProjectSources"
+    };
 
     public static async Task<ProcessResult> RunAsync(
         string fileName,
@@ -26,11 +34,12 @@ internal static class BoundedProcess
         int outputLimit = DefaultOutputLimit,
         CancellationToken cancellationToken = default)
     {
+        var useUnixProcessGroup = !OperatingSystem.IsWindows();
         using var process = new Process
         {
             StartInfo = new ProcessStartInfo
             {
-                FileName = fileName,
+                FileName = useUnixProcessGroup ? "setsid" : fileName,
                 WorkingDirectory = workingDirectory,
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
@@ -38,6 +47,11 @@ internal static class BoundedProcess
                 CreateNoWindow = true
             }
         };
+
+        if (useUnixProcessGroup)
+        {
+            process.StartInfo.ArgumentList.Add(fileName);
+        }
 
         foreach (var argument in arguments)
         {
@@ -47,6 +61,14 @@ internal static class BoundedProcess
         foreach (var pair in environment)
         {
             process.StartInfo.Environment[pair.Key] = pair.Value;
+        }
+
+        foreach (var key in RestoreEnvironmentOverrides)
+        {
+            if (!environment.ContainsKey(key))
+            {
+                process.StartInfo.Environment[key] = null;
+            }
         }
 
         try
@@ -62,35 +84,73 @@ internal static class BoundedProcess
         }
 
         WindowsProcessJob? processJob = WindowsProcessJob.TryAttach(process);
+        using var lifecycleCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         try
         {
-            var standardOutput = CaptureAsync(process.StandardOutput, outputLimit, cancellationToken);
-            var standardError = CaptureAsync(process.StandardError, outputLimit, cancellationToken);
-            var waitForExit = process.WaitForExitAsync(cancellationToken);
-            var timeoutTask = Task.Delay(timeout, cancellationToken);
-            var completed = await Task.WhenAny(waitForExit, timeoutTask).ConfigureAwait(false);
-            var timedOut = completed != waitForExit;
+            var standardOutput = CaptureAsync(process.StandardOutput, outputLimit, lifecycleCancellation.Token);
+            var standardError = CaptureAsync(process.StandardError, outputLimit, lifecycleCancellation.Token);
+            var waitForExit = process.WaitForExitAsync(CancellationToken.None);
+            var completeLifecycle = Task.WhenAll(waitForExit, standardOutput, standardError);
+            var timeoutTask = Task.Delay(timeout, CancellationToken.None);
+            var cancellationTask = Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            var completed = await Task.WhenAny(completeLifecycle, timeoutTask, cancellationTask).ConfigureAwait(false);
 
-            if (timedOut)
+            if (completed == cancellationTask)
             {
-                TryKill(process);
-                await process.WaitForExitAsync(CancellationToken.None).ConfigureAwait(false);
+                Terminate(process, processJob, useUnixProcessGroup);
+                await DrainAfterTerminationAsync(completeLifecycle, lifecycleCancellation).ConfigureAwait(false);
+                cancellationToken.ThrowIfCancellationRequested();
             }
 
-            processJob?.Dispose();
-            processJob = null;
-            await Task.WhenAll(standardOutput, standardError).ConfigureAwait(false);
+            var timedOut = completed == timeoutTask;
+            if (timedOut)
+            {
+                Terminate(process, processJob, useUnixProcessGroup);
+                await DrainAfterTerminationAsync(completeLifecycle, lifecycleCancellation).ConfigureAwait(false);
+            }
+
+            if (completeLifecycle.IsCompletedSuccessfully)
+            {
+                processJob?.Dispose();
+                processJob = null;
+            }
+
             return new ProcessResult(
                 true,
                 timedOut ? -1 : process.ExitCode,
                 timedOut,
-                standardOutput.Result,
-                standardError.Result);
+                GetCompletedOutput(standardOutput),
+                GetCompletedOutput(standardError));
         }
         finally
         {
+            lifecycleCancellation.Cancel();
             processJob?.Dispose();
         }
+    }
+
+    private static async Task DrainAfterTerminationAsync(
+        Task completeLifecycle,
+        CancellationTokenSource lifecycleCancellation)
+    {
+        var drainTimeout = Task.Delay(TerminationGracePeriod);
+        var completed = await Task.WhenAny(completeLifecycle, drainTimeout).ConfigureAwait(false);
+        if (completed != completeLifecycle)
+        {
+            lifecycleCancellation.Cancel();
+            try
+            {
+                await completeLifecycle.ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+            }
+        }
+    }
+
+    private static string GetCompletedOutput(Task<string> output)
+    {
+        return output.Status == TaskStatus.RanToCompletion ? output.Result : string.Empty;
     }
 
     private static async Task<string> CaptureAsync(StreamReader reader, int limit, CancellationToken cancellationToken)
@@ -127,11 +187,16 @@ internal static class BoundedProcess
         return builder.ToString();
     }
 
-    private static void TryKill(Process process)
+    private static void Terminate(Process process, WindowsProcessJob? processJob, bool unixProcessGroup)
     {
+        processJob?.Dispose();
         try
         {
-            if (!process.HasExited)
+            if (unixProcessGroup)
+            {
+                _ = kill(-process.Id, SigKill);
+            }
+            else if (!process.HasExited)
             {
                 process.Kill(entireProcessTree: true);
             }
@@ -143,6 +208,11 @@ internal static class BoundedProcess
         {
         }
     }
+
+    private const int SigKill = 9;
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int kill(int processId, int signal);
 
     private sealed class WindowsProcessJob : IDisposable
     {

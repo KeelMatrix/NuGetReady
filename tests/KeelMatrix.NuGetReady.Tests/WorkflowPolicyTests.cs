@@ -17,6 +17,8 @@ public sealed class WorkflowPolicyTests
                 permissions:
                   id-token: write
                   contents: read
+                env:
+                  KEELMATRIX_NO_TELEMETRY: '1'
                 steps:
                   - run: dotnet nugetready check --artifacts artifacts/packages
                   - uses: NuGet/login@v1
@@ -164,10 +166,25 @@ public sealed class WorkflowPolicyTests
     [Fact]
     public void Artifact_validation_must_execute_before_publication()
     {
-        using var repository = WorkflowRepository.Create("release.yml", ReleaseWorkflow.Replace(
-            "- run: dotnet nugetready check --artifacts artifacts/packages\n              - uses: NuGet/login@v1\n              - run: dotnet nuget push",
-            "- uses: NuGet/login@v1\n              - run: dotnet nuget push\n              - run: dotnet nugetready check --artifacts artifacts/packages",
-            StringComparison.Ordinal));
+        using var repository = WorkflowRepository.Create("release.yml", """
+            name: release
+            on:
+              push:
+                tags: ["v*"]
+            permissions:
+              contents: read
+            env:
+              KEELMATRIX_NO_TELEMETRY: '1'
+            jobs:
+              publish:
+                permissions:
+                  id-token: write
+                  contents: read
+                steps:
+                  - uses: NuGet/login@v1
+                  - run: dotnet nuget push artifacts/KeelMatrix.NuGetReady.1.0.0.nupkg
+                  - run: dotnet nugetready check --artifacts artifacts/packages
+            """);
 
         var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
 
@@ -177,11 +194,33 @@ public sealed class WorkflowPolicyTests
     [Fact]
     public void Release_workflow_must_suppress_product_telemetry()
     {
-        using var repository = WorkflowRepository.Create("release.yml", ReleaseWorkflow);
+        using var repository = WorkflowRepository.Create("release.yml", ReleaseWorkflow.Replace(
+            "KEELMATRIX_NO_TELEMETRY",
+            "OTHER_ENVIRONMENT_VARIABLE",
+            StringComparison.Ordinal));
 
         var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
 
         Assert.Contains(findings, finding => finding.Message.Contains("telemetry", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void Repository_root_is_anchored_above_a_build_directory_config()
+    {
+        var root = Directory.CreateTempSubdirectory("nugetready-root-");
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(root.FullName, ".git"));
+            var configDirectory = Directory.CreateDirectory(Path.Combine(root.FullName, "build"));
+            var configPath = Path.Combine(configDirectory.FullName, "nugetready.json");
+            File.WriteAllText(configPath, "{}");
+
+            Assert.Equal(root.FullName, RepositoryLocator.FindRoot(configPath));
+        }
+        finally
+        {
+            root.Delete(recursive: true);
+        }
     }
 
     private const string ReleaseWorkflow = """
@@ -196,6 +235,8 @@ public sealed class WorkflowPolicyTests
             permissions:
               id-token: write
               contents: read
+            env:
+              KEELMATRIX_NO_TELEMETRY: '1'
             steps:
               - run: dotnet nugetready check --artifacts artifacts/packages
               - uses: NuGet/login@v1

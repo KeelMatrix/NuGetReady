@@ -10,3 +10,13 @@ TestResults/
 .env.*
 *.nupkg
 *.snupkg
+keelmatrix.telemetry.json
+local-telemetry.json
+*.log
+*.tmp
+*.bak
+*.swp
+.cache/
+.telemetry/
+.DS_Store
+Thumbs.db

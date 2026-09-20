@@ -17,7 +17,7 @@ internal static class NuGetReadyApplication
         {
             options = CliParser.Parse(args);
             var config = ConfigurationLoader.Load(options.ConfigPath);
-            var repositoryPath = Path.GetDirectoryName(Path.GetFullPath(options.ConfigPath))!;
+            var repositoryPath = RepositoryLocator.FindRoot(options.ConfigPath);
             var report = CheckRunner.Run(config, options.ArtifactsPath, repositoryPath, options.Timeout);
             ReportWriter.Write(report, options.Format);
             TelemetryCoordinator.RecordIfTrustworthy(report, telemetry);
@@ -67,5 +67,24 @@ internal static class NuGetReadyApplication
         {
             Console.Error.WriteLine($"Configuration error: {message}");
         }
+    }
+}
+
+internal static class RepositoryLocator
+{
+    public static string FindRoot(string configPath)
+    {
+        var configDirectory = new DirectoryInfo(Path.GetDirectoryName(Path.GetFullPath(configPath))!);
+        for (var directory = configDirectory; directory is not null; directory = directory.Parent)
+        {
+            if (Directory.Exists(Path.Combine(directory.FullName, ".git")) ||
+                File.Exists(Path.Combine(directory.FullName, ".git")) ||
+                Directory.Exists(Path.Combine(directory.FullName, ".github")))
+            {
+                return directory.FullName;
+            }
+        }
+
+        return configDirectory.FullName;
     }
 }

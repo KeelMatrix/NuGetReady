@@ -9,6 +9,9 @@
 ### Fixed
 
 - Classifies unavailable restore sources and related tooling infrastructure as exit-code-2 errors while preserving exit code 1 for reproducibly unready package assets, including bad-image diagnostics.
+- Prevents inherited fallback folders and shared-cache substitutions from satisfying consumer rehearsals, verifies restored package provenance, and supports declaration-order-independent public dependency graphs.
+- Validates portable PDBs, matching symbol layouts, file-based licenses, deliberate archive-sensitive paths, bounded process cleanup, safe deterministic diagnostics, truthful skipped-check states, and JSON-formatted CLI errors.
+- Makes workflow policy checks structural and job-scoped, publishes the package and adjacent symbols once, and closes package inspection and pack-time guards against unexpected or local-sensitive content.
 
 ## [0.1.0] - 2026-09-16
 

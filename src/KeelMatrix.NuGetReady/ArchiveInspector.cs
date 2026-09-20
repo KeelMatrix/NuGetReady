@@ -1,12 +1,17 @@
 using NuGet.Packaging;
 using NuGet.Packaging.Core;
+using System.Reflection.Metadata;
 using System.Xml.Linq;
 
 namespace KeelMatrix.NuGetReady;
 
 internal static class ArchiveInspector
 {
-    public static IReadOnlyList<Failure> Inspect(string path, PackageExpectation expectation, bool symbols)
+    public static IReadOnlyList<Failure> Inspect(
+        string path,
+        PackageExpectation expectation,
+        bool symbols,
+        string? mainPackagePath = null)
     {
         using var reader = new PackageArchiveReader(path);
         var nuspec = reader.NuspecReader;
@@ -21,10 +26,7 @@ internal static class ArchiveInspector
 
         if (symbols)
         {
-            if (!files.Any(file => file.EndsWith(".pdb", StringComparison.OrdinalIgnoreCase)))
-            {
-                failures.Add(new Failure("archive-layout", "Symbol archive does not contain a portable symbol file."));
-            }
+            CheckSymbols(reader, files, mainPackagePath, failures);
 
             CheckUnexpectedFiles(files, failures);
             return failures;
@@ -45,9 +47,15 @@ internal static class ArchiveInspector
             failures.Add(new Failure("archive-metadata", "Package tags are missing."));
         }
 
-        if (nuspec.GetLicenseMetadata() is null)
+        var license = nuspec.GetLicenseMetadata();
+        if (license is null)
         {
             failures.Add(new Failure("archive-metadata", "Package license metadata is missing."));
+        }
+        else if (string.Equals(license.Type.ToString(), "file", StringComparison.OrdinalIgnoreCase) &&
+                 (string.IsNullOrWhiteSpace(license.License) || !ContainsFile(files, license.License)))
+        {
+            failures.Add(new Failure("archive-metadata", "Package license metadata does not resolve to an archive file."));
         }
 
         var readme = nuspec.GetReadme();
@@ -161,6 +169,109 @@ internal static class ArchiveInspector
         }
     }
 
+    private static void CheckSymbols(
+        PackageArchiveReader symbolReader,
+        IReadOnlyList<string> symbolFiles,
+        string? mainPackagePath,
+        List<Failure> failures)
+    {
+        var pdbFiles = symbolFiles
+            .Where(file => file.EndsWith(".pdb", StringComparison.OrdinalIgnoreCase))
+            .OrderBy(file => file, StringComparer.Ordinal)
+            .ToArray();
+        if (pdbFiles.Length == 0)
+        {
+            failures.Add(new Failure("archive-layout", "Symbol archive does not contain a portable symbol file."));
+            return;
+        }
+
+        PackageArchiveReader? mainReader = null;
+        try
+        {
+            if (mainPackagePath is not null)
+            {
+                mainReader = new PackageArchiveReader(mainPackagePath);
+            }
+
+            var mainFiles = mainReader?.GetFiles()
+                .Select(Normalize)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            foreach (var pdbFile in pdbFiles)
+            {
+                try
+                {
+                    using var source = symbolReader.GetStream(pdbFile);
+                    using var stream = new MemoryStream();
+                    source.CopyTo(stream);
+                    stream.Position = 0;
+                    using var provider = System.Reflection.Metadata.MetadataReaderProvider.FromPortablePdbStream(stream);
+                    var metadata = provider.GetMetadataReader();
+                    if (metadata.DebugMetadataHeader is null)
+                    {
+                        failures.Add(new Failure("archive-layout", "Symbol archive contains a PDB without portable debug metadata."));
+                    }
+                    else
+                    {
+                        ValidateSourceLink(metadata, failures);
+                    }
+
+                    if (mainFiles is not null)
+                    {
+                        var expectedAssembly = pdbFile[..^4] + ".dll";
+                        if (!mainFiles.Contains(expectedAssembly))
+                        {
+                            failures.Add(new Failure("archive-layout", "Symbol archive contains a PDB without a matching package assembly."));
+                        }
+                    }
+                }
+                catch (BadImageFormatException)
+                {
+                    failures.Add(new Failure("archive-layout", "Symbol archive contains a malformed portable PDB."));
+                }
+                catch (InvalidDataException)
+                {
+                    failures.Add(new Failure("archive-layout", "Symbol archive contains a malformed portable PDB."));
+                }
+                catch (Exception)
+                {
+                    failures.Add(new Failure("archive-layout", "Symbol archive contains a malformed portable PDB."));
+                }
+            }
+        }
+        finally
+        {
+            mainReader?.Dispose();
+        }
+    }
+
+    private static void ValidateSourceLink(MetadataReader metadata, List<Failure> failures)
+    {
+        var sourceLinkGuid = new Guid("CC110556-A091-4D38-9FEC-25AB9A351A6A");
+        foreach (var handle in metadata.CustomDebugInformation)
+        {
+            var information = metadata.GetCustomDebugInformation(handle);
+            if (metadata.GetGuid(information.Kind) != sourceLinkGuid)
+            {
+                continue;
+            }
+
+            try
+            {
+                using var document = System.Text.Json.JsonDocument.Parse(metadata.GetBlobBytes(information.Value));
+                if (document.RootElement.ValueKind != System.Text.Json.JsonValueKind.Object ||
+                    !document.RootElement.TryGetProperty("documents", out var documents) ||
+                    documents.ValueKind != System.Text.Json.JsonValueKind.Object)
+                {
+                    failures.Add(new Failure("archive-layout", "Portable PDB SourceLink metadata is invalid."));
+                }
+            }
+            catch (System.Text.Json.JsonException)
+            {
+                failures.Add(new Failure("archive-layout", "Portable PDB SourceLink metadata is invalid."));
+            }
+        }
+    }
+
     private static void CheckToolCommand(PackageArchiveReader reader, IReadOnlyList<string> files, PackageExpectation expectation, List<Failure> failures)
     {
         var settingsPath = files.FirstOrDefault(file => file.EndsWith("/DotnetToolSettings.xml", StringComparison.OrdinalIgnoreCase));
@@ -209,25 +320,26 @@ internal static class ArchiveInspector
     private static bool IsUnexpectedFile(string file)
     {
         var lower = file.ToLowerInvariant();
+        var name = lower[(lower.LastIndexOf('/') + 1)..];
         return lower.Contains("../", StringComparison.Ordinal) ||
                lower.StartsWith(".git/", StringComparison.Ordinal) ||
                lower.StartsWith(".github/", StringComparison.Ordinal) ||
                lower.Contains("/obj/", StringComparison.Ordinal) ||
                lower.Contains("/bin/", StringComparison.Ordinal) ||
                lower.Contains("node_modules/", StringComparison.Ordinal) ||
+               lower.EndsWith("/agents.md", StringComparison.Ordinal) ||
                lower.Equals("agents.md", StringComparison.Ordinal) ||
-               lower.EndsWith("/.env", StringComparison.Ordinal) ||
+               lower.Equals(".env", StringComparison.Ordinal) ||
+               lower.StartsWith(".env.", StringComparison.Ordinal) ||
                lower.Contains("/.env.", StringComparison.Ordinal) ||
+               lower.EndsWith("/.env", StringComparison.Ordinal) ||
+               lower.EndsWith("/keelmatrix.telemetry.json", StringComparison.Ordinal) ||
+               lower.Equals("keelmatrix.telemetry.json", StringComparison.Ordinal) ||
                lower.EndsWith(".pfx", StringComparison.Ordinal) ||
                lower.EndsWith(".p12", StringComparison.Ordinal) ||
                lower.EndsWith(".pem", StringComparison.Ordinal) ||
                lower.EndsWith(".key", StringComparison.Ordinal) ||
-               lower.Contains("secret", StringComparison.Ordinal) ||
-               lower.Contains("credential", StringComparison.Ordinal) ||
-               lower.Contains("password", StringComparison.Ordinal) ||
-               lower.Contains("apikey", StringComparison.Ordinal) ||
-               lower.Contains("api-key", StringComparison.Ordinal) ||
-               lower.Contains("access-token", StringComparison.Ordinal) ||
+               name is "apikey" or "api-key" or "access-token" or "credentials.json" or "password" or "secret" ||
                lower.EndsWith(".user", StringComparison.Ordinal) ||
                lower.EndsWith(".suo", StringComparison.Ordinal);
     }

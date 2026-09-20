@@ -10,7 +10,6 @@ on:
         description: Version to validate against the current repository state
         required: true
         type: string
-
 permissions:
   contents: read
 
@@ -188,15 +187,12 @@ jobs:
         with:
           user: dmitriyzen
 
-      - name: Publish the exact validated artifacts
+      - name: Publish the exact validated package and adjacent symbols once
         shell: pwsh
         env:
           RELEASE_VERSION: ${{ needs.validate.outputs.version }}
           NUGET_TEMP_CREDENTIAL: ${{ steps.nuget-login.outputs[format('NUGET_{0}', 'API_KEY')] }}
         run: |
           $package = "artifacts/release/KeelMatrix.NuGetReady.$env:RELEASE_VERSION.nupkg"
-          $symbols = "artifacts/release/KeelMatrix.NuGetReady.$env:RELEASE_VERSION.snupkg"
           dotnet nuget push $package -k $env:NUGET_TEMP_CREDENTIAL --source https://api.nuget.org/v3/index.json
           if ($LASTEXITCODE -ne 0) { throw "NuGet package publication failed." }
-          dotnet nuget push $symbols -k $env:NUGET_TEMP_CREDENTIAL --source https://api.nuget.org/v3/index.json
-          if ($LASTEXITCODE -ne 0) { throw "NuGet symbol publication failed." }

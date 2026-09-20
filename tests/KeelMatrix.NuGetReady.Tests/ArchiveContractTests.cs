@@ -1,3 +1,4 @@
+using System.IO.Compression;
 using System.Text.Json;
 
 namespace KeelMatrix.NuGetReady.Tests;
@@ -126,20 +127,20 @@ public sealed class ArchiveContractTests
     [Fact]
     public void Tool_and_symbol_archives_pass_with_their_declared_layouts()
     {
-        using var fixture = PackageFixture.Create();
-        fixture.AddPackage("example-tool.1.2.3.nupkg", "example-tool", "1.2.3", kind: "dotnetTool");
-        fixture.AddSymbols("example-tool.1.2.3.snupkg", "example-tool", "1.2.3");
+        using var corpus = PackedCorpus.Create();
+        var package = corpus.Pack("Tool/Tool.csproj");
+        var symbols = Path.Combine(corpus.OutputPath, "Fixture.Tool.1.0.0.snupkg");
 
         var report = CheckRunner.Run(
             ConfigWithCommand(
-                "example-tool",
+                "Fixture.Tool",
                 "dotnetTool",
-                "1.2.3",
-                new[] { "example-tool.1.2.3.nupkg", "example-tool.1.2.3.snupkg" },
-                "example-tool"),
-            fixture.ArtifactsPath);
+                "1.0.0",
+                new[] { Path.GetFileName(package), Path.GetFileName(symbols) },
+                "fixture-tool"),
+            corpus.OutputPath);
 
-        Assert.Equal(0, report.ExitCode);
+        Assert.True(report.ExitCode == 0, string.Join(" | ", report.Failures.Select(failure => failure.Message)));
     }
 
     [Fact]
@@ -185,6 +186,34 @@ public sealed class ArchiveContractTests
             fixture.ArtifactsPath);
 
         Assert.Contains(missingLicenseReport.Failures, failure => failure.CheckId == "archive-metadata");
+    }
+
+    [Fact]
+    public void Symbol_layout_must_match_an_assembly_in_the_main_package()
+    {
+        using var corpus = PackedCorpus.Create();
+        var package = corpus.Pack("Standard/Standard.csproj");
+        var symbols = Path.Combine(corpus.OutputPath, "Fixture.Standard.1.0.0.snupkg");
+        byte[] pdb;
+        using (var archive = ZipFile.OpenRead(symbols))
+        {
+            var entry = archive.Entries.Single(entry => entry.FullName.EndsWith(".pdb", StringComparison.OrdinalIgnoreCase));
+            using var stream = entry.Open();
+            using var buffer = new MemoryStream();
+            stream.CopyTo(buffer);
+            pdb = buffer.ToArray();
+        }
+
+        var intermediate = ArchiveMutator.RemoveEntry(symbols, "lib/net8.0/Fixture.Standard.pdb", "mismatched-symbols.nupkg");
+        var mismatched = ArchiveMutator.AddEntry(intermediate, "lib/net8.0/OtherAssembly.pdb", pdb, "mismatched-symbols-final.snupkg");
+        File.Delete(symbols);
+        File.Delete(intermediate);
+
+        var report = CheckRunner.Run(
+            Config("Fixture.Standard", "library", "1.0.0", Path.GetFileName(package), "mismatched-symbols-final.snupkg"),
+            corpus.OutputPath);
+
+        Assert.Contains(report.Failures, failure => failure.CheckId == "archive-layout" && failure.Message.Contains("matching", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]

@@ -44,4 +44,15 @@
       <SuppressDependenciesWhenPacking>false</SuppressDependenciesWhenPacking>
     </PropertyGroup>
   </Target>
+
+  <Target Name="RejectNuGetReadySensitivePackInputs" BeforeTargets="Pack">
+    <ItemGroup>
+      <_NuGetReadySensitivePackFiles Include="$(MSBuildProjectDirectory)\**\.env*" />
+      <_NuGetReadySensitivePackFiles Include="$(MSBuildProjectDirectory)\**\keelmatrix.telemetry.json" />
+      <_NuGetReadySensitivePackFiles Include="$(MSBuildProjectDirectory)\**\local-telemetry.json" />
+      <_NuGetReadySensitivePackFiles Remove="$(MSBuildProjectDirectory)\bin\**;$(MSBuildProjectDirectory)\obj\**" />
+    </ItemGroup>
+    <Error Condition="'@(_NuGetReadySensitivePackFiles)' != ''"
+           Text="NuGetReady refuses to pack sensitive local input: @(_NuGetReadySensitivePackFiles)" />
+  </Target>
 </Project>

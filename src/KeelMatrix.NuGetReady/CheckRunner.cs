@@ -82,10 +82,21 @@ internal static class CheckRunner
             var absolutePath = Path.Combine(artifactsPath, paths[0].Replace('/', Path.DirectorySeparatorChar));
             try
             {
+                string? mainPackagePath = null;
+                if (expected.EndsWith(".snupkg", StringComparison.OrdinalIgnoreCase))
+                {
+                    var mainArtifact = package.Artifacts?.FirstOrDefault(artifact => artifact.EndsWith(".nupkg", StringComparison.OrdinalIgnoreCase));
+                    if (mainArtifact is not null && actualArtifacts.TryGetValue(mainArtifact, out var mainPaths) && mainPaths.Count == 1)
+                    {
+                        mainPackagePath = Path.Combine(artifactsPath, mainPaths[0].Replace('/', Path.DirectorySeparatorChar));
+                    }
+                }
+
                 var inspectionFailures = ArchiveInspector.Inspect(
                     absolutePath,
                     package,
-                    expected.EndsWith(".snupkg", StringComparison.OrdinalIgnoreCase));
+                    expected.EndsWith(".snupkg", StringComparison.OrdinalIgnoreCase),
+                    mainPackagePath);
                 foreach (var failure in inspectionFailures)
                 {
                     failures[failure.CheckId].Add(failure);
@@ -106,16 +117,32 @@ internal static class CheckRunner
             failures["dependency-coherence"].Add(failure);
         }
 
+        var checkStates = new Dictionary<string, string>(StringComparer.Ordinal);
         if (repositoryPath is not null)
         {
-            foreach (var failure in WorkflowPolicyInspector.Inspect(repositoryPath))
+            var workflowInspection = WorkflowPolicyInspector.InspectDetailed(repositoryPath);
+            foreach (var failure in workflowInspection.Failures)
             {
                 failures["workflow-policy"].Add(failure);
+            }
+
+            if (!workflowInspection.Evaluated)
+            {
+                checkStates["workflow-policy"] = "not-applicable";
             }
         }
 
         var rehearsals = Array.Empty<RehearsalResult>();
         var blockingArchiveFailure = failures.Values.SelectMany(items => items).Any(failure => !failure.IsWarning);
+        if (repositoryPath is not null && timeout is not null && blockingArchiveFailure)
+        {
+            checkStates["consumer-rehearsal"] = "not-run";
+        }
+        else if (repositoryPath is not null && timeout is null)
+        {
+            checkStates["consumer-rehearsal"] = "not-applicable";
+        }
+
         if (repositoryPath is not null && timeout is not null && !blockingArchiveFailure)
         {
             var detailedRehearsals = ConsumerRehearsal.RunDetailed(config, artifactsPath, timeout.Value, rehearsalOptions);
@@ -132,7 +159,7 @@ internal static class CheckRunner
             }
         }
 
-        return BuildReport(expectedArtifacts.Length, actualArtifacts.Values.Sum(paths => paths.Count), failures, rehearsals);
+        return BuildReport(expectedArtifacts.Length, actualArtifacts.Values.Sum(paths => paths.Count), failures, rehearsals, checkStates);
     }
 
     private static string FormatDiagnostic(string diagnostic)
@@ -195,10 +222,14 @@ internal static class CheckRunner
         int expectedCount,
         int foundCount,
         Dictionary<string, List<Failure>> failures,
-        IReadOnlyList<RehearsalResult> rehearsals)
+        IReadOnlyList<RehearsalResult> rehearsals,
+        Dictionary<string, string>? checkStates = null)
     {
         var checks = CheckOrder
-            .Select(id => new CheckResult(id, failures.TryGetValue(id, out var checkFailures) ? checkFailures : Array.Empty<Failure>()))
+            .Select(id => new CheckResult(
+                id,
+                failures.TryGetValue(id, out var checkFailures) ? checkFailures : Array.Empty<Failure>(),
+                checkStates is not null && checkStates.TryGetValue(id, out var state) ? state : null))
             .ToArray();
         var allFailures = checks
             .SelectMany(check => check.Failures)

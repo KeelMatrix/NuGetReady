@@ -40,15 +40,15 @@ internal sealed record Failure(string CheckId, string Message, bool IsError = fa
 
 internal sealed class CheckResult
 {
-    public CheckResult(string id, IReadOnlyList<Failure> failures)
+    public CheckResult(string id, IReadOnlyList<Failure> failures, string? state = null)
     {
         Id = id;
         Failures = failures.OrderBy(failure => failure.Message, StringComparer.Ordinal).ToArray();
-        Status = Failures.Any(failure => failure.IsError)
+        Status = state ?? (Failures.Any(failure => failure.IsError)
             ? "error"
             : Failures.Any(failure => !failure.IsWarning)
                 ? "fail"
-                : Failures.Count == 0 ? "pass" : "warn";
+                : Failures.Count == 0 ? "pass" : "warn");
     }
 
     public string Id { get; }

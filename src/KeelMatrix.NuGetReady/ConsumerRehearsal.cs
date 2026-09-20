@@ -28,16 +28,7 @@ internal sealed record TargetRehearsalOutcome(bool Passed, bool IsError, string 
 internal static class ConsumerRehearsal
 {
     private const int DiagnosticLimit = 16 * 1024;
-    private static readonly string[] PublicPackagePatterns =
-    {
-        "KeelMatrix.Telemetry",
-        "System.*",
-        "Microsoft.*",
-        "NuGet.*",
-        "runtime.*",
-        "NETStandard.Library",
-        "NETCore.App.*"
-    };
+    private static readonly string[] PublicPackagePatterns = { "*" };
 
     public static IReadOnlyList<RehearsalOutcome> RunDetailed(
         NuGetReadyConfig config,
@@ -51,12 +42,10 @@ internal static class ConsumerRehearsal
         try
         {
             var feedPath = Directory.CreateDirectory(Path.Combine(root.FullName, "feed")).FullName;
-            var cachePath = Directory.CreateDirectory(Path.Combine(root.FullName, "packages")).FullName;
             var cliHome = Directory.CreateDirectory(Path.Combine(root.FullName, "cli-home")).FullName;
             var localPackageIds = config.Packages!
                 .Select(package => package.Id!)
                 .ToHashSet(StringComparer.OrdinalIgnoreCase);
-            var publicDependencyIds = ReadPublicDependencyIds(config, artifactsPath, localPackageIds);
             var packagePaths = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             var results = new List<RehearsalOutcome>();
 
@@ -83,21 +72,15 @@ internal static class ConsumerRehearsal
                 }
             }
 
-            if (options.SeedPackageCache)
-            {
-                foreach (var package in config.Packages!)
-                {
-                    var version = VersionText.Normalize(package.Version!);
-                    var cachePackage = Directory.CreateDirectory(Path.Combine(cachePath, package.Id!, version));
-                    File.WriteAllText(Path.Combine(cachePackage.FullName, ".seeded-copy"), "seeded package copy");
-                }
-            }
-
             var configPath = Path.Combine(root.FullName, "NuGet.config");
-            WriteNuGetConfig(configPath, feedPath, options, localPackageIds, publicDependencyIds);
-            var environment = new Dictionary<string, string?>
+            WriteNuGetConfig(configPath, feedPath, options, localPackageIds);
+            var baseEnvironment = new Dictionary<string, string?>
             {
-                ["NUGET_PACKAGES"] = cachePath,
+                ["NUGET_FALLBACK_PACKAGES"] = null,
+                ["NUGET_ADDITIONAL_SIGNING_STORE"] = null,
+                ["RestoreFallbackFolders"] = string.Empty,
+                ["RestoreAdditionalProjectSources"] = null,
+                ["RestoreSources"] = null,
                 ["NUGET_HTTP_CACHE_PATH"] = Path.Combine(root.FullName, "http-cache"),
                 ["DOTNET_CLI_HOME"] = cliHome,
                 ["DOTNET_NOLOGO"] = "1",
@@ -113,6 +96,19 @@ internal static class ConsumerRehearsal
                     continue;
                 }
 
+                var packageRoot = Directory.CreateDirectory(Path.Combine(root.FullName, SanitizeDirectoryName(package.Id!))).FullName;
+                var cachePath = Directory.CreateDirectory(Path.Combine(packageRoot, "packages")).FullName;
+                if (options.SeedPackageCache)
+                {
+                    var version = VersionText.Normalize(package.Version!);
+                    var cachePackage = Directory.CreateDirectory(Path.Combine(cachePath, package.Id!, version));
+                    File.WriteAllText(Path.Combine(cachePackage.FullName, ".seeded-copy"), "seeded package copy");
+                }
+
+                var environment = new Dictionary<string, string?>(baseEnvironment, StringComparer.Ordinal)
+                {
+                    ["NUGET_PACKAGES"] = cachePath
+                };
                 var cacheIssue = FindPreexistingCache(package, cachePath);
                 if (cacheIssue is not null)
                 {
@@ -120,7 +116,6 @@ internal static class ConsumerRehearsal
                     continue;
                 }
 
-                var packageRoot = Directory.CreateDirectory(Path.Combine(root.FullName, SanitizeDirectoryName(package.Id!))).FullName;
                 var packageResult = package.Kind!.Equals("dotnetTool", StringComparison.OrdinalIgnoreCase)
                     ? RunToolAsync(package, packagePath, packageRoot, configPath, environment, timeout, options).GetAwaiter().GetResult()
                     : RunLibraryAsync(package, packagePath, packageRoot, configPath, environment, timeout, options).GetAwaiter().GetResult();
@@ -177,6 +172,7 @@ internal static class ConsumerRehearsal
             var targetRoot = Directory.CreateDirectory(Path.Combine(packageRoot, SanitizeDirectoryName(target.Framework))).FullName;
             var outcome = await RunLibraryTargetAsync(
                 package,
+                packagePath,
                 target,
                 targetRoot,
                 configPath,
@@ -203,6 +199,7 @@ internal static class ConsumerRehearsal
 
     private static async Task<TargetRehearsalOutcome> RunLibraryTargetAsync(
         PackageExpectation package,
+        string packagePath,
         LibraryTarget target,
         string packageRoot,
         string configPath,
@@ -262,6 +259,12 @@ internal static class ConsumerRehearsal
             return restoreOutcome;
         }
 
+        var provenance = VerifyRestoredPackage(package, packagePath, environment);
+        if (!provenance.Passed)
+        {
+            return provenance;
+        }
+
         var build = await RunDotnetAsync(
             ["build", projectPath, "--no-restore", "--nologo", "--configuration", "Release", "-p:UseSharedCompilation=false"],
             packageRoot,
@@ -314,6 +317,12 @@ internal static class ConsumerRehearsal
         if (!installOutcome.Passed)
         {
             return Failure(package, "The isolated tool could not be installed from the controlled feed.", installOutcome.IsError, installOutcome.Diagnostic);
+        }
+
+        var provenance = VerifyInstalledToolPackage(packagePath, toolPath);
+        if (!provenance.Passed)
+        {
+            return Failure(package, "The isolated tool did not restore the exact supplied artifact.", provenance.IsError, provenance.Diagnostic);
         }
 
         var command = package.Command ?? package.Id!;
@@ -406,7 +415,7 @@ internal static class ConsumerRehearsal
         var diagnostic = Combine(result);
         if (Succeeded(result) && !HasUnusableAssetDiagnostic(result))
         {
-            return new TargetRehearsalOutcome(true, false, SanitizeDiagnostic(diagnostic));
+            return new TargetRehearsalOutcome(true, false, string.Empty);
         }
 
         var isInfrastructure = IsInfrastructure(result);
@@ -415,7 +424,7 @@ internal static class ConsumerRehearsal
             isInfrastructure,
             isInfrastructure
                 ? InfrastructureDiagnostic(phase, result, diagnostic)
-                : SanitizeDiagnostic(diagnostic));
+                : StructuredDiagnostic(phase, result));
     }
 
     private static bool IsInfrastructure(ProcessResult result)
@@ -448,19 +457,26 @@ internal static class ConsumerRehearsal
         return $"The isolated {operation} could not be trusted because {detail}. Verify the package sources, dependency availability, and local tooling, then rerun NuGetReady.";
     }
 
-    private static string SanitizeDiagnostic(string diagnostic)
+    private static string StructuredDiagnostic(ProcessPhase phase, ProcessResult result)
     {
-        if (string.IsNullOrWhiteSpace(diagnostic))
+        if (!result.Started)
         {
-            return string.Empty;
+            return "The child process could not be started.";
         }
 
-        var sanitized = diagnostic.Replace("\r\n", "\n", StringComparison.Ordinal).Replace('\r', '\n');
-        sanitized = System.Text.RegularExpressions.Regex.Replace(
-            sanitized,
-            @"(?m)(?<![\w:/])(?:[A-Za-z]:[\\/]|/|\\\\)[^\r\n]*",
-            "[path]");
-        return sanitized.Length <= DiagnosticLimit ? sanitized : sanitized[..DiagnosticLimit] + "\n[output truncated]";
+        var marker = UnusableAssetMarkers.FirstOrDefault(candidate =>
+            string.Join("\n", result.StandardOutput, result.StandardError).Contains(candidate, StringComparison.OrdinalIgnoreCase));
+        var operation = phase switch
+        {
+            ProcessPhase.Restore => "package restore",
+            ProcessPhase.ToolInstall => "tool installation",
+            ProcessPhase.Build => "consumer build",
+            ProcessPhase.Run => "consumer run",
+            _ => "tool smoke command"
+        };
+        return marker is null
+            ? $"The {operation} child process failed with exit code {result.ExitCode}."
+            : $"The {operation} reported diagnostic marker {marker}.";
     }
 
     private static RehearsalOutcome Success(PackageExpectation package, string message, string diagnostic)
@@ -619,52 +635,11 @@ internal static class ConsumerRehearsal
         return path.Replace('\\', '/').TrimStart('/');
     }
 
-    private static HashSet<string> ReadPublicDependencyIds(
-        NuGetReadyConfig config,
-        string artifactsPath,
-        HashSet<string> localPackageIds)
-    {
-        var ids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var package in config.Packages!)
-        {
-            var artifact = package.Artifacts!.FirstOrDefault(name => name.EndsWith(".nupkg", StringComparison.OrdinalIgnoreCase));
-            if (artifact is null)
-            {
-                continue;
-            }
-
-            var path = Path.Combine(artifactsPath, artifact);
-            if (!File.Exists(path))
-            {
-                continue;
-            }
-
-            try
-            {
-                using var reader = new PackageArchiveReader(path);
-                foreach (var dependency in reader.NuspecReader.GetDependencyGroups().SelectMany(group => group.Packages))
-                {
-                    if (!localPackageIds.Contains(dependency.Id))
-                    {
-                        ids.Add(dependency.Id);
-                    }
-                }
-            }
-            catch (Exception) when (File.Exists(path))
-            {
-                // Archive parsing is reported by the archive contract. Do not echo archive content here.
-            }
-        }
-
-        return ids;
-    }
-
     private static void WriteNuGetConfig(
         string path,
         string feedPath,
         ConsumerRehearsalOptions options,
-        IReadOnlyCollection<string> localPackageIds,
-        IReadOnlyCollection<string> publicDependencyIds)
+        IReadOnlyCollection<string> localPackageIds)
     {
         XNamespace ns = "http://schemas.microsoft.com/packaging/2010/07/NuGet.xsd";
         var sources = new List<XElement>
@@ -681,10 +656,7 @@ internal static class ConsumerRehearsal
             .Select(id => new XElement("package", new XAttribute("pattern", id)))));
 
         mappings.Add(new XElement("packageSource", new XAttribute("key", "public"),
-            publicDependencyIds
-                .OrderBy(id => id, StringComparer.OrdinalIgnoreCase)
-                .ThenBy(id => id, StringComparer.Ordinal)
-                .Concat(PublicPackagePatterns.Where(pattern => !localPackageIds.Any(id => MatchesPattern(id, pattern))))
+            PublicPackagePatterns
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .Select(pattern => new XElement("package", new XAttribute("pattern", pattern)))));
 
@@ -696,11 +668,139 @@ internal static class ConsumerRehearsal
         document.Save(path, SaveOptions.DisableFormatting);
     }
 
-    private static bool MatchesPattern(string packageId, string pattern)
+    private static TargetRehearsalOutcome VerifyRestoredPackage(
+        PackageExpectation package,
+        string packagePath,
+        IReadOnlyDictionary<string, string?> environment,
+        string? installedToolPath = null)
     {
-        return pattern.EndsWith('*')
-            ? packageId.StartsWith(pattern[..^1], StringComparison.OrdinalIgnoreCase)
-            : packageId.Equals(pattern, StringComparison.OrdinalIgnoreCase);
+        string? packageDirectory;
+        if (installedToolPath is not null)
+        {
+            var version = VersionText.Normalize(package.Version!);
+            packageDirectory = Directory.EnumerateDirectories(installedToolPath, version, SearchOption.AllDirectories)
+                .FirstOrDefault(path => Directory.EnumerateFiles(path, "*.nuspec", SearchOption.TopDirectoryOnly).Any());
+        }
+        else
+        {
+            if (!environment.TryGetValue("NUGET_PACKAGES", out var cachePath) || string.IsNullOrWhiteSpace(cachePath))
+            {
+                return new TargetRehearsalOutcome(false, true, "The isolated package cache was not configured.");
+            }
+
+            var version = VersionText.Normalize(package.Version!);
+            packageDirectory = Directory.EnumerateDirectories(cachePath)
+                .FirstOrDefault(path => string.Equals(Path.GetFileName(path), package.Id, StringComparison.OrdinalIgnoreCase));
+            packageDirectory = packageDirectory is null
+                ? null
+                : Directory.EnumerateDirectories(packageDirectory)
+                    .FirstOrDefault(path => string.Equals(Path.GetFileName(path), version, StringComparison.OrdinalIgnoreCase));
+        }
+
+        if (packageDirectory is null)
+        {
+            return new TargetRehearsalOutcome(false, true, installedToolPath is null
+                ? "The isolated package cache did not contain the restored package."
+                : "The installed tool store did not contain the restored package.");
+        }
+
+        try
+        {
+            var expectedHash = Convert.ToBase64String(System.Security.Cryptography.SHA512.HashData(File.ReadAllBytes(packagePath)));
+            var hashPath = Path.Combine(packageDirectory, ".sha512");
+            if (File.Exists(hashPath))
+            {
+                var actualHash = File.ReadAllText(hashPath).Trim();
+                if (!string.Equals(actualHash, expectedHash, StringComparison.Ordinal) &&
+                    !string.Equals(actualHash, $"sha512-{expectedHash}", StringComparison.Ordinal))
+                {
+                    return new TargetRehearsalOutcome(false, false, "The restored package hash did not match the supplied artifact.");
+                }
+
+                return new TargetRehearsalOutcome(true, false, string.Empty);
+            }
+
+            using var reader = new PackageArchiveReader(packagePath);
+            foreach (var file in reader.GetFiles().Select(NormalizeArchivePath))
+            {
+                if (file.StartsWith("_rels/", StringComparison.OrdinalIgnoreCase) ||
+                    file.Equals("[Content_Types].xml", StringComparison.OrdinalIgnoreCase) ||
+                    file.StartsWith("package/services/", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                var restoredFile = Path.Combine(packageDirectory, file.Replace('/', Path.DirectorySeparatorChar));
+                if (!File.Exists(restoredFile))
+                {
+                    return new TargetRehearsalOutcome(false, false, "The restored package contents did not match the supplied artifact.");
+                }
+
+                using var stream = reader.GetStream(file);
+                using var expectedBytes = new MemoryStream();
+                stream.CopyTo(expectedBytes);
+                var restoredBytes = File.ReadAllBytes(restoredFile);
+                if (!expectedBytes.ToArray().AsSpan().SequenceEqual(restoredBytes))
+                {
+                    return new TargetRehearsalOutcome(false, false, "The restored package contents did not match the supplied artifact.");
+                }
+            }
+
+            return new TargetRehearsalOutcome(true, false, string.Empty);
+        }
+        catch (IOException)
+        {
+            return new TargetRehearsalOutcome(false, true, "The restored package could not be verified in the isolated cache.");
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return new TargetRehearsalOutcome(false, true, "The restored package could not be verified in the isolated cache.");
+        }
+    }
+
+    private static TargetRehearsalOutcome VerifyInstalledToolPackage(string packagePath, string toolPath)
+    {
+        try
+        {
+            using var reader = new PackageArchiveReader(packagePath);
+            var toolFiles = reader.GetFiles()
+                .Select(NormalizeArchivePath)
+                .Where(file => file.StartsWith("tools/net8.0/any/", StringComparison.OrdinalIgnoreCase) &&
+                               file.EndsWith(".dll", StringComparison.OrdinalIgnoreCase))
+                .ToArray();
+            foreach (var toolFile in toolFiles)
+            {
+                var installedFile = Directory.EnumerateFiles(toolPath, Path.GetFileName(toolFile), SearchOption.AllDirectories)
+                    .FirstOrDefault(candidate =>
+                    {
+                        var normalized = candidate.Replace('\\', '/');
+                        var marker = normalized.IndexOf("/tools/net8.0/any/", StringComparison.OrdinalIgnoreCase);
+                        return marker >= 0 && normalized[(marker + 1)..].Equals(toolFile, StringComparison.OrdinalIgnoreCase);
+                    });
+                if (!File.Exists(installedFile))
+                {
+                    return new TargetRehearsalOutcome(false, true, "The installed tool did not contain an artifact asset from the supplied package.");
+                }
+
+                using var source = reader.GetStream(toolFile);
+                using var expected = new MemoryStream();
+                source.CopyTo(expected);
+                if (!expected.ToArray().AsSpan().SequenceEqual(File.ReadAllBytes(installedFile)))
+                {
+                    return new TargetRehearsalOutcome(false, false, "The installed tool asset did not match the supplied artifact.");
+                }
+            }
+
+            return new TargetRehearsalOutcome(true, false, string.Empty);
+        }
+        catch (IOException)
+        {
+            return new TargetRehearsalOutcome(false, true, "The installed tool could not be checked against the supplied artifact.");
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return new TargetRehearsalOutcome(false, true, "The installed tool could not be checked against the supplied artifact.");
+        }
     }
 
     private static string Combine(ProcessResult result)

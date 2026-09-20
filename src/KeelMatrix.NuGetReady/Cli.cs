@@ -28,13 +28,13 @@ internal static partial class CliParser
             switch (option)
             {
                 case "--config":
-                    config = ReadValue(args, ref index, option);
+                    config = ReadValue(args, ref index, option, format);
                     break;
                 case "--artifacts":
-                    artifacts = ReadValue(args, ref index, option);
+                    artifacts = ReadValue(args, ref index, option, format);
                     break;
                 case "--format":
-                    var formatValue = ReadValue(args, ref index, option);
+                    var formatValue = ReadValue(args, ref index, option, format);
                     format = formatValue.ToLowerInvariant() switch
                     {
                         "text" => OutputFormat.Text,
@@ -43,7 +43,7 @@ internal static partial class CliParser
                     };
                     break;
                 case "--timeout":
-                    timeout = ParseTimeout(ReadValue(args, ref index, option), format);
+                    timeout = ParseTimeout(ReadValue(args, ref index, option, format), format);
                     break;
                 case "--help":
                     throw new HelpRequestedException();
@@ -70,11 +70,11 @@ internal static partial class CliParser
           --timeout <duration>  Bounded operation timeout (for example 30s or 00:05:00)
         """.TrimEnd();
 
-    private static string ReadValue(IReadOnlyList<string> args, ref int index, string option)
+    private static string ReadValue(IReadOnlyList<string> args, ref int index, string option, OutputFormat format)
     {
         if (index + 1 >= args.Count || string.IsNullOrWhiteSpace(args[index + 1]) || args[index + 1].StartsWith("--", StringComparison.Ordinal))
         {
-            throw new CliInputException($"Option {option} requires a value.", OutputFormat.Text);
+            throw new CliInputException($"Option {option} requires a value.", format);
         }
 
         index++;

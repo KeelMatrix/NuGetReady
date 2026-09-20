@@ -90,17 +90,50 @@ function Inspect-Archive {
             }
 
             Assert-NuspecContract (Read-Nuspec $archive) $false
+            $allowed = @(
+                "_rels/.rels",
+                "KeelMatrix.NuGetReady.nuspec",
+                "README.md",
+                "icon.png",
+                "[Content_Types].xml",
+                "tools/net8.0/any/DotnetToolSettings.xml",
+                "tools/net8.0/any/KeelMatrix.NuGetReady.dll",
+                "tools/net8.0/any/KeelMatrix.NuGetReady.deps.json",
+                "tools/net8.0/any/KeelMatrix.NuGetReady.runtimeconfig.json",
+                "tools/net8.0/any/KeelMatrix.NuGetReady.pdb",
+                "tools/net8.0/any/KeelMatrix.Telemetry.dll",
+                "tools/net8.0/any/Newtonsoft.Json.dll",
+                "tools/net8.0/any/NuGet.Common.dll",
+                "tools/net8.0/any/NuGet.Configuration.dll",
+                "tools/net8.0/any/NuGet.Frameworks.dll",
+                "tools/net8.0/any/NuGet.Packaging.dll",
+                "tools/net8.0/any/NuGet.Versioning.dll",
+                "tools/net8.0/any/System.Security.Cryptography.Pkcs.dll",
+                "tools/net8.0/any/System.Security.Cryptography.ProtectedData.dll",
+                "tools/net8.0/any/runtimes/win/lib/net8.0/System.Security.Cryptography.Pkcs.dll"
+            )
         }
         else {
             Assert-Contract ($entries -contains "tools/net8.0/any/KeelMatrix.NuGetReady.pdb") "Symbol package PDB is missing."
             Assert-NuspecContract (Read-Nuspec $archive) $true
+            $allowed = @(
+                "_rels/.rels",
+                "KeelMatrix.NuGetReady.nuspec",
+                "tools/net8.0/any/KeelMatrix.NuGetReady.pdb",
+                "[Content_Types].xml"
+            )
         }
+
+        $unexpected = @($entries | Where-Object {
+            ($allowed -notcontains $_) -and ($_ -notmatch '^package/services/metadata/core-properties/[^/]+\.psmdcp$')
+        })
+        Assert-Contract ($unexpected.Count -eq 0) "Unexpected package entries found: $($unexpected -join ', ')"
 
         $forbidden = @($entries | Where-Object {
             $_ -match '(^|/)(AGENTS\.md|CHANGELOG\.md|SECURITY\.md|PRIVACY\.md|NuGet\.config|global\.json|\.env[^/]*|keelmatrix\.telemetry\.json)$' -or
             $_ -match '\.(csproj|sln|yml|yaml|trx)$' -or
             $_ -match '(^|/)(tests?|artifacts|bin|obj|TestResults)(/|$)' -or
-            $_ -match '(secret|credential|password)'
+            $_ -match '(^|/)(apikey|api-key|access-token|credentials\.json|password|secret)$'
         })
         Assert-Contract ($forbidden.Count -eq 0) "Forbidden archive entries found: $($forbidden -join ', ')"
     }
