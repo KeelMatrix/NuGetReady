@@ -28,4 +28,12 @@ public sealed class CliContractTests
 
         Assert.Contains("nugetready check", CliParser.HelpText, StringComparison.Ordinal);
     }
+
+    [Fact]
+    public void Missing_json_option_value_preserves_the_requested_json_error_contract()
+    {
+        var exception = Assert.Throws<CliInputException>(() => CliParser.Parse(new[] { "check", "--format", "json", "--config" }));
+
+        Assert.Equal(OutputFormat.Json, exception.Format);
+    }
 }

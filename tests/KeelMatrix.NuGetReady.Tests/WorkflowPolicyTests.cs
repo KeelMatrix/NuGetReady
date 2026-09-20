@@ -102,6 +102,88 @@ public sealed class WorkflowPolicyTests
         Assert.False(finding.IsError);
     }
 
+    [Fact]
+    public void Comments_and_step_names_do_not_prove_authentication_or_artifact_validation()
+    {
+        using var repository = WorkflowRepository.Create("release.yml", """
+            name: release
+            on:
+              push:
+                tags: ["v*"]
+            permissions:
+              contents: read
+            jobs:
+              publish:
+                permissions:
+                  id-token: write
+                  contents: read
+                steps:
+                  # Trusted Publishing and expected artifacts are mentioned here.
+                  - name: Trusted Publishing
+                    run: echo "not authentication"
+                  - name: Validate expected artifacts
+                    run: echo "not validation"
+                  - run: dotnet nuget push artifacts/KeelMatrix.NuGetReady.1.0.0.nupkg
+            """);
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+        Assert.NotEmpty(findings);
+    }
+
+    [Fact]
+    public void Inline_write_all_is_rejected_but_contents_write_in_a_separate_release_job_is_allowed()
+    {
+        using var repository = WorkflowRepository.Create("release.yml", """
+            name: release
+            on:
+              push:
+                tags: ["v*"]
+            jobs:
+              publish:
+                permissions: write-all # broad permissions
+                env:
+                  KEELMATRIX_NO_TELEMETRY: '1'
+                steps:
+                  - run: dotnet nugetready check --artifacts artifacts/packages
+                  - uses: NuGet/login@v1
+                  - run: dotnet nuget push artifacts/KeelMatrix.NuGetReady.1.0.0.nupkg
+              release:
+                permissions:
+                  contents: write
+                steps:
+                  - run: gh release create "${{ github.ref_name }}"
+            """);
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+        Assert.Contains(findings, finding => finding.Message.Contains("broader", StringComparison.OrdinalIgnoreCase));
+        Assert.DoesNotContain(findings, finding => finding.Message.Contains("contents", StringComparison.OrdinalIgnoreCase) && finding.Message.Contains("broader", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void Artifact_validation_must_execute_before_publication()
+    {
+        using var repository = WorkflowRepository.Create("release.yml", ReleaseWorkflow.Replace(
+            "- run: dotnet nugetready check --artifacts artifacts/packages\n              - uses: NuGet/login@v1\n              - run: dotnet nuget push",
+            "- uses: NuGet/login@v1\n              - run: dotnet nuget push\n              - run: dotnet nugetready check --artifacts artifacts/packages",
+            StringComparison.Ordinal));
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+        Assert.Contains(findings, finding => finding.Message.Contains("before publication", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void Release_workflow_must_suppress_product_telemetry()
+    {
+        using var repository = WorkflowRepository.Create("release.yml", ReleaseWorkflow);
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+        Assert.Contains(findings, finding => finding.Message.Contains("telemetry", StringComparison.OrdinalIgnoreCase));
+    }
+
     private const string ReleaseWorkflow = """
         name: release
         on:

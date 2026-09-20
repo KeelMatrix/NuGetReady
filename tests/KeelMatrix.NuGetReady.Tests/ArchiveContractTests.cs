@@ -86,6 +86,44 @@ public sealed class ArchiveContractTests
     }
 
     [Fact]
+    public void Root_and_nested_sensitive_files_fail_without_rejecting_user_secrets_assembly()
+    {
+        using var fixture = PackageFixture.Create();
+        var sensitiveEntries = new[] { ".env", ".env.local", "nested/AGENTS.md", "nested/keelmatrix.telemetry.json" };
+
+        foreach (var entry in sensitiveEntries)
+        {
+            var original = fixture.AddPackage($"sensitive-{entry.Replace('/', '-').Replace('.', '-')}.nupkg", "Example.Core", "1.2.3");
+            var package = ArchiveMutator.AddEntry(
+                original,
+                entry,
+                new byte[] { 1 },
+                $"sensitive-{entry.Replace('/', '-').Replace('.', '-')}-mutated.nupkg");
+            File.Delete(original);
+
+            var report = CheckRunner.Run(
+                Config("Example.Core", "library", "1.2.3", Path.GetFileName(package)),
+                fixture.ArtifactsPath);
+
+            Assert.Contains(report.Failures, failure => failure.CheckId == "archive-security");
+        }
+
+        var originalAssemblyPackage = fixture.AddPackage("user-secrets-assembly.nupkg", "Example.Core", "1.2.3");
+        var assemblyPackage = ArchiveMutator.AddEntry(
+            originalAssemblyPackage,
+            "tools/net8.0/any/Microsoft.Extensions.Configuration.UserSecrets.dll",
+            new byte[] { 1 },
+            "user-secrets-assembly-mutated.nupkg");
+        File.Delete(originalAssemblyPackage);
+
+        var validReport = CheckRunner.Run(
+            Config("Example.Core", "library", "1.2.3", Path.GetFileName(assemblyPackage)),
+            fixture.ArtifactsPath);
+
+        Assert.DoesNotContain(validReport.Failures, failure => failure.CheckId == "archive-security");
+    }
+
+    [Fact]
     public void Tool_and_symbol_archives_pass_with_their_declared_layouts()
     {
         using var fixture = PackageFixture.Create();
@@ -116,6 +154,53 @@ public sealed class ArchiveContractTests
 
         Assert.Equal(1, report.ExitCode);
         Assert.Contains(report.Failures, failure => failure.Message.Contains("symbol file", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Malformed_or_mismatched_symbols_and_missing_license_file_fail()
+    {
+        using var fixture = PackageFixture.Create();
+        var toolPackage = fixture.AddPackage("example-tool.1.2.3.nupkg", "example-tool", "1.2.3", kind: "dotnetTool");
+        fixture.AddSymbols("example-tool.1.2.3.snupkg", "example-tool", "1.2.3");
+        File.Delete(toolPackage);
+
+        var malformedReport = CheckRunner.Run(
+            Config("example-tool", "dotnetTool", "1.2.3", "example-tool.1.2.3.snupkg"),
+            fixture.ArtifactsPath);
+
+        Assert.Contains(malformedReport.Failures, failure => failure.CheckId == "archive-layout");
+
+        var originalPackage = fixture.AddPackage("file-license.nupkg", "Example.Core", "1.2.3");
+        var packageWithFileLicense = ArchiveMutator.ReplaceNuspecText(
+            originalPackage,
+            text => text.Replace(
+                "<license type=\"expression\">MIT</license>",
+                "<license type=\"file\">LICENSE.txt</license>",
+                StringComparison.Ordinal),
+            "file-license-mutated.nupkg");
+        File.Delete(originalPackage);
+
+        var missingLicenseReport = CheckRunner.Run(
+            Config("Example.Core", "library", "1.2.3", Path.GetFileName(packageWithFileLicense)),
+            fixture.ArtifactsPath);
+
+        Assert.Contains(missingLicenseReport.Failures, failure => failure.CheckId == "archive-metadata");
+    }
+
+    [Fact]
+    public void Blocking_archive_failure_marks_consumer_rehearsal_as_not_run()
+    {
+        using var fixture = PackageFixture.Create();
+        File.WriteAllText(Path.Combine(fixture.ArtifactsPath, "Example.Core.1.2.3.nupkg"), "not a zip");
+        using var repository = WorkflowRepository.Create("ci.yml", "name: CI");
+
+        var report = CheckRunner.Run(
+            Config("Example.Core", "library", "1.2.3", "Example.Core.1.2.3.nupkg"),
+            fixture.ArtifactsPath,
+            repository.Root.FullName,
+            TimeSpan.FromSeconds(1));
+
+        Assert.Equal("not-run", report.Checks.Single(check => check.Id == "consumer-rehearsal").Status);
     }
 
     [Fact]

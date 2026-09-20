@@ -59,6 +59,25 @@ public sealed class ConsumerRehearsalTests
     }
 
     [Fact]
+    public void Related_packages_rehearse_when_declared_in_reverse_dependency_order()
+    {
+        using var corpus = PackedCorpus.Create();
+        var core = corpus.Pack("Related.Core/Related.Core.csproj");
+        var consumer = corpus.Pack("Related.Consumer/Related.Consumer.csproj", corpus.OutputPath);
+        var config = Config(
+            new PackageExpectation { Id = "Fixture.Related.Consumer", Kind = "library", Version = "1.0.0", Artifacts = Artifacts(consumer) },
+            new PackageExpectation { Id = "Fixture.Related.Core", Kind = "library", Version = "1.0.0", Artifacts = Artifacts(core) });
+
+        var outcomes = ConsumerRehearsal.RunDetailed(
+            config,
+            corpus.OutputPath,
+            TimeSpan.FromMinutes(2),
+            new ConsumerRehearsalOptions(PublicFeedPath: corpus.OutputPath));
+
+        Assert.All(outcomes, outcome => Assert.Equal("pass", outcome.Result.Status));
+    }
+
+    [Fact]
     public void Public_dependencies_resolve_from_the_intended_public_source()
     {
         using var corpus = PackedCorpus.Create();
@@ -82,6 +101,46 @@ public sealed class ConsumerRehearsalTests
 
         Assert.Single(outcomes);
         Assert.True(outcomes[0].Result.Status == "pass", outcomes[0].Diagnostic);
+    }
+
+    [Fact]
+    public void Transitive_public_dependencies_outside_allowlist_resolve_from_the_public_source()
+    {
+        using var corpus = PackedCorpus.Create();
+        var publicLeaf = corpus.Pack("PublicSource/PublicSource.csproj");
+        var publicMiddleOriginal = corpus.Pack("Related.Core/Related.Core.csproj");
+        var publicMiddle = ArchiveMutator.ReplaceNuspecText(
+            publicMiddleOriginal,
+            text => text.Replace(
+                "</metadata>",
+                "<dependencies><group targetFramework=\"net8.0\"><dependency id=\"Fixture.Public.Source\" version=\"[1.0.0]\" /></group></dependencies></metadata>",
+                StringComparison.Ordinal),
+            "public-middle.nupkg");
+        var localOriginal = corpus.Pack("Related.Consumer/Related.Consumer.csproj", corpus.OutputPath);
+        var localPackage = ArchiveMutator.ReplaceNuspecText(localOriginal, text => text, "local-app.nupkg");
+        var localArtifacts = Directory.CreateDirectory(Path.Combine(corpus.Root.FullName, "local-artifacts"));
+        File.Copy(localPackage, Path.Combine(localArtifacts.FullName, "Fixture.Related.Consumer.1.0.0.nupkg"));
+
+        var publicFeed = Directory.CreateDirectory(Path.Combine(corpus.Root.FullName, "transitive-public-feed"));
+        File.Copy(publicMiddle, Path.Combine(publicFeed.FullName, "Fixture.Related.Core.1.0.0.nupkg"));
+        File.Copy(publicLeaf, Path.Combine(publicFeed.FullName, "Fixture.Public.Source.1.0.0.nupkg"));
+
+        var config = Config(new PackageExpectation
+        {
+            Id = "Fixture.Related.Consumer",
+            Kind = "library",
+            Version = "1.0.0",
+            Artifacts = new List<string> { "Fixture.Related.Consumer.1.0.0.nupkg" }
+        });
+
+        var outcomes = ConsumerRehearsal.RunDetailed(
+            config,
+            localArtifacts.FullName,
+            TimeSpan.FromMinutes(2),
+            new ConsumerRehearsalOptions(PublicFeedPath: publicFeed.FullName));
+
+        Assert.Single(outcomes);
+        Assert.Equal("pass", outcomes[0].Result.Status);
     }
 
     [Fact]
@@ -188,6 +247,91 @@ public sealed class ConsumerRehearsalTests
             outcomes[0].Diagnostic.Contains("Unable to resolve", StringComparison.OrdinalIgnoreCase) ||
             outcomes[0].Diagnostic.Contains("Unable to find package", StringComparison.OrdinalIgnoreCase),
             outcomes[0].Diagnostic);
+    }
+
+    [Fact]
+    public void Fallback_cache_cannot_replace_the_supplied_artifact_or_local_feed()
+    {
+        using var corpus = PackedCorpus.Create();
+        var goodPackage = corpus.Pack("Standard/Standard.csproj");
+        var failingPackage = ArchiveMutator.AddEntry(
+            goodPackage,
+            "buildTransitive/Fixture.Standard.targets",
+            System.Text.Encoding.UTF8.GetBytes("<Project><Target Name=\"NuGetReadyFallbackRegression\" BeforeTargets=\"Build\"><Error Text=\"local artifact was restored\" /></Target></Project>"),
+            "Fixture.Standard.failing.nupkg");
+        var localArtifacts = Directory.CreateDirectory(Path.Combine(corpus.Root.FullName, "fallback-local-artifacts"));
+        File.Copy(failingPackage, Path.Combine(localArtifacts.FullName, "Fixture.Standard.1.0.0.nupkg"));
+
+        var fallbackRoot = Directory.CreateDirectory(Path.Combine(corpus.Root.FullName, "fallback-packages"));
+        var fallbackPackage = Directory.CreateDirectory(Path.Combine(fallbackRoot.FullName, "fixture.standard", "1.0.0"));
+        ZipFile.OpenRead(goodPackage).ExtractToDirectory(fallbackPackage.FullName);
+        using var environment = new EnvironmentVariableScope("NUGET_FALLBACK_PACKAGES", fallbackRoot.FullName);
+
+        var config = Config(new PackageExpectation
+        {
+            Id = "Fixture.Standard",
+            Kind = "library",
+            Version = "1.0.0",
+            Artifacts = new List<string> { "Fixture.Standard.1.0.0.nupkg" }
+        });
+
+        var controlledFeedOutcome = ConsumerRehearsal.RunDetailed(
+            config,
+            localArtifacts.FullName,
+            TimeSpan.FromMinutes(2),
+            new ConsumerRehearsalOptions(PublicFeedPath: Directory.CreateDirectory(Path.Combine(corpus.Root.FullName, "empty-public-feed")).FullName));
+        Assert.Equal("fail", controlledFeedOutcome.Single().Result.Status);
+
+        var missingLocalFeedOutcome = ConsumerRehearsal.RunDetailed(
+            config,
+            localArtifacts.FullName,
+            TimeSpan.FromMinutes(2),
+            new ConsumerRehearsalOptions(
+                IncludeLocalFeed: false,
+                PublicFeedPath: Directory.CreateDirectory(Path.Combine(corpus.Root.FullName, "empty-public-feed-2")).FullName));
+        Assert.Equal("error", missingLocalFeedOutcome.Single().Result.Status);
+    }
+
+    [Fact]
+    public void Child_diagnostics_are_structured_and_do_not_leak_credentials_or_timings()
+    {
+        using var corpus = PackedCorpus.Create();
+        var package = corpus.Pack("Standard/Standard.csproj");
+        var config = Config(new PackageExpectation
+        {
+            Id = "Fixture.Standard",
+            Kind = "library",
+            Version = "1.0.0",
+            Artifacts = Artifacts(package)
+        });
+
+        static Task<ProcessResult> FailingProcess(
+            string fileName,
+            IReadOnlyList<string> arguments,
+            string workingDirectory,
+            IReadOnlyDictionary<string, string?> environment,
+            TimeSpan timeout) => Task.FromResult(new ProcessResult(
+                Started: true,
+                ExitCode: 1,
+                TimedOut: false,
+                StandardOutput: string.Empty,
+                StandardError: "Authorization: Bearer super-secret elapsed 17ms"));
+
+        var first = ConsumerRehearsal.RunDetailed(
+            config,
+            corpus.OutputPath,
+            TimeSpan.FromMinutes(2),
+            new ConsumerRehearsalOptions(ProcessRunner: FailingProcess));
+        var second = ConsumerRehearsal.RunDetailed(
+            config,
+            corpus.OutputPath,
+            TimeSpan.FromMinutes(2),
+            new ConsumerRehearsalOptions(ProcessRunner: FailingProcess));
+
+        Assert.Equal(first.Single().Result, second.Single().Result);
+        Assert.DoesNotContain("super-secret", first.Single().Diagnostic, StringComparison.Ordinal);
+        Assert.DoesNotContain("17ms", first.Single().Diagnostic, StringComparison.Ordinal);
+        Assert.DoesNotContain("Authorization", first.Single().Diagnostic, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -332,5 +476,23 @@ public sealed class ConsumerRehearsalTests
     private static List<string> Artifacts(string package)
     {
         return new List<string> { Path.GetFileName(package) };
+    }
+
+    private sealed class EnvironmentVariableScope : IDisposable
+    {
+        private readonly string name;
+        private readonly string? original;
+
+        public EnvironmentVariableScope(string name, string value)
+        {
+            this.name = name;
+            original = Environment.GetEnvironmentVariable(name);
+            Environment.SetEnvironmentVariable(name, value);
+        }
+
+        public void Dispose()
+        {
+            Environment.SetEnvironmentVariable(name, original);
+        }
     }
 }
