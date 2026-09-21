@@ -148,21 +148,21 @@ public sealed class ConsumerRehearsalTests
             TimeSpan.FromMinutes(2),
             new ConsumerRehearsalOptions(
                 PublicFeedPath: corpus.OutputPath,
-                ProcessRunner: AfterRestore(cachePackage => File.Delete(Path.Combine(cachePackage, "Fixture.Documentation.1.0.0.nupkg.sha512")))));
+                ProcessRunner: AfterRestore((_, cachedArchive) => File.Delete(cachedArchive + ".sha512"))));
         var tamperedCachedPackage = ConsumerRehearsal.RunDetailed(
             config,
             corpus.OutputPath,
             TimeSpan.FromMinutes(2),
             new ConsumerRehearsalOptions(
                 PublicFeedPath: corpus.OutputPath,
-                ProcessRunner: AfterRestore(cachePackage => File.AppendAllText(Path.Combine(cachePackage, "Fixture.Documentation.1.0.0.nupkg"), "tampered"))));
+                ProcessRunner: AfterRestore((_, cachedArchive) => File.AppendAllText(cachedArchive, "tampered"))));
         var missingCachedXml = ConsumerRehearsal.RunDetailed(
             config,
             corpus.OutputPath,
             TimeSpan.FromMinutes(2),
             new ConsumerRehearsalOptions(
                 PublicFeedPath: corpus.OutputPath,
-                ProcessRunner: AfterRestore(cachePackage => File.Delete(Path.Combine(cachePackage, "lib", "net8.0", "Documentation.xml")))));
+                ProcessRunner: AfterRestore((cachePackage, _) => File.Delete(Path.Combine(cachePackage, "lib", "net8.0", "Documentation.xml")))));
 
         testOutput.WriteLine($"intact: {intact.Single().Result.Status.ToUpperInvariant()}");
         testOutput.WriteLine($"missing-sidecar: {missingSidecar.Single().Result.Status.ToUpperInvariant()}");
@@ -616,7 +616,7 @@ public sealed class ConsumerRehearsalTests
         return new List<string> { Path.GetFileName(package) };
     }
 
-    private static ConsumerProcessRunner AfterRestore(Action<string> mutateCache)
+    private static ConsumerProcessRunner AfterRestore(Action<string, string> mutateCache)
     {
         return async (fileName, arguments, workingDirectory, environment, timeout) =>
         {
@@ -628,7 +628,10 @@ public sealed class ConsumerRehearsalTests
                     .Single(path => Path.GetFileName(path).Equals("Fixture.Documentation", StringComparison.OrdinalIgnoreCase));
                 var packageCache = Directory.EnumerateDirectories(packageRoot)
                     .Single(path => Path.GetFileName(path).Equals("1.0.0", StringComparison.OrdinalIgnoreCase));
-                mutateCache(packageCache);
+                var cachedArchive = Directory.EnumerateFiles(packageCache, "*.nupkg", SearchOption.TopDirectoryOnly)
+                    .Single(path => !path.EndsWith(".snupkg", StringComparison.OrdinalIgnoreCase));
+                Assert.True(File.Exists(cachedArchive + ".sha512"), "The restore harness did not produce the package-specific provenance sidecar.");
+                mutateCache(packageCache, cachedArchive);
             }
 
             return result;
