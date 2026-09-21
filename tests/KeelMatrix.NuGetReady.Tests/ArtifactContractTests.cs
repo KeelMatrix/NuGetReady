@@ -50,6 +50,34 @@ public sealed class ArtifactContractTests
         Assert.Equal("error", report.Status);
     }
 
+    [Fact]
+    public void Empty_artifact_directory_marks_every_downstream_check_not_run()
+    {
+        using var fixture = PackageFixture.Create();
+        var report = CheckRunner.Run(
+            new NuGetReadyConfig
+            {
+                SchemaVersion = 1,
+                Packages = new List<PackageExpectation>
+                {
+                    new()
+                    {
+                        Id = "Example.Core",
+                        Kind = "library",
+                        Version = "1.2.3",
+                        Artifacts = new List<string> { "Example.Core.1.2.3.nupkg" }
+                    }
+                }
+            },
+            fixture.ArtifactsPath);
+
+        Assert.Equal(1, report.ExitCode);
+        Assert.Equal("fail", report.Status);
+        Assert.Equal("fail", report.Checks.Single(check => check.Id == "artifact-set").Status);
+        Assert.All(report.Checks.Where(check => check.Id != "artifact-set"), check => Assert.Equal("not-run", check.Status));
+        Assert.DoesNotContain(report.Checks, check => check.Status == "pass");
+    }
+
     private static NuGetReadyConfig Config(string id, string artifact)
     {
         return new NuGetReadyConfig

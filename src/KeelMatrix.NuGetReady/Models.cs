@@ -38,6 +38,39 @@ internal sealed class PackageExpectation
 
 internal sealed record Failure(string CheckId, string Message, bool IsError = false, bool IsWarning = false);
 
+internal static class CheckContract
+{
+    public static readonly string[] Order =
+    {
+        "artifact-set",
+        "archive-metadata",
+        "archive-layout",
+        "dependency-groups",
+        "dependency-coherence",
+        "archive-security",
+        "archive-parse",
+        "workflow-policy",
+        "consumer-rehearsal"
+    };
+
+    public const string Pass = "pass";
+    public const string Warn = "warn";
+    public const string Fail = "fail";
+    public const string Error = "error";
+    public const string NotRun = "not-run";
+    public const string NotApplicable = "not-applicable";
+
+    public static readonly IReadOnlySet<string> States = new HashSet<string>(StringComparer.Ordinal)
+    {
+        Pass,
+        Warn,
+        Fail,
+        Error,
+        NotRun,
+        NotApplicable
+    };
+}
+
 internal sealed class CheckResult
 {
     public CheckResult(string id, IReadOnlyList<Failure> failures, string? state = null)
@@ -45,10 +78,14 @@ internal sealed class CheckResult
         Id = id;
         Failures = failures.OrderBy(failure => failure.Message, StringComparer.Ordinal).ToArray();
         Status = state ?? (Failures.Any(failure => failure.IsError)
-            ? "error"
+            ? CheckContract.Error
             : Failures.Any(failure => !failure.IsWarning)
-                ? "fail"
-                : Failures.Count == 0 ? "pass" : "warn");
+                ? CheckContract.Fail
+                : Failures.Count == 0 ? CheckContract.Pass : CheckContract.Warn);
+        if (!CheckContract.States.Contains(Status))
+        {
+            throw new ArgumentException($"Unsupported check state '{Status}'.", nameof(state));
+        }
     }
 
     public string Id { get; }

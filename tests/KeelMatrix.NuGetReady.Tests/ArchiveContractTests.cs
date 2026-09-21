@@ -15,7 +15,9 @@ public sealed class ArchiveContractTests
 
         Assert.Equal(0, report.ExitCode);
         Assert.Equal("pass", report.Status);
-        Assert.All(report.Checks, check => Assert.Equal("pass", check.Status));
+        Assert.All(report.Checks.Where(check => check.Id is not "workflow-policy" and not "consumer-rehearsal"), check => Assert.Equal("pass", check.Status));
+        Assert.Equal("not-applicable", report.Checks.Single(check => check.Id == "workflow-policy").Status);
+        Assert.Equal("not-applicable", report.Checks.Single(check => check.Id == "consumer-rehearsal").Status);
     }
 
     [Fact]
@@ -90,7 +92,15 @@ public sealed class ArchiveContractTests
     public void Root_and_nested_sensitive_files_fail_without_rejecting_user_secrets_assembly()
     {
         using var fixture = PackageFixture.Create();
-        var sensitiveEntries = new[] { ".env", ".env.local", "nested/AGENTS.md", "nested/keelmatrix.telemetry.json" };
+        var sensitiveEntries = new[]
+        {
+            ".env",
+            ".env.local",
+            "local-telemetry.json",
+            "nested/local-telemetry.json",
+            "nested/AGENTS.md",
+            "nested/keelmatrix.telemetry.json"
+        };
 
         foreach (var entry in sensitiveEntries)
         {
@@ -107,6 +117,7 @@ public sealed class ArchiveContractTests
                 fixture.ArtifactsPath);
 
             Assert.Contains(report.Failures, failure => failure.CheckId == "archive-security");
+            File.Delete(package);
         }
 
         var originalAssemblyPackage = fixture.AddPackage("user-secrets-assembly.nupkg", "Example.Core", "1.2.3");
@@ -170,6 +181,7 @@ public sealed class ArchiveContractTests
             fixture.ArtifactsPath);
 
         Assert.Contains(malformedReport.Failures, failure => failure.CheckId == "archive-layout");
+        File.Delete(Path.Combine(fixture.ArtifactsPath, "example-tool.1.2.3.snupkg"));
 
         var originalPackage = fixture.AddPackage("file-license.nupkg", "Example.Core", "1.2.3");
         var packageWithFileLicense = ArchiveMutator.ReplaceNuspecText(
@@ -217,6 +229,74 @@ public sealed class ArchiveContractTests
     }
 
     [Fact]
+    public void Foreign_valid_portable_pdb_at_the_expected_path_fails_identity_validation()
+    {
+        using var corpus = PackedCorpus.Create();
+        var toolPackage = corpus.Pack("Tool/Tool.csproj");
+        corpus.Pack("Standard/Standard.csproj");
+        var toolSymbols = Path.Combine(corpus.OutputPath, "Fixture.Tool.1.0.0.snupkg");
+        var standardSymbols = Path.Combine(corpus.OutputPath, "Fixture.Standard.1.0.0.snupkg");
+        byte[] foreignPdb;
+        using (var archive = ZipFile.OpenRead(standardSymbols))
+        {
+            var entry = archive.Entries.Single(entry => entry.FullName.EndsWith(".pdb", StringComparison.OrdinalIgnoreCase));
+            using var stream = entry.Open();
+            using var buffer = new MemoryStream();
+            stream.CopyTo(buffer);
+            foreignPdb = buffer.ToArray();
+        }
+        File.Delete(Path.Combine(corpus.OutputPath, "Fixture.Standard.1.0.0.nupkg"));
+        File.Delete(standardSymbols);
+
+        var substitutedSymbols = ArchiveMutator.ReplaceEntry(
+            toolSymbols,
+            "tools/net8.0/any/Fixture.Tool.pdb",
+            foreignPdb,
+            "foreign-pdb.snupkg");
+        File.Delete(toolSymbols);
+
+        var report = CheckRunner.Run(
+            ConfigWithCommand(
+                "Fixture.Tool",
+                "dotnetTool",
+                "1.0.0",
+                new[] { Path.GetFileName(toolPackage), Path.GetFileName(substitutedSymbols) },
+                "fixture-tool"),
+            corpus.OutputPath);
+
+        Assert.Equal(1, report.ExitCode);
+        Assert.Contains(report.Failures, failure =>
+            failure.CheckId == "archive-layout" &&
+            failure.Message.Contains("identity", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void Deterministic_rebuild_symbols_match_the_same_assembly()
+    {
+        using var first = PackedCorpus.Create();
+        using var rebuild = PackedCorpus.Create();
+        var firstPackage = first.Pack("Tool/Tool.csproj");
+        var firstSymbols = Path.Combine(first.OutputPath, "Fixture.Tool.1.0.0.snupkg");
+        rebuild.Pack("Tool/Tool.csproj");
+        var rebuildSymbols = Path.Combine(rebuild.OutputPath, "Fixture.Tool.1.0.0.snupkg");
+        var copiedSymbols = Path.Combine(first.OutputPath, "deterministic-rebuild.snupkg");
+        File.Copy(rebuildSymbols, copiedSymbols);
+        File.Delete(firstSymbols);
+
+        var report = CheckRunner.Run(
+            ConfigWithCommand(
+                "Fixture.Tool",
+                "dotnetTool",
+                "1.0.0",
+                new[] { Path.GetFileName(firstPackage), Path.GetFileName(copiedSymbols) },
+                "fixture-tool"),
+            first.OutputPath);
+
+        Assert.Equal(0, report.ExitCode);
+        Assert.DoesNotContain(report.Failures, failure => failure.CheckId == "archive-layout");
+    }
+
+    [Fact]
     public void Blocking_archive_failure_marks_consumer_rehearsal_as_not_run()
     {
         using var fixture = PackageFixture.Create();
@@ -257,6 +337,10 @@ public sealed class ArchiveContractTests
         Assert.Equal(2, report.ExitCode);
         Assert.Equal("error", report.Status);
         Assert.Contains(report.Failures, failure => failure.CheckId == "archive-parse" && failure.IsError);
+        Assert.Equal("error", report.Checks.Single(check => check.Id == "archive-parse").Status);
+        Assert.All(
+            report.Checks.Where(check => check.Id is "archive-metadata" or "archive-layout" or "dependency-groups" or "dependency-coherence" or "archive-security"),
+            check => Assert.Equal("not-run", check.Status));
     }
 
     [Fact]

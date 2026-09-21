@@ -297,6 +297,21 @@ $changelogLines = $changelog -split '\r?\n'
 $sections = @(Get-HeadingSections -Lines $changelogLines)
 $unreleased = $sections | Where-Object { $_.Label -ieq "Unreleased" } | Select-Object -First 1
 $release = $sections | Where-Object { $_.Label -eq $targetVersion } | Select-Object -First 1
+
+if ($Mode -eq "PreRelease") {
+    if ($null -eq $unreleased) {
+        Fail-Contract "CHANGELOG.md must contain an [Unreleased] section for a pre-release candidate."
+    }
+
+    $unreleasedLines = @(Get-SectionLines -Lines $changelogLines -Section $unreleased -Sections $sections)
+    if (-not (($unreleasedLines -join "`n") -match [Regex]::Escape($targetVersion))) {
+        Fail-Contract "CHANGELOG.md [Unreleased] must identify the planned target version '$targetVersion'."
+    }
+
+    Write-Host "Pre-release contract passed: mode=$Mode; version=$targetVersion; package=KeelMatrix.NuGetReady; changelog=[Unreleased]"
+    return
+}
+
 if ($null -eq $release) {
     Fail-Contract "CHANGELOG.md does not contain a released [$targetVersion] section outside [Unreleased]."
 }

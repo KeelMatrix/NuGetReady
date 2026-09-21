@@ -1,6 +1,8 @@
 using NuGet.Packaging;
 using NuGet.Packaging.Core;
 using System.Reflection.Metadata;
+using System.Reflection.PortableExecutable;
+using System.Security.Cryptography;
 using System.Xml.Linq;
 
 namespace KeelMatrix.NuGetReady;
@@ -222,6 +224,15 @@ internal static class ArchiveInspector
                         {
                             failures.Add(new Failure("archive-layout", "Symbol archive contains a PDB without a matching package assembly."));
                         }
+                        else
+                        {
+                            ValidatePdbCorrespondence(
+                                mainReader!,
+                                expectedAssembly,
+                                stream.ToArray(),
+                                metadata,
+                                failures);
+                        }
                     }
                 }
                 catch (BadImageFormatException)
@@ -242,6 +253,84 @@ internal static class ArchiveInspector
         {
             mainReader?.Dispose();
         }
+    }
+
+    private static void ValidatePdbCorrespondence(
+        PackageArchiveReader mainReader,
+        string assemblyPath,
+        byte[] pdbBytes,
+        MetadataReader pdbMetadata,
+        List<Failure> failures)
+    {
+        using var source = mainReader.GetStream(assemblyPath);
+        using var assemblyStream = new MemoryStream();
+        source.CopyTo(assemblyStream);
+        assemblyStream.Position = 0;
+        using var peReader = new PEReader(assemblyStream);
+        var debugEntries = peReader.ReadDebugDirectory();
+        var codeViewEntry = debugEntries.FirstOrDefault(entry => entry.Type == DebugDirectoryEntryType.CodeView);
+        if (codeViewEntry.Type != DebugDirectoryEntryType.CodeView)
+        {
+            failures.Add(new Failure("archive-layout", "Package assembly does not contain CodeView debug identity for its portable PDB."));
+            return;
+        }
+
+        var codeView = peReader.ReadCodeViewDebugDirectoryData(codeViewEntry);
+        var pdbIdBytes = pdbMetadata.DebugMetadataHeader?.Id;
+        if (pdbIdBytes is null || pdbIdBytes.Value.Length != 20)
+        {
+            failures.Add(new Failure("archive-layout", "Portable PDB identity does not match its package assembly."));
+            return;
+        }
+
+        var pdbId = new BlobContentId(pdbIdBytes.Value);
+        // Portable CodeView records use Age=1 and carry the remaining four PDB-ID bytes in the entry stamp.
+        if (codeViewEntry.Stamp != pdbId.Stamp || codeView.Guid != pdbId.Guid || codeView.Age != 1)
+        {
+            failures.Add(new Failure("archive-layout", "Portable PDB identity does not match its package assembly."));
+            return;
+        }
+
+        var checksumEntries = debugEntries.Where(entry => entry.Type == DebugDirectoryEntryType.PdbChecksum).ToArray();
+        if (checksumEntries.Length == 0)
+        {
+            return;
+        }
+
+        var idOffset = pdbMetadata.DebugMetadataHeader!.IdStartOffset;
+        if (idOffset < 0 || idOffset > pdbBytes.Length - 20)
+        {
+            failures.Add(new Failure("archive-layout", "Portable PDB checksum metadata is invalid."));
+            return;
+        }
+
+        foreach (var checksumEntry in checksumEntries)
+        {
+            var checksum = peReader.ReadPdbChecksumDebugDirectoryData(checksumEntry);
+            var checksumInput = (byte[])pdbBytes.Clone();
+            // The Portable PDB checksum is defined over the PDB with its 20-byte ID zeroed.
+            Array.Clear(checksumInput, idOffset, 20);
+            using var algorithm = CreateChecksumAlgorithm(checksum.AlgorithmName);
+            if (algorithm is null || !CryptographicOperations.FixedTimeEquals(algorithm.ComputeHash(checksumInput), checksum.Checksum.ToArray()))
+            {
+                failures.Add(new Failure("archive-layout", "Portable PDB checksum does not match its package assembly."));
+            }
+        }
+    }
+
+    private static HashAlgorithm? CreateChecksumAlgorithm(string algorithmName)
+    {
+#pragma warning disable CA5350, CA5351 // The algorithm is declared by the assembly's PDB-checksum debug directory; it is not selected as a security primitive.
+        return algorithmName.ToUpperInvariant() switch
+        {
+            "MD5" => MD5.Create(),
+            "SHA1" => SHA1.Create(),
+            "SHA256" => SHA256.Create(),
+            "SHA384" => SHA384.Create(),
+            "SHA512" => SHA512.Create(),
+            _ => null
+        };
+#pragma warning restore CA5350, CA5351
     }
 
     private static void ValidateSourceLink(MetadataReader metadata, List<Failure> failures)
@@ -319,29 +408,7 @@ internal static class ArchiveInspector
 
     private static bool IsUnexpectedFile(string file)
     {
-        var lower = file.ToLowerInvariant();
-        var name = lower[(lower.LastIndexOf('/') + 1)..];
-        return lower.Contains("../", StringComparison.Ordinal) ||
-               lower.StartsWith(".git/", StringComparison.Ordinal) ||
-               lower.StartsWith(".github/", StringComparison.Ordinal) ||
-               lower.Contains("/obj/", StringComparison.Ordinal) ||
-               lower.Contains("/bin/", StringComparison.Ordinal) ||
-               lower.Contains("node_modules/", StringComparison.Ordinal) ||
-               lower.EndsWith("/agents.md", StringComparison.Ordinal) ||
-               lower.Equals("agents.md", StringComparison.Ordinal) ||
-               lower.Equals(".env", StringComparison.Ordinal) ||
-               lower.StartsWith(".env.", StringComparison.Ordinal) ||
-               lower.Contains("/.env.", StringComparison.Ordinal) ||
-               lower.EndsWith("/.env", StringComparison.Ordinal) ||
-               lower.EndsWith("/keelmatrix.telemetry.json", StringComparison.Ordinal) ||
-               lower.Equals("keelmatrix.telemetry.json", StringComparison.Ordinal) ||
-               lower.EndsWith(".pfx", StringComparison.Ordinal) ||
-               lower.EndsWith(".p12", StringComparison.Ordinal) ||
-               lower.EndsWith(".pem", StringComparison.Ordinal) ||
-               lower.EndsWith(".key", StringComparison.Ordinal) ||
-               name is "apikey" or "api-key" or "access-token" or "credentials.json" or "password" or "secret" ||
-               lower.EndsWith(".user", StringComparison.Ordinal) ||
-               lower.EndsWith(".suo", StringComparison.Ordinal);
+        return PackageSensitiveFilePolicy.IsSensitive(file);
     }
 
     private static string Normalize(string path)

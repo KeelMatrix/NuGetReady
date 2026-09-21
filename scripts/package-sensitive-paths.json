@@ -1,0 +1,50 @@
+{
+  "exactFileNames": [
+    "AGENTS.md",
+    "CHANGELOG.md",
+    "SECURITY.md",
+    "PRIVACY.md",
+    "NuGet.config",
+    "global.json",
+    "local-telemetry.json",
+    "keelmatrix.telemetry.json",
+    "apikey",
+    "api-key",
+    "access-token",
+    "credentials.json",
+    "password",
+    "secret"
+  ],
+  "fileNamePrefixes": [
+    ".env"
+  ],
+  "fileNameSuffixes": [
+    ".pfx",
+    ".p12",
+    ".pem",
+    ".key",
+    ".user",
+    ".suo"
+  ],
+  "fileExtensions": [
+    ".csproj",
+    ".sln",
+    ".yml",
+    ".yaml",
+    ".trx"
+  ],
+  "pathSegments": [
+    ".git",
+    ".github",
+    "obj",
+    "bin",
+    "node_modules",
+    "tests",
+    "test",
+    "artifacts",
+    "TestResults"
+  ],
+  "pathFragments": [
+    "../"
+  ]
+}

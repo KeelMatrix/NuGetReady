@@ -33,6 +33,8 @@
     <PackageReference Include="KeelMatrix.Telemetry" />
     <None Include="README.md" Pack="true" PackagePath="README.md" />
     <None Include="..\..\icon.png" Pack="true" PackagePath="icon.png" Link="icon.png" Visible="false" />
+    <EmbeddedResource Include="..\..\scripts\package-sensitive-paths.json"
+                      LogicalName="KeelMatrix.NuGetReady.package-sensitive-paths.json" />
   </ItemGroup>
 
   <!-- PackAsTool suppresses dependencies by default; retain the required
@@ -46,13 +48,6 @@
   </Target>
 
   <Target Name="RejectNuGetReadySensitivePackInputs" BeforeTargets="Pack">
-    <ItemGroup>
-      <_NuGetReadySensitivePackFiles Include="$(MSBuildProjectDirectory)\**\.env*" />
-      <_NuGetReadySensitivePackFiles Include="$(MSBuildProjectDirectory)\**\keelmatrix.telemetry.json" />
-      <_NuGetReadySensitivePackFiles Include="$(MSBuildProjectDirectory)\**\local-telemetry.json" />
-      <_NuGetReadySensitivePackFiles Remove="$(MSBuildProjectDirectory)\bin\**;$(MSBuildProjectDirectory)\obj\**" />
-    </ItemGroup>
-    <Error Condition="'@(_NuGetReadySensitivePackFiles)' != ''"
-           Text="NuGetReady refuses to pack sensitive local input: @(_NuGetReadySensitivePackFiles)" />
+    <Exec Command="pwsh -NoProfile -NonInteractive -File &quot;$(MSBuildProjectDirectory)\..\..\scripts\reject-sensitive-pack-inputs.ps1&quot; -ProjectDirectory &quot;$(MSBuildProjectDirectory)&quot;" />
   </Target>
 </Project>

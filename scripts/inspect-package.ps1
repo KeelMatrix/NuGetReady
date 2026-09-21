@@ -12,6 +12,8 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+$sensitivePathPolicy = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot "package-sensitive-paths.json") | ConvertFrom-Json
+
 function Assert-Contract {
     param(
         [bool]$Condition,
@@ -21,6 +23,24 @@ function Assert-Contract {
     if (-not $Condition) {
         throw $Message
     }
+}
+
+function Test-SensitivePackagePath {
+    param([string]$Path)
+
+    $normalized = $Path.Replace("\", "/").TrimStart("/")
+    $lower = $normalized.ToLowerInvariant()
+    if (@($sensitivePathPolicy.pathFragments) | Where-Object { $lower.Contains([string]$_, [StringComparison]::Ordinal) }) { return $true }
+
+    $segments = $lower.Split('/', [StringSplitOptions]::RemoveEmptyEntries)
+    if (@($sensitivePathPolicy.pathSegments) | Where-Object { $segments -contains ([string]$_).ToLowerInvariant() }) { return $true }
+
+    $name = [IO.Path]::GetFileName($lower)
+    if (@($sensitivePathPolicy.exactFileNames) | Where-Object { $name -eq ([string]$_).ToLowerInvariant() }) { return $true }
+    if (@($sensitivePathPolicy.fileNamePrefixes) | Where-Object { $name.StartsWith(([string]$_).ToLowerInvariant(), [StringComparison]::Ordinal) }) { return $true }
+    if (@($sensitivePathPolicy.fileNameSuffixes) | Where-Object { $name.EndsWith(([string]$_).ToLowerInvariant(), [StringComparison]::Ordinal) }) { return $true }
+    if (@($sensitivePathPolicy.fileExtensions) | Where-Object { $name.EndsWith(([string]$_).ToLowerInvariant(), [StringComparison]::Ordinal) }) { return $true }
+    return $false
 }
 
 function Read-Nuspec {
@@ -129,12 +149,7 @@ function Inspect-Archive {
         })
         Assert-Contract ($unexpected.Count -eq 0) "Unexpected package entries found: $($unexpected -join ', ')"
 
-        $forbidden = @($entries | Where-Object {
-            $_ -match '(^|/)(AGENTS\.md|CHANGELOG\.md|SECURITY\.md|PRIVACY\.md|NuGet\.config|global\.json|\.env[^/]*|keelmatrix\.telemetry\.json)$' -or
-            $_ -match '\.(csproj|sln|yml|yaml|trx)$' -or
-            $_ -match '(^|/)(tests?|artifacts|bin|obj|TestResults)(/|$)' -or
-            $_ -match '(^|/)(apikey|api-key|access-token|credentials\.json|password|secret)$'
-        })
+        $forbidden = @($entries | Where-Object { Test-SensitivePackagePath $_ })
         Assert-Contract ($forbidden.Count -eq 0) "Forbidden archive entries found: $($forbidden -join ', ')"
     }
     finally {

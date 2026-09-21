@@ -68,6 +68,8 @@ internal static partial class CliParser
           --artifacts <path>    Package archive directory (default: ./artifacts/packages)
           --format text|json    Report format (default: text)
           --timeout <duration>  Bounded operation timeout (for example 30s or 00:05:00)
+
+        Check statuses are pass, warn, fail, error, not-run, and not-applicable.
         """.TrimEnd();
 
     private static string ReadValue(IReadOnlyList<string> args, ref int index, string option, OutputFormat format)

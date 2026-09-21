@@ -2,19 +2,6 @@ namespace KeelMatrix.NuGetReady;
 
 internal static class CheckRunner
 {
-    private static readonly string[] CheckOrder =
-    {
-        "artifact-set",
-        "archive-metadata",
-        "archive-layout",
-        "dependency-groups",
-        "dependency-coherence",
-        "archive-security",
-        "archive-parse",
-        "workflow-policy",
-        "consumer-rehearsal"
-    };
-
     public static ReadinessReport Run(NuGetReadyConfig config, string artifactsPath)
     {
         return RunCore(config, artifactsPath, repositoryPath: null, timeout: null);
@@ -37,12 +24,15 @@ internal static class CheckRunner
         TimeSpan? timeout,
         ConsumerRehearsalOptions? rehearsalOptions = null)
     {
+        var failures = CheckContract.Order.ToDictionary(id => id, _ => new List<Failure>(), StringComparer.Ordinal);
+        var checkStates = new Dictionary<string, string>(StringComparer.Ordinal);
         if (!Directory.Exists(artifactsPath))
         {
-            return ErrorReport("Artifact directory was not found.");
+            failures["artifact-set"].Add(new Failure("artifact-set", "Artifact directory was not found.", true));
+            MarkDownstreamChecksNotRun(checkStates);
+            return BuildReport(0, 0, failures, Array.Empty<RehearsalResult>(), checkStates);
         }
 
-        var failures = CheckOrder.ToDictionary(id => id, _ => new List<Failure>(), StringComparer.Ordinal);
         var actualArtifacts = EnumerateArtifacts(artifactsPath, failures["artifact-set"]);
         var expectedArtifacts = config.Packages!.SelectMany(package => package.Artifacts!).ToArray();
         var expectations = config.Packages!
@@ -69,6 +59,12 @@ internal static class CheckRunner
             {
                 failures["artifact-set"].Add(new Failure("artifact-set", $"Unintended artifact '{actual.Key}' was found."));
             }
+        }
+
+        if (HasBlockingFailure(failures["artifact-set"]))
+        {
+            MarkDownstreamChecksNotRun(checkStates);
+            return BuildReport(expectedArtifacts.Length, actualArtifacts.Values.Sum(paths => paths.Count), failures, Array.Empty<RehearsalResult>(), checkStates);
         }
 
         foreach (var expected in expectedArtifacts.OrderBy(name => name, StringComparer.OrdinalIgnoreCase).ThenBy(name => name, StringComparer.Ordinal))
@@ -112,13 +108,24 @@ internal static class CheckRunner
             }
         }
 
-        foreach (var failure in DependencyCoherence.Inspect(config, artifactsPath))
+        var archiveParseBlocked = HasBlockingFailure(failures["archive-parse"]);
+        if (!archiveParseBlocked)
         {
-            failures["dependency-coherence"].Add(failure);
+            foreach (var failure in DependencyCoherence.Inspect(config, artifactsPath))
+            {
+                failures["dependency-coherence"].Add(failure);
+            }
+        }
+        else
+        {
+            MarkIfEmpty(failures, checkStates, "archive-metadata");
+            MarkIfEmpty(failures, checkStates, "archive-layout");
+            MarkIfEmpty(failures, checkStates, "dependency-groups");
+            MarkIfEmpty(failures, checkStates, "archive-security");
+            checkStates["dependency-coherence"] = CheckContract.NotRun;
         }
 
-        var checkStates = new Dictionary<string, string>(StringComparer.Ordinal);
-        if (repositoryPath is not null)
+        if (repositoryPath is not null && !archiveParseBlocked)
         {
             var workflowInspection = WorkflowPolicyInspector.InspectDetailed(repositoryPath);
             foreach (var failure in workflowInspection.Failures)
@@ -128,19 +135,31 @@ internal static class CheckRunner
 
             if (!workflowInspection.Evaluated)
             {
-                checkStates["workflow-policy"] = "not-applicable";
+                checkStates["workflow-policy"] = CheckContract.NotApplicable;
             }
+        }
+        else if (repositoryPath is null)
+        {
+            checkStates["workflow-policy"] = CheckContract.NotApplicable;
+        }
+        else
+        {
+            checkStates["workflow-policy"] = CheckContract.NotRun;
         }
 
         var rehearsals = Array.Empty<RehearsalResult>();
         var blockingArchiveFailure = failures.Values.SelectMany(items => items).Any(failure => !failure.IsWarning);
         if (repositoryPath is not null && timeout is not null && blockingArchiveFailure)
         {
-            checkStates["consumer-rehearsal"] = "not-run";
+            checkStates["consumer-rehearsal"] = CheckContract.NotRun;
         }
         else if (repositoryPath is not null && timeout is null)
         {
-            checkStates["consumer-rehearsal"] = "not-applicable";
+            checkStates["consumer-rehearsal"] = CheckContract.NotApplicable;
+        }
+        else if (repositoryPath is null)
+        {
+            checkStates["consumer-rehearsal"] = CheckContract.NotApplicable;
         }
 
         if (repositoryPath is not null && timeout is not null && !blockingArchiveFailure)
@@ -149,7 +168,7 @@ internal static class CheckRunner
             rehearsals = detailedRehearsals.Select(outcome => outcome.Result).ToArray();
             foreach (var outcome in detailedRehearsals)
             {
-                if (!outcome.Result.Status.Equals("pass", StringComparison.Ordinal))
+                if (!outcome.Result.Status.Equals(CheckContract.Pass, StringComparison.Ordinal))
                 {
                     failures["consumer-rehearsal"].Add(new Failure(
                         "consumer-rehearsal",
@@ -160,6 +179,30 @@ internal static class CheckRunner
         }
 
         return BuildReport(expectedArtifacts.Length, actualArtifacts.Values.Sum(paths => paths.Count), failures, rehearsals, checkStates);
+    }
+
+    private static bool HasBlockingFailure(IEnumerable<Failure> failures)
+    {
+        return failures.Any(failure => !failure.IsWarning);
+    }
+
+    private static void MarkDownstreamChecksNotRun(Dictionary<string, string> checkStates)
+    {
+        foreach (var checkId in CheckContract.Order.Skip(1))
+        {
+            checkStates[checkId] = CheckContract.NotRun;
+        }
+    }
+
+    private static void MarkIfEmpty(
+        Dictionary<string, List<Failure>> failures,
+        Dictionary<string, string> checkStates,
+        string checkId)
+    {
+        if (failures[checkId].Count == 0)
+        {
+            checkStates[checkId] = CheckContract.NotRun;
+        }
     }
 
     private static string FormatDiagnostic(string diagnostic)
@@ -212,10 +255,11 @@ internal static class CheckRunner
     private static ReadinessReport ErrorReport(string message)
     {
         var failure = new Failure("artifact-set", message, true);
-        return BuildReport(0, 0, new Dictionary<string, List<Failure>>(StringComparer.Ordinal)
-        {
-            ["artifact-set"] = new List<Failure> { failure }
-        }, Array.Empty<RehearsalResult>());
+        var failures = CheckContract.Order.ToDictionary(id => id, _ => new List<Failure>(), StringComparer.Ordinal);
+        failures["artifact-set"].Add(failure);
+        var checkStates = new Dictionary<string, string>(StringComparer.Ordinal);
+        MarkDownstreamChecksNotRun(checkStates);
+        return BuildReport(0, 0, failures, Array.Empty<RehearsalResult>(), checkStates);
     }
 
     private static ReadinessReport BuildReport(
@@ -225,7 +269,7 @@ internal static class CheckRunner
         IReadOnlyList<RehearsalResult> rehearsals,
         Dictionary<string, string>? checkStates = null)
     {
-        var checks = CheckOrder
+        var checks = CheckContract.Order
             .Select(id => new CheckResult(
                 id,
                 failures.TryGetValue(id, out var checkFailures) ? checkFailures : Array.Empty<Failure>(),
