@@ -5,10 +5,51 @@ namespace KeelMatrix.NuGetReady.Tests;
 public sealed class SensitivePathPolicyTests
 {
     [Fact]
+    public async Task Tool_and_power_shell_policy_accept_manifest_generated_legitimate_embedded_names()
+    {
+        var manifest = PackageSensitiveFilePolicy.ReadManifestForTests();
+        var corpus = SensitivePathCorpus.GenerateAcceptCorpus(manifest).ToArray();
+
+        Assert.NotEmpty(corpus);
+        Assert.All(corpus, path => Assert.False(
+            PackageSensitiveFilePolicy.IsSensitive(path),
+            $"Tool rejected legitimate embedded name: {path}"));
+
+        var root = FindRepositoryRoot();
+        var policyScript = Path.Combine(root.FullName, "scripts", "package-sensitive-path-policy.ps1");
+        var pathsJson = JsonSerializer.Serialize(corpus);
+        var probe = Path.Combine(Path.GetTempPath(), $"nugetready-sensitive-accept-parity-{Guid.NewGuid():N}.ps1");
+        var probeScript = ". '" + policyScript.Replace("'", "''") + "'\n" +
+            "$paths = ConvertFrom-Json @'\n" + pathsJson + "\n'@\n" +
+            "$falsePositives = @($paths | Where-Object { Test-SensitivePackagePath ([string]$_) })\n" +
+            "if ($falsePositives.Count -gt 0) { throw \"Script rejected legitimate embedded names: $($falsePositives -join ', ')\" }\n";
+        File.WriteAllText(probe, probeScript);
+        try
+        {
+            var result = await BoundedProcess.RunAsync(
+                "pwsh",
+                ["-NoProfile", "-NonInteractive", "-File", probe],
+                root.FullName,
+                new Dictionary<string, string?> { ["DOTNET_CLI_TELEMETRY_OPTOUT"] = "1" },
+                TimeSpan.FromSeconds(30));
+
+            Assert.True(result.Started, result.StandardError);
+            Assert.Equal(0, result.ExitCode);
+        }
+        finally
+        {
+            if (File.Exists(probe))
+            {
+                File.Delete(probe);
+            }
+        }
+    }
+
+    [Fact]
     public async Task Tool_pack_guard_and_archive_inspection_share_manifest_family_semantics()
     {
         var manifest = PackageSensitiveFilePolicy.ReadManifestForTests();
-        var corpus = SensitivePathCorpus.GenerateExactNameCorpus(manifest)
+        var corpus = SensitivePathCorpus.GenerateRejectCorpus(manifest)
             .Concat(manifest.FileNamePrefixes.Select(prefix => $"{prefix}.local"))
             .Concat(manifest.FileNameSuffixes.Select(suffix => $"local{suffix}.bak"))
             .Concat(manifest.FileExtensions.Select(extension => $"release{extension}.bak"))
@@ -101,7 +142,7 @@ public sealed class SensitivePathPolicyTests
             rule.Match.Equals("contains", StringComparison.OrdinalIgnoreCase) &&
             rule.Scope.Equals("pathSegments", StringComparison.OrdinalIgnoreCase));
 
-        var variants = SensitivePathCorpus.GenerateExactNameCorpus(manifest);
+        var variants = SensitivePathCorpus.GenerateRejectCorpus(manifest);
         var accepted = variants.Where(path => !PackageSensitiveFilePolicy.IsSensitive(path)).ToArray();
 
         Assert.Empty(accepted);

@@ -68,11 +68,29 @@
     "Microsoft.Extensions.Configuration.UserSecrets.dll"
   ],
   "familyRules": [
-    { "source": "exactFileNames", "match": "prefix", "scope": "pathSegments" },
+    {
+      "source": "exactFileNames",
+      "match": "prefix",
+      "scope": "pathSegments",
+      "exemptExtensions": [ ".dll", ".exe", ".pdb", ".so", ".dylib", ".xml" ]
+    },
+    {
+      "source": "exactFileNames",
+      "match": "contains",
+      "scope": "pathSegments",
+      "boundary": "none",
+      "exemptExtensions": [ ".dll", ".exe", ".pdb", ".so", ".dylib", ".xml" ]
+    },
     { "source": "fileNamePrefixes", "match": "prefix", "scope": "pathSegments" },
     { "source": "fileNameSuffixes", "match": "extension", "scope": "pathSegments" },
     { "source": "fileExtensions", "match": "extension", "scope": "pathSegments" },
-    { "source": "fileNameFragments", "match": "contains", "scope": "pathSegments" },
+    {
+      "source": "fileNameFragments",
+      "match": "contains",
+      "scope": "pathSegments",
+      "boundary": "endOrSeparator",
+      "exemptExtensions": [ ".dll", ".exe", ".pdb", ".so", ".dylib", ".xml" ]
+    },
     { "source": "pathSegments", "match": "prefix", "scope": "pathSegments" }
   ]
 }

@@ -31,6 +31,10 @@ internal sealed class PackageSensitiveFamilyRule
     public string Match { get; set; } = string.Empty;
 
     public string Scope { get; set; } = string.Empty;
+
+    public string Boundary { get; set; } = string.Empty;
+
+    public string[] ExemptExtensions { get; set; } = Array.Empty<string>();
 }
 
 internal static class PackageSensitiveFilePolicy
@@ -74,6 +78,11 @@ internal static class PackageSensitiveFilePolicy
                     continue;
                 }
 
+                if (rule.ExemptExtensions.Any(extension => segment.EndsWith(extension, StringComparison.OrdinalIgnoreCase)))
+                {
+                    continue;
+                }
+
                 if (rule.Match.Equals("prefix", StringComparison.OrdinalIgnoreCase) &&
                     values.Any(value => segment.StartsWith(value, StringComparison.OrdinalIgnoreCase)))
                 {
@@ -87,7 +96,7 @@ internal static class PackageSensitiveFilePolicy
                 }
 
                 if (rule.Match.Equals("contains", StringComparison.OrdinalIgnoreCase) &&
-                    values.Any(value => segment.Contains(value, StringComparison.OrdinalIgnoreCase)))
+                    values.Any(value => ContainsFamilyValue(segment, value, rule.Boundary)))
                 {
                     return true;
                 }
@@ -113,6 +122,29 @@ internal static class PackageSensitiveFilePolicy
             "pathSegments" => Manifest.PathSegments,
             _ => throw new InvalidOperationException($"The package-sensitive path manifest contains an unsupported family rule source: {source}.")
         };
+    }
+
+    private static bool ContainsFamilyValue(string segment, string value, string boundary)
+    {
+        var start = segment.IndexOf(value, StringComparison.OrdinalIgnoreCase);
+        while (start >= 0)
+        {
+            var end = start + value.Length;
+            if (boundary.Equals("endOrSeparator", StringComparison.OrdinalIgnoreCase) &&
+                (end == segment.Length || !char.IsLetterOrDigit(segment[end])))
+            {
+                return true;
+            }
+
+            if (string.IsNullOrEmpty(boundary) || boundary.Equals("none", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            start = segment.IndexOf(value, end, StringComparison.OrdinalIgnoreCase);
+        }
+
+        return false;
     }
 
     private static bool ContainsExtensionFamily(string segment, string value)

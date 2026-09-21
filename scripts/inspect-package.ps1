@@ -71,6 +71,21 @@ function Assert-NuspecContract {
     Assert-Contract ($telemetry.exclude -eq "Build,Analyzers") "KeelMatrix.Telemetry dependency exclusions are incorrect."
 }
 
+function Test-ManifestExemptToolPayloadEntry {
+    param([string]$Entry)
+
+    $segments = $Entry.Replace("\", "/").TrimStart("/").Split("/", [StringSplitOptions]::RemoveEmptyEntries)
+    if ($segments.Count -ne 4 -or $segments[0] -ne "tools" -or $segments[2] -ne "any") { return $false }
+
+    $fragmentRule = @($packageSensitivePathPolicy.familyRules | Where-Object {
+        $_.source -eq "fileNameFragments" -and $_.match -eq "contains" -and $_.scope -eq "pathSegments"
+    }) | Select-Object -First 1
+    if ($null -eq $fragmentRule -or $null -eq $fragmentRule.PSObject.Properties["exemptExtensions"]) { return $false }
+
+    $extension = [IO.Path]::GetExtension($segments[3]).ToLowerInvariant()
+    return @($fragmentRule.exemptExtensions | ForEach-Object { ([string]$_).ToLowerInvariant() }) -contains $extension
+}
+
 function Inspect-Archive {
     param(
         [string]$Path,
@@ -130,7 +145,9 @@ function Inspect-Archive {
         Assert-Contract ($forbidden.Count -eq 0) "Forbidden archive entries found: $($forbidden -join ', ')"
 
         $unexpected = @($entries | Where-Object {
-            ($allowed -notcontains $_) -and ($_ -notmatch '^package/services/metadata/core-properties/[^/]+\.psmdcp$')
+            ($allowed -notcontains $_) -and
+            ($_ -notmatch '^package/services/metadata/core-properties/[^/]+\.psmdcp$') -and
+            -not (Test-ManifestExemptToolPayloadEntry $_)
         })
         Assert-Contract ($unexpected.Count -eq 0) "Unexpected package entries found: $($unexpected -join ', ')"
     }

@@ -56,11 +56,29 @@ function Test-SensitivePackagePath {
         $values = @(Get-FamilyValues ([string]$familyRule.source) | ForEach-Object { ([string]$_).ToLowerInvariant() })
         foreach ($segment in $segments) {
             if (@($packageSensitivePathPolicy.familyExceptions) | Where-Object { $segment -eq ([string]$_).ToLowerInvariant() }) { continue }
+            $exemptExtensions = @()
+            if ($null -ne $familyRule.PSObject.Properties["exemptExtensions"]) {
+                $exemptExtensions = @($familyRule.exemptExtensions) | ForEach-Object { ([string]$_).ToLowerInvariant() }
+            }
+            if ($exemptExtensions | Where-Object { $segment.EndsWith([string]$_, [StringComparison]::Ordinal) }) { continue }
 
             foreach ($value in $values) {
                 if ($familyRule.match -eq "prefix" -and $segment.StartsWith($value, [StringComparison]::Ordinal)) { return $true }
                 if ($familyRule.match -eq "extension" -and (Test-ExtensionFamily $segment $value)) { return $true }
-                if ($familyRule.match -eq "contains" -and $segment.Contains($value, [StringComparison]::Ordinal)) { return $true }
+                if ($familyRule.match -eq "contains") {
+                    $boundary = if ($null -ne $familyRule.PSObject.Properties["boundary"]) { [string]$familyRule.boundary } else { "" }
+                    $start = $segment.IndexOf($value, [StringComparison]::Ordinal)
+                    while ($start -ge 0) {
+                        $end = $start + $value.Length
+                        if ($boundary -eq "endOrSeparator" -and ($end -eq $segment.Length -or -not [char]::IsLetterOrDigit($segment[$end]))) { return $true }
+                        if ([string]::IsNullOrEmpty($boundary) -or $boundary -eq "none") { return $true }
+                        $nextStart = $end
+                        $remaining = $segment.Length - $nextStart
+                        $next = $segment.Substring($nextStart, $remaining)
+                        $relative = $next.IndexOf($value, [StringComparison]::Ordinal)
+                        $start = if ($relative -ge 0) { $nextStart + $relative } else { -1 }
+                    }
+                }
                 if ($familyRule.match -notin @("prefix", "extension", "contains")) {
                     throw "Unsupported package-sensitive family rule match: $($familyRule.match)"
                 }

@@ -73,11 +73,44 @@ public sealed class PackageInspectionContractTests
     }
 
     [Fact]
+    public async Task Package_inspection_accepts_a_manifest_exempt_tool_payload_assembly()
+    {
+        using var fixture = PackageFixture.Create();
+        var package = CreateArchive(
+            Path.Combine(fixture.ArtifactsPath, "KeelMatrix.NuGetReady.0.1.0.nupkg"),
+            symbols: false,
+            extraEntry: "tools/net8.0/any/NuGet.Configuration.Extensions.dll");
+        var symbols = CreateArchive(
+            Path.Combine(fixture.ArtifactsPath, "KeelMatrix.NuGetReady.0.1.0.snupkg"),
+            symbols: true,
+            extraEntry: null);
+        var script = FindRepositoryFile("scripts", "inspect-package.ps1");
+
+        var result = await BoundedProcess.RunAsync(
+            "pwsh",
+            [
+                "-NoProfile",
+                "-File",
+                script,
+                "-PackagePath",
+                package,
+                "-SymbolsPackagePath",
+                symbols
+            ],
+            fixture.Root.FullName,
+            new Dictionary<string, string?> { ["DOTNET_CLI_TELEMETRY_OPTOUT"] = "1" },
+            TimeSpan.FromSeconds(30));
+
+        Assert.True(result.Started, result.StandardError);
+        Assert.Equal(0, result.ExitCode);
+    }
+
+    [Fact]
     public async Task Package_inspection_rejects_the_manifest_generated_exact_name_corpus_through_the_sensitive_rule()
     {
         using var fixture = PackageFixture.Create();
         var manifest = PackageSensitiveFilePolicy.ReadManifestForTests();
-        var corpus = SensitivePathCorpus.GenerateExactNameCorpus(manifest);
+        var corpus = SensitivePathCorpus.GenerateRejectCorpus(manifest);
         var symbols = CreateArchive(
             Path.Combine(fixture.ArtifactsPath, "KeelMatrix.NuGetReady.0.1.0.snupkg"),
             symbols: true,
