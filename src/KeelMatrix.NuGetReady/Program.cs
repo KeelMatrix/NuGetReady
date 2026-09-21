@@ -4,6 +4,11 @@ public static class Program
 {
     public static int Main(string[] args)
     {
+        if (args is ["--internal-unix-supervisor", var payload])
+        {
+            return UnixProcessSupervisor.Run(payload);
+        }
+
         return NuGetReadyApplication.Run(args, new NuGetReadyTelemetry());
     }
 }

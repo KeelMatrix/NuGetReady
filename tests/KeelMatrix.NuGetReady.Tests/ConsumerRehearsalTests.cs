@@ -40,6 +40,91 @@ public sealed class ConsumerRehearsalTests
     }
 
     [Fact]
+    public void Duplicate_primary_archives_for_one_identity_never_pass_consumer_rehearsal()
+    {
+        using var corpus = PackedCorpus.Create();
+        var goodPackage = corpus.Pack("Standard/Standard.csproj");
+        File.Delete(Path.ChangeExtension(goodPackage, ".snupkg"));
+        var brokenPackage = ArchiveMutator.ReplaceEntry(
+            goodPackage,
+            "lib/net8.0/Fixture.Standard.dll",
+            new byte[64],
+            "Fixture.Standard.alternate.nupkg");
+        var config = Config(new PackageExpectation
+        {
+            Id = "Fixture.Standard",
+            Kind = "library",
+            Version = "1.0.0",
+            Artifacts = new List<string>
+            {
+                Path.GetFileName(goodPackage),
+                Path.GetFileName(brokenPackage)
+            }
+        });
+
+        var report = CheckRunner.Run(
+            config,
+            corpus.OutputPath,
+            corpus.Root.FullName,
+            TimeSpan.FromMinutes(2),
+            new ConsumerRehearsalOptions(PublicFeedPath: corpus.OutputPath));
+
+        Assert.NotEqual("pass", report.Status);
+        Assert.Equal(1, report.ExitCode);
+        Assert.Contains(report.Failures, failure => failure.Message.Contains("ambiguous", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void Packaged_library_with_xml_documentation_rehearses_and_rejects_a_substituted_assembly()
+    {
+        using var corpus = PackedCorpus.Create();
+        var package = corpus.Pack("Documentation/Documentation.csproj");
+        using (var archive = ZipFile.OpenRead(package))
+        {
+            Assert.Contains(archive.Entries, entry => entry.FullName.Equals("lib/net8.0/Documentation.xml", StringComparison.OrdinalIgnoreCase));
+        }
+
+        var config = Config(new PackageExpectation
+        {
+            Id = "Fixture.Documentation",
+            Kind = "library",
+            Version = "1.0.0",
+            Artifacts = Artifacts(package)
+        });
+
+        var intact = ConsumerRehearsal.RunDetailed(
+            config,
+            corpus.OutputPath,
+            TimeSpan.FromMinutes(2),
+            new ConsumerRehearsalOptions(PublicFeedPath: corpus.OutputPath));
+
+        Assert.Single(intact);
+        Assert.Equal("pass", intact[0].Result.Status);
+
+        var corrupted = ArchiveMutator.ReplaceEntry(
+            package,
+            "lib/net8.0/Documentation.dll",
+            new byte[64],
+            "Fixture.Documentation.corrupted.nupkg");
+        var corruptedConfig = Config(new PackageExpectation
+        {
+            Id = "Fixture.Documentation",
+            Kind = "library",
+            Version = "1.0.0",
+            Artifacts = Artifacts(corrupted)
+        });
+
+        var substituted = ConsumerRehearsal.RunDetailed(
+            corruptedConfig,
+            corpus.OutputPath,
+            TimeSpan.FromMinutes(2),
+            new ConsumerRehearsalOptions(PublicFeedPath: corpus.OutputPath));
+
+        Assert.Single(substituted);
+        Assert.NotEqual("pass", substituted[0].Result.Status);
+    }
+
+    [Fact]
     public void Related_packages_rehearse_with_the_internal_dependency_from_the_local_feed()
     {
         using var corpus = PackedCorpus.Create();
@@ -163,7 +248,7 @@ public sealed class ConsumerRehearsalTests
         var report = CheckRunner.Run(
             config,
             artifactsPath.FullName,
-            corpus.RepositoryRoot,
+            corpus.Root.FullName,
             TimeSpan.FromMinutes(2),
             new ConsumerRehearsalOptions(PublicFeedPath: unavailablePublicFeed.FullName));
 

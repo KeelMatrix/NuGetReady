@@ -154,6 +154,16 @@ internal static partial class ConfigurationLoader
                 throw new NuGetReadyInputException("Every package must declare one or more exact artifacts.");
             }
 
+            if (PackageArtifacts.PrimaryCount(package) != 1)
+            {
+                throw new NuGetReadyInputException("Every package must declare exactly one primary .nupkg artifact.");
+            }
+
+            if (PackageArtifacts.SymbolsCount(package) > 1)
+            {
+                throw new NuGetReadyInputException("Every package may declare at most one optional .snupkg artifact.");
+            }
+
             foreach (var artifact in package.Artifacts)
             {
                 if (string.IsNullOrWhiteSpace(artifact) || artifact.Length > 240 ||

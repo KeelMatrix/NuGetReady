@@ -122,7 +122,10 @@ public sealed class SeededCorpusTests : IClassFixture<RealCorpusFixture>
     public void Missing_symbols_inside_a_required_symbol_package_are_detected()
     {
         var package = ArchiveMutator.RemoveEntry(corpus.StandardSymbols, "lib/net8.0/Standard.pdb", "missing-symbol-file.snupkg");
-        var report = RunArchive(package, "Fixture.Standard", "missing-symbol-file.snupkg", symbols: true);
+        using var scenario = Scenario(corpus.Standard, "Fixture.Standard", "Fixture.Standard.1.0.0.nupkg");
+        File.Copy(package, Path.Combine(scenario.ArtifactsPath, "missing-symbol-file.snupkg"));
+        scenario.Config.Packages![0].Artifacts!.Add("missing-symbol-file.snupkg");
+        var report = CheckRunner.Run(scenario.Config, scenario.ArtifactsPath);
 
         Assert.Contains(report.Failures, failure => failure.Message.Contains("symbol file", StringComparison.OrdinalIgnoreCase));
     }

@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Runtime.InteropServices;
 using Microsoft.Win32.SafeHandles;
 using System.Text;
+using System.Text.Json;
 
 namespace KeelMatrix.NuGetReady;
 
@@ -11,7 +12,8 @@ internal sealed record ProcessResult(
     int ExitCode,
     bool TimedOut,
     string StandardOutput,
-    string StandardError);
+    string StandardError,
+    bool CleanupConfirmed = false);
 
 internal static class BoundedProcess
 {
@@ -35,22 +37,35 @@ internal static class BoundedProcess
         CancellationToken cancellationToken = default)
     {
         var useUnixProcessGroup = !OperatingSystem.IsWindows();
-        using var process = new Process
+        var startInfo = new ProcessStartInfo
         {
-            StartInfo = new ProcessStartInfo
-            {
-                FileName = fileName,
-                WorkingDirectory = workingDirectory,
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                CreateNoWindow = true
-            }
+            FileName = fileName,
+            WorkingDirectory = workingDirectory,
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true
         };
 
-        foreach (var argument in arguments)
+        if (useUnixProcessGroup)
         {
-            process.StartInfo.ArgumentList.Add(argument);
+            startInfo.FileName = Environment.GetEnvironmentVariable("DOTNET_HOST_PATH") ?? "dotnet";
+            startInfo.ArgumentList.Add(typeof(Program).Assembly.Location);
+            startInfo.ArgumentList.Add("--internal-unix-supervisor");
+            startInfo.ArgumentList.Add(UnixProcessSupervisor.Encode(fileName, arguments));
+        }
+
+        using var process = new Process
+        {
+            StartInfo = startInfo
+        };
+
+        if (!useUnixProcessGroup)
+        {
+            foreach (var argument in arguments)
+            {
+                process.StartInfo.ArgumentList.Add(argument);
+            }
         }
 
         foreach (var pair in environment)
@@ -73,7 +88,6 @@ internal static class BoundedProcess
                 return new ProcessResult(false, -1, false, string.Empty, "The process could not be started.");
             }
 
-            useUnixProcessGroup = useUnixProcessGroup && TryCreateUnixProcessGroup(process);
         }
         catch (Exception exception) when (exception is Win32Exception or FileNotFoundException or DirectoryNotFoundException)
         {
@@ -84,6 +98,7 @@ internal static class BoundedProcess
         using var lifecycleCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         try
         {
+            var cleanupConfirmed = true;
             var standardOutput = CaptureAsync(process.StandardOutput, outputLimit, lifecycleCancellation.Token);
             var standardError = CaptureAsync(process.StandardError, outputLimit, lifecycleCancellation.Token);
             var waitForExit = process.WaitForExitAsync(CancellationToken.None);
@@ -94,7 +109,7 @@ internal static class BoundedProcess
 
             if (completed == cancellationTask)
             {
-                Terminate(process, processJob, useUnixProcessGroup);
+                _ = Terminate(process, processJob, useUnixProcessGroup);
                 await DrainAfterTerminationAsync(completeLifecycle, lifecycleCancellation).ConfigureAwait(false);
                 cancellationToken.ThrowIfCancellationRequested();
             }
@@ -102,7 +117,7 @@ internal static class BoundedProcess
             var timedOut = completed == timeoutTask;
             if (timedOut)
             {
-                Terminate(process, processJob, useUnixProcessGroup);
+                cleanupConfirmed = Terminate(process, processJob, useUnixProcessGroup);
                 await DrainAfterTerminationAsync(completeLifecycle, lifecycleCancellation).ConfigureAwait(false);
             }
 
@@ -117,7 +132,8 @@ internal static class BoundedProcess
                 timedOut ? -1 : process.ExitCode,
                 timedOut,
                 GetCompletedOutput(standardOutput),
-                GetCompletedOutput(standardError));
+                GetCompletedOutput(standardError),
+                cleanupConfirmed);
         }
         finally
         {
@@ -184,55 +200,59 @@ internal static class BoundedProcess
         return builder.ToString();
     }
 
-    private static void Terminate(Process process, WindowsProcessJob? processJob, bool unixProcessGroup)
+    private static bool Terminate(Process process, WindowsProcessJob? processJob, bool unixProcessGroup)
     {
         processJob?.Dispose();
         try
         {
             if (unixProcessGroup)
             {
-                _ = kill(-process.Id, SigKill);
+                if (kill(-process.Id, SigKill) != 0)
+                {
+                    return Marshal.GetLastWin32Error() == NoSuchProcessError;
+                }
+
+                return WaitForUnixProcessGroupExit(process.Id);
             }
-            else
+
+            if (!process.HasExited)
             {
                 process.Kill(entireProcessTree: true);
             }
+
+            return process.WaitForExit((int)TerminationGracePeriod.TotalMilliseconds);
         }
         catch (InvalidOperationException)
         {
+            return process.HasExited;
         }
         catch (System.ComponentModel.Win32Exception)
         {
+            return false;
         }
     }
 
     private const int SigKill = 9;
+    private const int NoSuchProcessError = 3;
 
-    private static bool TryCreateUnixProcessGroup(Process process)
+    private static bool WaitForUnixProcessGroupExit(int processGroupId)
     {
-        for (var attempt = 0; attempt < 5; attempt++)
+        var deadline = DateTime.UtcNow + TerminationGracePeriod;
+        while (DateTime.UtcNow < deadline)
         {
-            if (setpgid(process.Id, process.Id) == 0)
+            if (kill(-processGroupId, 0) != 0)
             {
                 return true;
             }
 
-            if (process.HasExited)
-            {
-                break;
-            }
-
-            Thread.Sleep(1);
+            Thread.Sleep(10);
         }
 
-        return false;
+        return kill(-processGroupId, 0) != 0;
     }
 
     [DllImport("libc", SetLastError = true)]
     private static extern int kill(int processId, int signal);
-
-    [DllImport("libc", SetLastError = true)]
-    private static extern int setpgid(int processId, int processGroupId);
 
     private sealed class WindowsProcessJob : IDisposable
     {
@@ -376,4 +396,93 @@ internal static class BoundedProcess
             private static extern bool CloseHandle(IntPtr handle);
         }
     }
+}
+
+internal static class UnixProcessSupervisor
+{
+    private sealed record Request(string FileName, string[] Arguments);
+
+    public static string Encode(string fileName, IReadOnlyList<string> arguments)
+    {
+        return Convert.ToBase64String(JsonSerializer.SerializeToUtf8Bytes(new Request(fileName, arguments.ToArray())));
+    }
+
+    public static int Run(string payload)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return 125;
+        }
+
+        Request? request;
+        try
+        {
+            request = JsonSerializer.Deserialize<Request>(Convert.FromBase64String(payload));
+        }
+        catch (FormatException)
+        {
+            return 125;
+        }
+        catch (JsonException)
+        {
+            return 125;
+        }
+
+        if (request is null || string.IsNullOrWhiteSpace(request.FileName))
+        {
+            return 125;
+        }
+
+        var filePointer = IntPtr.Zero;
+        var argumentPointers = new IntPtr[request.Arguments.Length + 2];
+        var argumentVector = IntPtr.Zero;
+        try
+        {
+            filePointer = Marshal.StringToCoTaskMemUTF8(request.FileName);
+            argumentPointers[0] = filePointer;
+            for (var index = 0; index < request.Arguments.Length; index++)
+            {
+                argumentPointers[index + 1] = Marshal.StringToCoTaskMemUTF8(request.Arguments[index]);
+            }
+
+            argumentVector = Marshal.AllocHGlobal(argumentPointers.Length * IntPtr.Size);
+            for (var index = 0; index < argumentPointers.Length; index++)
+            {
+                Marshal.WriteIntPtr(argumentVector, index * IntPtr.Size, argumentPointers[index]);
+            }
+
+            if (setsid() < 0)
+            {
+                return 125;
+            }
+
+            _ = execvp(filePointer, argumentVector);
+            _exit(127);
+            return 127;
+        }
+        finally
+        {
+            if (argumentVector != IntPtr.Zero)
+            {
+                Marshal.FreeHGlobal(argumentVector);
+            }
+
+            foreach (var pointer in argumentPointers)
+            {
+                if (pointer != IntPtr.Zero)
+                {
+                    Marshal.FreeCoTaskMem(pointer);
+                }
+            }
+        }
+    }
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int setsid();
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int execvp(IntPtr file, IntPtr argumentVector);
+
+    [DllImport("libc")]
+    private static extern void _exit(int status);
 }

@@ -1,3 +1,5 @@
+using NuGet.Packaging;
+
 namespace KeelMatrix.NuGetReady;
 
 internal static class CheckRunner
@@ -38,6 +40,25 @@ internal static class CheckRunner
         var expectations = config.Packages!
             .SelectMany(package => package.Artifacts!.Select(artifact => (package, artifact)))
             .ToDictionary(item => item.artifact, item => item.package, StringComparer.OrdinalIgnoreCase);
+
+        foreach (var package in config.Packages!)
+        {
+            if (PackageArtifacts.PrimaryCount(package) != 1)
+            {
+                failures["artifact-set"].Add(new Failure(
+                    "artifact-set",
+                    $"Package '{package.Id}' must declare exactly one primary .nupkg artifact."));
+            }
+
+            if (PackageArtifacts.SymbolsCount(package) > 1)
+            {
+                failures["artifact-set"].Add(new Failure(
+                    "artifact-set",
+                    $"Package '{package.Id}' may declare at most one optional .snupkg artifact."));
+            }
+        }
+
+        AddDuplicatePrimaryIdentityFailures(artifactsPath, actualArtifacts, failures["artifact-set"]);
 
         foreach (var expected in expectedArtifacts)
         {
@@ -81,7 +102,7 @@ internal static class CheckRunner
                 string? mainPackagePath = null;
                 if (expected.EndsWith(".snupkg", StringComparison.OrdinalIgnoreCase))
                 {
-                    var mainArtifact = package.Artifacts?.FirstOrDefault(artifact => artifact.EndsWith(".nupkg", StringComparison.OrdinalIgnoreCase));
+                    var mainArtifact = PackageArtifacts.Primary(package);
                     if (mainArtifact is not null && actualArtifacts.TryGetValue(mainArtifact, out var mainPaths) && mainPaths.Count == 1)
                     {
                         mainPackagePath = Path.Combine(artifactsPath, mainPaths[0].Replace('/', Path.DirectorySeparatorChar));
@@ -250,6 +271,46 @@ internal static class CheckRunner
         }
 
         return result;
+    }
+
+    private static void AddDuplicatePrimaryIdentityFailures(
+        string artifactsPath,
+        IReadOnlyDictionary<string, List<string>> actualArtifacts,
+        List<Failure> failures)
+    {
+        var identities = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var artifact in actualArtifacts
+                     .Where(pair => pair.Key.EndsWith(".nupkg", StringComparison.OrdinalIgnoreCase))
+                     .SelectMany(pair => pair.Value.Select(path => (Name: pair.Key, Path: Path.Combine(artifactsPath, path.Replace('/', Path.DirectorySeparatorChar))))))
+        {
+            try
+            {
+                using var reader = new PackageArchiveReader(artifact.Path);
+                var identity = reader.NuspecReader.GetIdentity();
+                var key = $"{identity.Id}/{identity.Version.ToNormalizedString()}";
+                if (!identities.TryGetValue(key, out var names))
+                {
+                    names = new List<string>();
+                    identities[key] = names;
+                }
+
+                names.Add(artifact.Name);
+            }
+            catch (Exception) when (File.Exists(artifact.Path))
+            {
+                // The archive contract reports malformed archives. Do not turn an
+                // unrelated parse failure here into a second infrastructure result.
+            }
+        }
+
+        foreach (var identity in identities
+                     .Where(pair => pair.Value.Distinct(StringComparer.OrdinalIgnoreCase).Count() > 1)
+                     .OrderBy(pair => pair.Key, StringComparer.OrdinalIgnoreCase))
+        {
+            failures.Add(new Failure(
+                "artifact-set",
+                $"Primary package identity '{identity.Key.Replace('/', ' ')}' is ambiguous across multiple .nupkg artifacts."));
+        }
     }
 
     private static ReadinessReport ErrorReport(string message)

@@ -70,6 +70,9 @@ internal static partial class CliParser
           --timeout <duration>  Bounded operation timeout (for example 30s or 00:05:00)
 
         Check statuses are pass, warn, fail, error, not-run, and not-applicable.
+        Each package expects exactly one primary .nupkg and at most one associated .snupkg; duplicate primary identities fail closed.
+        Consumer provenance checks the package-version cache's .nupkg/.nupkg.sha512 and expanded payload, including XML documentation.
+        Unix child processes run in a dedicated process group with bounded descendant cleanup after timeout or cancellation.
         """.TrimEnd();
 
     private static string ReadValue(IReadOnlyList<string> args, ref int index, string option, OutputFormat format)

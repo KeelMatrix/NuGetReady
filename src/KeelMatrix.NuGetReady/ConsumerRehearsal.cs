@@ -51,10 +51,10 @@ internal static class ConsumerRehearsal
 
             foreach (var package in config.Packages!)
             {
-                var packageArtifact = package.Artifacts!.FirstOrDefault(artifact => artifact.EndsWith(".nupkg", StringComparison.OrdinalIgnoreCase));
+                var packageArtifact = PackageArtifacts.Primary(package);
                 if (packageArtifact is null)
                 {
-                    results.Add(Failure(package, "No .nupkg artifact was declared for the package.", isError: true));
+                    results.Add(Failure(package, "Exactly one primary .nupkg artifact must be declared for the package.", isError: true));
                     continue;
                 }
 
@@ -84,7 +84,6 @@ internal static class ConsumerRehearsal
                 ["NUGET_HTTP_CACHE_PATH"] = Path.Combine(root.FullName, "http-cache"),
                 ["DOTNET_CLI_HOME"] = cliHome,
                 ["DOTNET_NOLOGO"] = "1",
-                ["NUGET_XMLDOC_MODE"] = "skip",
                 ["MSBUILDDISABLENODEREUSE"] = "1",
                 ["DOTNET_CLI_TELEMETRY_OPTOUT"] = "1"
             };
@@ -413,6 +412,11 @@ internal static class ConsumerRehearsal
     private static TargetRehearsalOutcome ClassifyProcessResult(ProcessResult result, ProcessPhase phase)
     {
         var diagnostic = Combine(result);
+        if (result.TimedOut && !result.CleanupConfirmed)
+        {
+            return new TargetRehearsalOutcome(false, true, "The bounded child process timed out and its process-group cleanup could not be confirmed.");
+        }
+
         if (Succeeded(result) && !HasUnusableAssetDiagnostic(result))
         {
             return new TargetRehearsalOutcome(true, false, string.Empty);
@@ -709,24 +713,20 @@ internal static class ConsumerRehearsal
             var expectedHash = Convert.ToBase64String(System.Security.Cryptography.SHA512.HashData(File.ReadAllBytes(packagePath)));
             var cachedArchives = Directory.EnumerateFiles(packageDirectory, "*", SearchOption.TopDirectoryOnly)
                 .Where(path => string.Equals(Path.GetExtension(path), ".nupkg", StringComparison.OrdinalIgnoreCase))
-                .Where(path => string.Equals(Path.GetFileName(path), Path.GetFileName(packagePath), StringComparison.OrdinalIgnoreCase))
                 .OrderBy(path => path, StringComparer.Ordinal)
                 .ToArray();
-            if (cachedArchives.Length > 1)
+            if (cachedArchives.Length != 1)
             {
-                return new TargetRehearsalOutcome(false, false, "The isolated package cache contained ambiguous copies of the supplied artifact.");
+                return new TargetRehearsalOutcome(false, false, "The isolated package cache did not contain exactly one canonical .nupkg for the restored package.");
             }
 
-            if (cachedArchives.Length == 1)
+            var cachedHash = Convert.ToBase64String(System.Security.Cryptography.SHA512.HashData(File.ReadAllBytes(cachedArchives[0])));
+            if (!string.Equals(cachedHash, expectedHash, StringComparison.Ordinal))
             {
-                var cachedHash = Convert.ToBase64String(System.Security.Cryptography.SHA512.HashData(File.ReadAllBytes(cachedArchives[0])));
-                if (!string.Equals(cachedHash, expectedHash, StringComparison.Ordinal))
-                {
-                    return new TargetRehearsalOutcome(false, false, "The restored package hash did not match the supplied artifact.");
-                }
+                return new TargetRehearsalOutcome(false, false, "The restored package hash did not match the supplied artifact.");
             }
 
-            var hashPath = Path.Combine(packageDirectory, ".sha512");
+            var hashPath = cachedArchives[0] + ".sha512";
             if (File.Exists(hashPath))
             {
                 var actualHash = File.ReadAllText(hashPath).Trim();
@@ -735,8 +735,6 @@ internal static class ConsumerRehearsal
                 {
                     return new TargetRehearsalOutcome(false, false, "The restored package hash did not match the supplied artifact.");
                 }
-
-                return new TargetRehearsalOutcome(true, false, string.Empty);
             }
 
             using var reader = new PackageArchiveReader(packagePath);

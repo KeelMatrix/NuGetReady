@@ -36,6 +36,36 @@ internal sealed class PackageExpectation
     public string? Command { get; set; }
 }
 
+internal static class PackageArtifacts
+{
+    public static string? Primary(PackageExpectation package)
+    {
+        var primary = package.Artifacts?.Where(IsPrimary).ToArray();
+        return primary is { Length: 1 } ? primary[0] : null;
+    }
+
+    public static int PrimaryCount(PackageExpectation package)
+    {
+        return package.Artifacts?.Count(IsPrimary) ?? 0;
+    }
+
+    public static int SymbolsCount(PackageExpectation package)
+    {
+        return package.Artifacts?.Count(IsSymbols) ?? 0;
+    }
+
+    private static bool IsPrimary(string artifact)
+    {
+        return artifact.EndsWith(".nupkg", StringComparison.OrdinalIgnoreCase) &&
+               !artifact.EndsWith(".snupkg", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsSymbols(string artifact)
+    {
+        return artifact.EndsWith(".snupkg", StringComparison.OrdinalIgnoreCase);
+    }
+}
+
 internal sealed record Failure(string CheckId, string Message, bool IsError = false, bool IsWarning = false);
 
 internal static class CheckContract

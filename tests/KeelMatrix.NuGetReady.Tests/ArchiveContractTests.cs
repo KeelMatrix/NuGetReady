@@ -158,10 +158,11 @@ public sealed class ArchiveContractTests
     public void Symbol_archive_without_a_portable_pdb_fails()
     {
         using var fixture = PackageFixture.Create();
+        fixture.AddPackage("example-tool.1.2.3.nupkg", "example-tool", "1.2.3", kind: "dotnetTool");
         fixture.AddSymbols("example-tool.1.2.3.snupkg", "example-tool", "1.2.3", includePdb: false);
 
         var report = CheckRunner.Run(
-            Config("example-tool", "dotnetTool", "1.2.3", "example-tool.1.2.3.snupkg"),
+            Config("example-tool", "dotnetTool", "1.2.3", "example-tool.1.2.3.nupkg", "example-tool.1.2.3.snupkg"),
             fixture.ArtifactsPath);
 
         Assert.Equal(1, report.ExitCode);
@@ -172,15 +173,15 @@ public sealed class ArchiveContractTests
     public void Malformed_or_mismatched_symbols_and_missing_license_file_fail()
     {
         using var fixture = PackageFixture.Create();
-        var toolPackage = fixture.AddPackage("example-tool.1.2.3.nupkg", "example-tool", "1.2.3", kind: "dotnetTool");
+        fixture.AddPackage("example-tool.1.2.3.nupkg", "example-tool", "1.2.3", kind: "dotnetTool");
         fixture.AddSymbols("example-tool.1.2.3.snupkg", "example-tool", "1.2.3");
-        File.Delete(toolPackage);
 
         var malformedReport = CheckRunner.Run(
-            Config("example-tool", "dotnetTool", "1.2.3", "example-tool.1.2.3.snupkg"),
+            Config("example-tool", "dotnetTool", "1.2.3", "example-tool.1.2.3.nupkg", "example-tool.1.2.3.snupkg"),
             fixture.ArtifactsPath);
 
         Assert.Contains(malformedReport.Failures, failure => failure.CheckId == "archive-layout");
+        File.Delete(Path.Combine(fixture.ArtifactsPath, "example-tool.1.2.3.nupkg"));
         File.Delete(Path.Combine(fixture.ArtifactsPath, "example-tool.1.2.3.snupkg"));
 
         var originalPackage = fixture.AddPackage("file-license.nupkg", "Example.Core", "1.2.3");

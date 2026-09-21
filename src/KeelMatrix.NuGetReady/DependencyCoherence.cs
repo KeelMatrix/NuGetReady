@@ -14,7 +14,7 @@ internal static class DependencyCoherence
 
         foreach (var package in config.Packages!.OrderBy(package => package.Id, StringComparer.OrdinalIgnoreCase))
         {
-            var artifact = package.Artifacts!.FirstOrDefault(name => name.EndsWith(".nupkg", StringComparison.OrdinalIgnoreCase));
+            var artifact = PackageArtifacts.Primary(package);
             if (artifact is null)
             {
                 continue;

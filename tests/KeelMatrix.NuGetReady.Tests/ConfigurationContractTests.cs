@@ -63,6 +63,39 @@ public sealed class ConfigurationContractTests
     }
 
     [Fact]
+    public void Each_package_must_have_one_primary_and_at_most_one_symbol_archive()
+    {
+        using var fixture = PackageFixture.Create();
+        var multiplePrimaryPath = WriteConfig(fixture, """
+            {
+              "schemaVersion": 1,
+              "packages": [{
+                "id": "Example",
+                "kind": "library",
+                "version": "1.0.0",
+                "artifacts": ["Example.a.nupkg", "Example.b.nupkg"]
+              }]
+            }
+            """);
+        var multiplePrimary = Assert.Throws<NuGetReadyInputException>(() => ConfigurationLoader.Load(multiplePrimaryPath));
+        Assert.Contains("exactly one primary", multiplePrimary.Message, StringComparison.Ordinal);
+
+        var multipleSymbolsPath = WriteConfig(fixture, """
+            {
+              "schemaVersion": 1,
+              "packages": [{
+                "id": "Example",
+                "kind": "library",
+                "version": "1.0.0",
+                "artifacts": ["Example.nupkg", "Example.a.snupkg", "Example.b.snupkg"]
+              }]
+            }
+            """);
+        var multipleSymbols = Assert.Throws<NuGetReadyInputException>(() => ConfigurationLoader.Load(multipleSymbolsPath));
+        Assert.Contains("at most one optional", multipleSymbols.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Unsupported_package_kind_is_invalid_input()
     {
         using var fixture = PackageFixture.Create();
