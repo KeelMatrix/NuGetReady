@@ -94,13 +94,12 @@ public sealed class ReleaseContractTests
     }
 
     [Fact]
-    public void The_real_current_changelog_is_rejected_in_tag_mode_and_accepted_in_prerelease_mode()
+    public void A_planned_synthetic_changelog_is_accepted_in_prerelease_mode_but_rejected_in_tag_mode()
     {
-        var root = SyntheticReleaseRepository.FindRepositoryRoot();
-        var script = Path.Combine(root, "scripts", "validate-release-contract.ps1");
+        using var repository = SyntheticReleaseRepository.Create(SyntheticReleaseRepository.PlannedChangelog);
 
-        var tagResult = RunValidator(script, root, "Tag", "0.1.0", "v0.1.0");
-        var prereleaseResult = RunValidator(script, root, "PreRelease", "0.1.0", null);
+        var tagResult = repository.Validate(mode: "Tag", tagVersion: "v0.1.0");
+        var prereleaseResult = repository.Validate(mode: "PreRelease", tagVersion: null);
 
         Assert.NotEqual(0, tagResult.ExitCode);
         Assert.Contains("[Unreleased]", tagResult.StandardError, StringComparison.OrdinalIgnoreCase);
@@ -108,14 +107,16 @@ public sealed class ReleaseContractTests
     }
 
     [Fact]
-    public void A_correctly_finalized_synthetic_changelog_is_accepted()
+    public void A_finalized_synthetic_release_tree_is_accepted_in_both_validation_modes()
     {
         using var repository = SyntheticReleaseRepository.Create();
 
-        var result = repository.Validate(mode: "Tag", tagVersion: "0.1.0");
+        var tagResult = repository.Validate(mode: "Tag", tagVersion: "v0.1.0");
+        var prereleaseResult = repository.Validate(mode: "PreRelease", tagVersion: null);
 
-        Assert.Equal(0, result.ExitCode);
-        Assert.Contains("Release contract passed", result.StandardOutput, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(0, tagResult.ExitCode);
+        Assert.Equal(0, prereleaseResult.ExitCode);
+        Assert.Contains("Release contract passed", tagResult.StandardOutput, StringComparison.OrdinalIgnoreCase);
     }
 
     private static ProcessResult RunValidator(string script, string root, string mode, string expectedVersion, string? tagVersion)
@@ -162,6 +163,23 @@ public sealed class ReleaseContractTests
 
         public DirectoryInfo Root { get; }
 
+        public static string PlannedChangelog => """
+            # Changelog
+
+            ## [Unreleased]
+
+            ### Added
+
+            - Initial package capabilities.
+            - Release documentation.
+
+            ## [0.1.0] - 2026-09-16
+
+            ### Added
+
+            - Initial package capabilities.
+            """;
+
         public static string FinalizedChangelog => """
             # Changelog
 
@@ -172,6 +190,7 @@ public sealed class ReleaseContractTests
             ### Added
 
             - Initial package capabilities.
+            - Release documentation.
             """;
 
         public static SyntheticReleaseRepository Create(
@@ -237,7 +256,7 @@ public sealed class ReleaseContractTests
             return new SyntheticReleaseRepository(root);
         }
 
-        public ProcessResult Validate(string mode, string tagVersion)
+        public ProcessResult Validate(string mode, string? tagVersion)
         {
             return RunValidator(
                 Path.Combine(FindRepositoryRoot(), "scripts", "validate-release-contract.ps1"),

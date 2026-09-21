@@ -9,7 +9,7 @@ public sealed class WorkflowPolicyTests
             name: release
             on:
               push:
-                tags: ["v*"]
+                tags: ["v*.*.*"]
             permissions:
               contents: read
             jobs:
@@ -65,6 +65,183 @@ public sealed class WorkflowPolicyTests
     }
 
     [Fact]
+    public void Authentication_before_validation_before_publication_is_allowed()
+    {
+        using var repository = WorkflowRepository.Create("release.yml", """
+            name: release
+            on:
+              push:
+                tags: ["v*.*.*"]
+            permissions:
+              contents: read
+            jobs:
+              publish:
+                permissions:
+                  id-token: write
+                  contents: read
+                env:
+                  KEELMATRIX_NO_TELEMETRY: '1'
+                steps:
+                  - uses: NuGet/login@v1
+                  - run: dotnet nugetready check --artifacts artifacts/packages
+                  - run: dotnet nuget push artifacts/KeelMatrix.NuGetReady.1.0.0.nupkg
+            """);
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+        Assert.Empty(findings);
+    }
+
+    [Fact]
+    public void A_secret_api_key_in_a_supported_env_scope_is_blocking()
+    {
+        using var repository = WorkflowRepository.Create("release.yml", """
+            name: release
+            on:
+              push:
+                tags: ["v*.*.*"]
+            permissions:
+              contents: read
+            jobs:
+              publish:
+                permissions:
+                  id-token: write
+                  contents: read
+                env:
+                  KEELMATRIX_NO_TELEMETRY: '1'
+                  NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+                steps:
+                  - run: dotnet nugetready check --artifacts artifacts/packages
+                  - uses: NuGet/login@v1
+                  - run: dotnet nuget push artifacts/KeelMatrix.NuGetReady.1.0.0.nupkg -k $env:NUGET_API_KEY
+            """);
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+        Assert.Contains(findings, finding => finding.Message.Contains("long-lived", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void Echoed_validation_text_does_not_prove_artifact_validation()
+    {
+        using var repository = WorkflowRepository.Create("release.yml", """
+            name: release
+            on:
+              push:
+                tags: ["v*.*.*"]
+            permissions:
+              contents: read
+            jobs:
+              publish:
+                permissions:
+                  id-token: write
+                  contents: read
+                env:
+                  KEELMATRIX_NO_TELEMETRY: '1'
+                steps:
+                  - run: echo "dotnet nugetready check --artifacts artifacts/packages"
+                  - uses: NuGet/login@v1
+                  - run: dotnet nuget push artifacts/KeelMatrix.NuGetReady.1.0.0.nupkg
+            """);
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+        Assert.Contains(findings, finding => finding.Message.Contains("artifact validation", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void Disabled_validation_step_does_not_prove_artifact_validation()
+    {
+        using var repository = WorkflowRepository.Create("release.yml", """
+            name: release
+            on:
+              push:
+                tags: ["v*.*.*"]
+            permissions:
+              contents: read
+            jobs:
+              publish:
+                permissions:
+                  id-token: write
+                  contents: read
+                env:
+                  KEELMATRIX_NO_TELEMETRY: '1'
+                steps:
+                  - if: false
+                    run: dotnet nugetready check --artifacts artifacts/packages
+                  - uses: NuGet/login@v1
+                  - run: dotnet nuget push artifacts/KeelMatrix.NuGetReady.1.0.0.nupkg
+            """);
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+        Assert.Contains(findings, finding => finding.Message.Contains("artifact validation", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void Workflow_level_oidc_permission_is_inherited_by_a_job_without_permissions()
+    {
+        using var repository = WorkflowRepository.Create("release.yml", """
+            name: release
+            on:
+              push:
+                tags: ["v*.*.*"]
+            permissions:
+              id-token: write
+              contents: read
+            jobs:
+              publish:
+                env:
+                  KEELMATRIX_NO_TELEMETRY: '1'
+                steps:
+                  - run: dotnet nugetready check --artifacts artifacts/packages
+                  - uses: NuGet/login@v1
+                  - run: dotnet nuget push artifacts/KeelMatrix.NuGetReady.1.0.0.nupkg
+            """);
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+        Assert.DoesNotContain(findings, finding => finding.Message.Contains("id-token", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void An_unconstrained_tag_pattern_is_not_a_version_gate()
+    {
+        using var repository = WorkflowRepository.Create("release.yml", ReleaseWorkflow.Replace("v*.*.*", "*", StringComparison.Ordinal));
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+        Assert.Contains(findings, finding => finding.Message.Contains("versioned tag", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void An_additional_branch_trigger_requires_a_supported_tag_condition()
+    {
+        using var repository = WorkflowRepository.Create("release.yml", ReleaseWorkflow.Replace(
+            "tags: [\"v*.*.*\"]",
+            "branches: [\"main\"]\n            tags: [\"v*.*.*\"]",
+            StringComparison.Ordinal));
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+        Assert.Contains(findings, finding => finding.Message.Contains("branch", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void Unsupported_job_condition_is_reported_as_unproven()
+    {
+        var workflow = ReleaseWorkflow.Replace("\r\n", "\n", StringComparison.Ordinal).Replace(
+            "publish:",
+            "publish:\n    if: needs.validate.result == 'success'",
+            StringComparison.Ordinal);
+        using var repository = WorkflowRepository.Create("release.yml", workflow);
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+        Assert.Contains(findings, finding => finding.IsWarning && finding.Message.Contains("unproven", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
     public void Missing_oidc_permission_is_blocking()
     {
         using var repository = WorkflowRepository.Create("release.yml", ReleaseWorkflow.Replace("id-token: write", "contents: read"));
@@ -113,7 +290,7 @@ public sealed class WorkflowPolicyTests
             name: release
             on:
               push:
-                tags: ["v*"]
+                tags: ["v*.*.*"]
             permissions:
               contents: read
             jobs:
@@ -142,7 +319,7 @@ public sealed class WorkflowPolicyTests
             name: release
             on:
               push:
-                tags: ["v*"]
+                tags: ["v*.*.*"]
             jobs:
               publish:
                 permissions: write-all # broad permissions
@@ -172,7 +349,7 @@ public sealed class WorkflowPolicyTests
             name: release
             on:
               push:
-                tags: ["v*"]
+                tags: ["v*.*.*"]
             permissions:
               contents: read
             env:
@@ -229,7 +406,7 @@ public sealed class WorkflowPolicyTests
         name: release
         on:
           push:
-            tags: ["v*"]
+            tags: ["v*.*.*"]
         permissions:
           contents: read
         jobs:

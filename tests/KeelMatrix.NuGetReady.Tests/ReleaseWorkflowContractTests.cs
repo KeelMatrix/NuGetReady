@@ -5,6 +5,14 @@ namespace KeelMatrix.NuGetReady.Tests;
 public sealed class ReleaseWorkflowContractTests
 {
     [Fact]
+    public void Current_release_workflow_has_no_policy_findings()
+    {
+        var root = FindRepositoryRoot();
+
+        Assert.Empty(WorkflowPolicyInspector.Inspect(root));
+    }
+
+    [Fact]
     public void Release_workflow_publishes_symbols_exactly_once()
     {
         var root = FindRepositoryRoot();

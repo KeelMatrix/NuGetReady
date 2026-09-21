@@ -304,11 +304,13 @@ if ($Mode -eq "PreRelease") {
     }
 
     $unreleasedLines = @(Get-SectionLines -Lines $changelogLines -Section $unreleased -Sections $sections)
-    if (-not (($unreleasedLines -join "`n") -match [Regex]::Escape($targetVersion))) {
-        Fail-Contract "CHANGELOG.md [Unreleased] must identify the planned target version '$targetVersion'."
+    $hasUnreleasedEntry = @($unreleasedLines | Where-Object { $_ -match '^\s*[-*+]\s+\S' }).Count -gt 0
+    $hasFinalizedRelease = $null -ne $release -and -not [string]::IsNullOrWhiteSpace($release.Date)
+    if (-not $hasUnreleasedEntry -and -not $hasFinalizedRelease) {
+        Fail-Contract "CHANGELOG.md must contain planned [Unreleased] entries or a dated [$targetVersion] release for a pre-release candidate."
     }
 
-    Write-Host "Pre-release contract passed: mode=$Mode; version=$targetVersion; package=KeelMatrix.NuGetReady; changelog=[Unreleased]"
+    Write-Host "Pre-release contract passed: mode=$Mode; version=$targetVersion; package=KeelMatrix.NuGetReady; changelog=[Unreleased] or finalized [$targetVersion]"
     return
 }
 
