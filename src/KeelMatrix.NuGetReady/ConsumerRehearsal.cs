@@ -84,6 +84,9 @@ internal static class ConsumerRehearsal
                 ["NUGET_HTTP_CACHE_PATH"] = Path.Combine(root.FullName, "http-cache"),
                 ["DOTNET_CLI_HOME"] = cliHome,
                 ["DOTNET_NOLOGO"] = "1",
+                // Restore must extract the complete package payload, even when
+                // the invoking CI process globally skips XML documentation.
+                ["NUGET_XMLDOC_MODE"] = null,
                 ["MSBUILDDISABLENODEREUSE"] = "1",
                 ["DOTNET_CLI_TELEMETRY_OPTOUT"] = "1"
             };
