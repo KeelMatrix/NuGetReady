@@ -39,7 +39,7 @@ internal static class BoundedProcess
         {
             StartInfo = new ProcessStartInfo
             {
-                FileName = useUnixProcessGroup ? "setsid" : fileName,
+                FileName = fileName,
                 WorkingDirectory = workingDirectory,
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
@@ -47,11 +47,6 @@ internal static class BoundedProcess
                 CreateNoWindow = true
             }
         };
-
-        if (useUnixProcessGroup)
-        {
-            process.StartInfo.ArgumentList.Add(fileName);
-        }
 
         foreach (var argument in arguments)
         {
@@ -77,6 +72,8 @@ internal static class BoundedProcess
             {
                 return new ProcessResult(false, -1, false, string.Empty, "The process could not be started.");
             }
+
+            useUnixProcessGroup = useUnixProcessGroup && TryCreateUnixProcessGroup(process);
         }
         catch (Exception exception) when (exception is Win32Exception or FileNotFoundException or DirectoryNotFoundException)
         {
@@ -196,7 +193,7 @@ internal static class BoundedProcess
             {
                 _ = kill(-process.Id, SigKill);
             }
-            else if (!process.HasExited)
+            else
             {
                 process.Kill(entireProcessTree: true);
             }
@@ -211,8 +208,31 @@ internal static class BoundedProcess
 
     private const int SigKill = 9;
 
+    private static bool TryCreateUnixProcessGroup(Process process)
+    {
+        for (var attempt = 0; attempt < 5; attempt++)
+        {
+            if (setpgid(process.Id, process.Id) == 0)
+            {
+                return true;
+            }
+
+            if (process.HasExited)
+            {
+                break;
+            }
+
+            Thread.Sleep(1);
+        }
+
+        return false;
+    }
+
     [DllImport("libc", SetLastError = true)]
     private static extern int kill(int processId, int signal);
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int setpgid(int processId, int processGroupId);
 
     private sealed class WindowsProcessJob : IDisposable
     {
