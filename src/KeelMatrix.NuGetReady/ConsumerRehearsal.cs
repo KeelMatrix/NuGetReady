@@ -707,6 +707,25 @@ internal static class ConsumerRehearsal
         try
         {
             var expectedHash = Convert.ToBase64String(System.Security.Cryptography.SHA512.HashData(File.ReadAllBytes(packagePath)));
+            var cachedArchives = Directory.EnumerateFiles(packageDirectory, "*", SearchOption.TopDirectoryOnly)
+                .Where(path => string.Equals(Path.GetExtension(path), ".nupkg", StringComparison.OrdinalIgnoreCase))
+                .Where(path => string.Equals(Path.GetFileName(path), Path.GetFileName(packagePath), StringComparison.OrdinalIgnoreCase))
+                .OrderBy(path => path, StringComparer.Ordinal)
+                .ToArray();
+            if (cachedArchives.Length > 1)
+            {
+                return new TargetRehearsalOutcome(false, false, "The isolated package cache contained ambiguous copies of the supplied artifact.");
+            }
+
+            if (cachedArchives.Length == 1)
+            {
+                var cachedHash = Convert.ToBase64String(System.Security.Cryptography.SHA512.HashData(File.ReadAllBytes(cachedArchives[0])));
+                if (!string.Equals(cachedHash, expectedHash, StringComparison.Ordinal))
+                {
+                    return new TargetRehearsalOutcome(false, false, "The restored package hash did not match the supplied artifact.");
+                }
+            }
+
             var hashPath = Path.Combine(packageDirectory, ".sha512");
             if (File.Exists(hashPath))
             {
@@ -730,8 +749,8 @@ internal static class ConsumerRehearsal
                     continue;
                 }
 
-                var restoredFile = Path.Combine(packageDirectory, file.Replace('/', Path.DirectorySeparatorChar));
-                if (!File.Exists(restoredFile))
+                var restoredFile = FindRestoredFile(packageDirectory, file);
+                if (restoredFile is null)
                 {
                     return new TargetRehearsalOutcome(false, false, "The restored package contents did not match the supplied artifact.");
                 }
@@ -756,6 +775,18 @@ internal static class ConsumerRehearsal
         {
             return new TargetRehearsalOutcome(false, true, "The restored package could not be verified in the isolated cache.");
         }
+    }
+
+    private static string? FindRestoredFile(string packageDirectory, string archivePath)
+    {
+        var matches = Directory.EnumerateFiles(packageDirectory, "*", SearchOption.AllDirectories)
+            .Where(path => string.Equals(
+                NormalizeArchivePath(Path.GetRelativePath(packageDirectory, path)),
+                archivePath,
+                StringComparison.OrdinalIgnoreCase))
+            .OrderBy(path => path, StringComparer.Ordinal)
+            .ToArray();
+        return matches.Length == 1 ? matches[0] : null;
     }
 
     private static TargetRehearsalOutcome VerifyInstalledToolPackage(string packagePath, string toolPath)
