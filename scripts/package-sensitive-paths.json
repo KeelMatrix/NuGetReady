@@ -46,5 +46,15 @@
   ],
   "pathFragments": [
     "../"
+  ],
+  "familyExceptions": [
+    "NuGet.Configuration.dll"
+  ],
+  "familyRules": [
+    { "source": "exactFileNames", "match": "prefix", "scope": "pathSegments" },
+    { "source": "fileNamePrefixes", "match": "prefix", "scope": "pathSegments" },
+    { "source": "fileNameSuffixes", "match": "extension", "scope": "pathSegments" },
+    { "source": "fileExtensions", "match": "extension", "scope": "pathSegments" },
+    { "source": "pathSegments", "match": "prefix", "scope": "pathSegments" }
   ]
 }

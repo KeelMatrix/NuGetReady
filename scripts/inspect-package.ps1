@@ -12,7 +12,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$sensitivePathPolicy = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot "package-sensitive-paths.json") | ConvertFrom-Json
+. (Join-Path $PSScriptRoot "package-sensitive-path-policy.ps1")
 
 function Assert-Contract {
     param(
@@ -23,24 +23,6 @@ function Assert-Contract {
     if (-not $Condition) {
         throw $Message
     }
-}
-
-function Test-SensitivePackagePath {
-    param([string]$Path)
-
-    $normalized = $Path.Replace("\", "/").TrimStart("/")
-    $lower = $normalized.ToLowerInvariant()
-    if (@($sensitivePathPolicy.pathFragments) | Where-Object { $lower.Contains([string]$_, [StringComparison]::Ordinal) }) { return $true }
-
-    $segments = $lower.Split('/', [StringSplitOptions]::RemoveEmptyEntries)
-    if (@($sensitivePathPolicy.pathSegments) | Where-Object { $segments -contains ([string]$_).ToLowerInvariant() }) { return $true }
-
-    $name = [IO.Path]::GetFileName($lower)
-    if (@($sensitivePathPolicy.exactFileNames) | Where-Object { $name -eq ([string]$_).ToLowerInvariant() }) { return $true }
-    if (@($sensitivePathPolicy.fileNamePrefixes) | Where-Object { $name.StartsWith(([string]$_).ToLowerInvariant(), [StringComparison]::Ordinal) }) { return $true }
-    if (@($sensitivePathPolicy.fileNameSuffixes) | Where-Object { $name.EndsWith(([string]$_).ToLowerInvariant(), [StringComparison]::Ordinal) }) { return $true }
-    if (@($sensitivePathPolicy.fileExtensions) | Where-Object { $name.EndsWith(([string]$_).ToLowerInvariant(), [StringComparison]::Ordinal) }) { return $true }
-    return $false
 }
 
 function Read-Nuspec {
@@ -144,13 +126,13 @@ function Inspect-Archive {
             )
         }
 
+        $forbidden = @($entries | Where-Object { Test-SensitivePackagePath $_ })
+        Assert-Contract ($forbidden.Count -eq 0) "Forbidden archive entries found: $($forbidden -join ', ')"
+
         $unexpected = @($entries | Where-Object {
             ($allowed -notcontains $_) -and ($_ -notmatch '^package/services/metadata/core-properties/[^/]+\.psmdcp$')
         })
         Assert-Contract ($unexpected.Count -eq 0) "Unexpected package entries found: $($unexpected -join ', ')"
-
-        $forbidden = @($entries | Where-Object { Test-SensitivePackagePath $_ })
-        Assert-Contract ($forbidden.Count -eq 0) "Forbidden archive entries found: $($forbidden -join ', ')"
     }
     finally {
         $archive.Dispose()

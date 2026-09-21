@@ -7,26 +7,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$policyPath = Join-Path $PSScriptRoot "package-sensitive-paths.json"
-$policy = Get-Content -Raw -LiteralPath $policyPath | ConvertFrom-Json
-
-function Test-SensitivePackagePath {
-    param([string]$Path)
-
-    $normalized = $Path.Replace("\", "/").TrimStart("/")
-    $lower = $normalized.ToLowerInvariant()
-    if (@($policy.pathFragments) | Where-Object { $lower.Contains([string]$_, [StringComparison]::Ordinal) }) { return $true }
-
-    $segments = $lower.Split('/', [StringSplitOptions]::RemoveEmptyEntries)
-    if (@($policy.pathSegments) | Where-Object { $segments -contains ([string]$_).ToLowerInvariant() }) { return $true }
-
-    $name = [IO.Path]::GetFileName($lower)
-    if (@($policy.exactFileNames) | Where-Object { $name -eq ([string]$_).ToLowerInvariant() }) { return $true }
-    if (@($policy.fileNamePrefixes) | Where-Object { $name.StartsWith(([string]$_).ToLowerInvariant(), [StringComparison]::Ordinal) }) { return $true }
-    if (@($policy.fileNameSuffixes) | Where-Object { $name.EndsWith(([string]$_).ToLowerInvariant(), [StringComparison]::Ordinal) }) { return $true }
-    if (@($policy.fileExtensions) | Where-Object { $name.EndsWith(([string]$_).ToLowerInvariant(), [StringComparison]::Ordinal) }) { return $true }
-    return $false
-}
+. (Join-Path $PSScriptRoot "package-sensitive-path-policy.ps1")
 
 $root = (Resolve-Path -LiteralPath $ProjectDirectory).Path
 $projectFileName = "$(Split-Path -Leaf $root).csproj"

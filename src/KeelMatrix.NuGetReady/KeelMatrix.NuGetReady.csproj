@@ -47,7 +47,7 @@
     </PropertyGroup>
   </Target>
 
-  <Target Name="RejectNuGetReadySensitivePackInputs" BeforeTargets="Pack">
+  <Target Name="RejectNuGetReadySensitivePackInputs" BeforeTargets="_LoadPackInputItems">
     <Exec Command="pwsh -NoProfile -NonInteractive -File &quot;$(MSBuildProjectDirectory)\..\..\scripts\reject-sensitive-pack-inputs.ps1&quot; -ProjectDirectory &quot;$(MSBuildProjectDirectory)&quot;" />
   </Target>
 </Project>

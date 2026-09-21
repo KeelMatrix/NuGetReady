@@ -16,6 +16,19 @@ internal sealed class PackageSensitivePathManifest
     public string[] PathSegments { get; set; } = Array.Empty<string>();
 
     public string[] PathFragments { get; set; } = Array.Empty<string>();
+
+    public string[] FamilyExceptions { get; set; } = Array.Empty<string>();
+
+    public PackageSensitiveFamilyRule[] FamilyRules { get; set; } = Array.Empty<PackageSensitiveFamilyRule>();
+}
+
+internal sealed class PackageSensitiveFamilyRule
+{
+    public string Source { get; set; } = string.Empty;
+
+    public string Match { get; set; } = string.Empty;
+
+    public string Scope { get; set; } = string.Empty;
 }
 
 internal static class PackageSensitiveFilePolicy
@@ -44,11 +57,70 @@ internal static class PackageSensitiveFilePolicy
             return true;
         }
 
+        if (Manifest.FamilyRules.Any(rule => !rule.Scope.Equals("pathSegments", StringComparison.OrdinalIgnoreCase)))
+        {
+            throw new InvalidOperationException("The package-sensitive path manifest contains an unsupported family rule scope.");
+        }
+
+        foreach (var rule in Manifest.FamilyRules)
+        {
+            var values = GetFamilyValues(rule.Source);
+            foreach (var segment in segments)
+            {
+                if (Manifest.FamilyExceptions.Contains(segment, StringComparer.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                if (rule.Match.Equals("prefix", StringComparison.OrdinalIgnoreCase) &&
+                    values.Any(value => segment.StartsWith(value, StringComparison.OrdinalIgnoreCase)))
+                {
+                    return true;
+                }
+
+                if (rule.Match.Equals("extension", StringComparison.OrdinalIgnoreCase) &&
+                    values.Any(value => ContainsExtensionFamily(segment, value)))
+                {
+                    return true;
+                }
+            }
+        }
+
         var name = lower[(lower.LastIndexOf('/') + 1)..];
         return Manifest.ExactFileNames.Contains(name, StringComparer.OrdinalIgnoreCase) ||
-               Manifest.FileNamePrefixes.Any(name.StartsWith) ||
-               Manifest.FileNameSuffixes.Any(name.EndsWith) ||
-               Manifest.FileExtensions.Any(name.EndsWith);
+               Manifest.FileNamePrefixes.Any(prefix => name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) ||
+               Manifest.FileNameSuffixes.Any(suffix => name.EndsWith(suffix, StringComparison.OrdinalIgnoreCase)) ||
+               Manifest.FileExtensions.Any(extension => name.EndsWith(extension, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static string[] GetFamilyValues(string source)
+    {
+        return source switch
+        {
+            "exactFileNames" => Manifest.ExactFileNames,
+            "fileNamePrefixes" => Manifest.FileNamePrefixes,
+            "fileNameSuffixes" => Manifest.FileNameSuffixes,
+            "fileExtensions" => Manifest.FileExtensions,
+            "pathSegments" => Manifest.PathSegments,
+            _ => throw new InvalidOperationException($"The package-sensitive path manifest contains an unsupported family rule source: {source}.")
+        };
+    }
+
+    private static bool ContainsExtensionFamily(string segment, string value)
+    {
+        var start = segment.IndexOf(value, StringComparison.OrdinalIgnoreCase);
+        while (start >= 0)
+        {
+            var end = start + value.Length;
+            if (end == segment.Length || segment[end] == '.')
+            {
+                return true;
+            }
+
+            start = segment.IndexOf(value, end, StringComparison.OrdinalIgnoreCase);
+        }
+
+        return false;
     }
 
     public static PackageSensitivePathManifest ReadManifestForTests() => Manifest;

@@ -39,6 +39,40 @@ public sealed class PackageInspectionContractTests
     }
 
     [Fact]
+    public async Task Package_inspection_rejects_an_extended_sensitive_name_family()
+    {
+        using var fixture = PackageFixture.Create();
+        var package = CreateArchive(
+            Path.Combine(fixture.ArtifactsPath, "KeelMatrix.NuGetReady.0.1.0.nupkg"),
+            symbols: false,
+            extraEntry: "nested/local-telemetry.json.bak");
+        var symbols = CreateArchive(
+            Path.Combine(fixture.ArtifactsPath, "KeelMatrix.NuGetReady.0.1.0.snupkg"),
+            symbols: true,
+            extraEntry: null);
+        var script = FindRepositoryFile("scripts", "inspect-package.ps1");
+
+        var result = await BoundedProcess.RunAsync(
+            "pwsh",
+            [
+                "-NoProfile",
+                "-File",
+                script,
+                "-PackagePath",
+                package,
+                "-SymbolsPackagePath",
+                symbols
+            ],
+            fixture.Root.FullName,
+            new Dictionary<string, string?> { ["DOTNET_CLI_TELEMETRY_OPTOUT"] = "1" },
+            TimeSpan.FromSeconds(30));
+
+        Assert.True(result.Started, result.StandardError);
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("Forbidden archive entries found", result.StandardError, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task Pack_fails_closed_for_local_environment_and_telemetry_files_even_when_directory_targets_are_disabled()
     {
         var project = FindRepositoryFile("src", "KeelMatrix.NuGetReady", "KeelMatrix.NuGetReady.csproj");
@@ -73,6 +107,60 @@ public sealed class PackageInspectionContractTests
                 TimeSpan.FromSeconds(30));
 
             Assert.NotEqual(0, result.ExitCode);
+        }
+        finally
+        {
+            foreach (var path in sensitiveFiles)
+            {
+                if (File.Exists(path))
+                {
+                    File.Delete(path);
+                }
+            }
+
+            output.Delete(recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Pack_fails_closed_for_extended_sensitive_name_families_and_writes_no_archives()
+    {
+        var project = FindRepositoryFile("src", "KeelMatrix.NuGetReady", "KeelMatrix.NuGetReady.csproj");
+        var projectDirectory = Path.GetDirectoryName(project)!;
+        var sensitiveFiles = new[] { "local-telemetry.json.bak", "local-telemetry.jsonx" }
+            .Select(name => Path.Combine(projectDirectory, name))
+            .ToArray();
+        var output = Directory.CreateTempSubdirectory("nugetready-pack-family-guard-");
+        try
+        {
+            foreach (var path in sensitiveFiles)
+            {
+                File.WriteAllText(path, "local-only");
+            }
+
+            var result = await BoundedProcess.RunAsync(
+                "dotnet",
+                [
+                    "pack",
+                    project,
+                    "-c",
+                    "Release",
+                    "--no-build",
+                    "--no-restore",
+                    "-p:ImportDirectoryBuildTargets=false",
+                    "-p:ImportDirectoryTargets=false",
+                    "-o",
+                    output.FullName
+                ],
+                FindRepositoryFile(),
+                new Dictionary<string, string?> { ["DOTNET_CLI_TELEMETRY_OPTOUT"] = "1" },
+                TimeSpan.FromSeconds(30));
+
+            Assert.NotEqual(0, result.ExitCode);
+            var archives = Directory.EnumerateFiles(output.FullName, "*.nupkg")
+                .Concat(Directory.EnumerateFiles(output.FullName, "*.snupkg"))
+                .ToArray();
+            Assert.True(archives.Length == 0, $"Sensitive pack input produced archives: {string.Join(", ", archives)}\n{result.StandardOutput}\n{result.StandardError}");
         }
         finally
         {
