@@ -76,7 +76,7 @@ internal static class WorkflowPolicyInspector
             }
 
             evaluated = true;
-            InspectWorkflow(workflow, failures);
+            InspectWorkflow(repositoryPath, workflow, failures);
         }
 
         return new WorkflowInspectionResult(failures.OrderBy(failure => failure.Message, StringComparer.Ordinal).ToArray(), evaluated);
@@ -88,17 +88,22 @@ internal static class WorkflowPolicyInspector
                workflow.Jobs.Any(job => job.Steps.Any(IsPublishStep));
     }
 
-    private static void InspectWorkflow(WorkflowDocument workflow, List<Failure> failures)
+    private static void InspectWorkflow(string repositoryPath, WorkflowDocument workflow, List<Failure> failures)
     {
         if (!workflow.HasVersionedTagTrigger || workflow.HasUnsupportedTagPattern)
         {
             failures.Add(new Failure("workflow-policy", "Release workflow is not gated by a versioned tag trigger."));
         }
 
+        var unsupportedPublicationPath = InspectUnsupportedPublicationPaths(repositoryPath, workflow, failures);
         var publishingJobs = workflow.Jobs.Where(job => job.Steps.Any(IsPublishStep)).ToArray();
         if (publishingJobs.Length == 0)
         {
-            failures.Add(new Failure("workflow-policy", "Release workflow does not contain an executable package publication step."));
+            if (!unsupportedPublicationPath)
+            {
+                failures.Add(new Failure("workflow-policy", "Release workflow does not contain an executable package publication step."));
+            }
+
             return;
         }
 
@@ -175,6 +180,114 @@ internal static class WorkflowPolicyInspector
                     IsWarning: true));
             }
         }
+    }
+
+    private static bool InspectUnsupportedPublicationPaths(
+        string repositoryPath,
+        WorkflowDocument workflow,
+        List<Failure> failures)
+    {
+        var foundUnsupportedPath = false;
+        foreach (var job in workflow.Jobs)
+        {
+            if (!IsExplicitlyDisabled(job.Condition) && !string.IsNullOrWhiteSpace(job.Uses))
+            {
+                failures.Add(new Failure(
+                    "workflow-policy",
+                    "Release workflow contains an unsupported reusable workflow job; package publication policy is limited/unproven.",
+                    IsWarning: true));
+                foundUnsupportedPath = true;
+            }
+
+            foreach (var step in job.Steps)
+            {
+                if (IsExplicitlyDisabled(step.Condition) || !IsUnsupportedCompositePublicationPath(repositoryPath, step.Uses))
+                {
+                    continue;
+                }
+
+                failures.Add(new Failure(
+                    "workflow-policy",
+                    "Release workflow uses a composite action publication path; package publication policy is limited/unproven.",
+                    IsWarning: true));
+                foundUnsupportedPath = true;
+            }
+        }
+
+        return foundUnsupportedPath;
+    }
+
+    private static bool IsUnsupportedCompositePublicationPath(string repositoryPath, string? uses)
+    {
+        if (!IsLocalActionReference(uses))
+        {
+            return false;
+        }
+
+        string actionDirectory;
+        try
+        {
+            var repositoryRoot = Path.GetFullPath(repositoryPath);
+            actionDirectory = Path.GetFullPath(Path.Combine(repositoryRoot, uses![2..].Replace('/', Path.DirectorySeparatorChar)));
+            if (!actionDirectory.StartsWith(repositoryRoot + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+
+        foreach (var metadataName in new[] { "action.yml", "action.yaml" })
+        {
+            var metadataPath = Path.Combine(actionDirectory, metadataName);
+            if (!File.Exists(metadataPath))
+            {
+                continue;
+            }
+
+            try
+            {
+                var file = new FileInfo(metadataPath);
+                if (file.Length > MaxWorkflowBytes)
+                {
+                    return true;
+                }
+
+                var content = File.ReadAllText(metadataPath);
+                return IsCompositeAction(content) &&
+                    (ContainsExecutableCommand(content, "nuget push") ||
+                     Regex.IsMatch(content, @"^\s*run\s*:\s*(?:\|\s*)?(?:&\s*)?(?:dotnet\s+)?nuget\s+push(?:\s|$)", RegexOptions.IgnoreCase | RegexOptions.Multiline));
+            }
+            catch (IOException)
+            {
+                return true;
+            }
+            catch (UnauthorizedAccessException)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool IsCompositeAction(string content)
+    {
+        return content
+            .Replace("\r\n", "\n", StringComparison.Ordinal)
+            .Replace('\r', '\n')
+            .Split('\n')
+            .Select(line => line.Trim())
+            .Where(line => line.StartsWith("using:", StringComparison.OrdinalIgnoreCase))
+            .Select(line => line["using:".Length..].Trim().Trim('\'', '"'))
+            .Any(value => value.Equals("composite", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool IsLocalActionReference(string? uses)
+    {
+        return uses is not null && (uses.StartsWith("./", StringComparison.Ordinal) || uses.StartsWith(".\\", StringComparison.Ordinal));
     }
 
     private static bool IsPublishStep(WorkflowStep step)
@@ -384,6 +497,7 @@ internal static class WorkflowPolicyInspector
     {
         public WorkflowJob(string id) => Id = id;
         public string Id { get; }
+        public string? Uses { get; set; }
         public string? Condition { get; set; }
         public HashSet<string> DependsOn { get; } = new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, string> Permissions { get; } = new(StringComparer.OrdinalIgnoreCase);
@@ -589,6 +703,10 @@ internal static class WorkflowPolicyInspector
                     else if (jobKey.Equals("if", StringComparison.OrdinalIgnoreCase))
                     {
                         currentJob.Condition = Unquote(jobValue);
+                    }
+                    else if (jobKey.Equals("uses", StringComparison.OrdinalIgnoreCase))
+                    {
+                        currentJob.Uses = Unquote(jobValue);
                     }
 
                     continue;

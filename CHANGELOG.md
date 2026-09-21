@@ -13,4 +13,5 @@ The 0.1.0 release is planned and unreleased.
 - Rejects manifest-defined sensitive-name families when protected names are extended or used as directory segments, while boundary-aware fragment matching accepts legitimate assemblies that merely contain protected tokens.
 - Requires exactly one primary archive per package expectation, rejects duplicate package identities, and keeps optional symbol association unambiguous.
 - Verifies the actual NuGet package-version cache `.nupkg`/`.nupkg.sha512` provenance while comparing the full expanded payload, including XML documentation.
+- Requires the package-specific provenance sidecar and reports unsupported reusable/composite publication paths as limited warnings rather than publication proof.
 - Establishes Unix process groups before target execution and confirms bounded descendant cleanup after timeout or cancellation; Windows retains job-object cleanup.

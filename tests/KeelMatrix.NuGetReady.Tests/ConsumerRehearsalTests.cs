@@ -125,6 +125,59 @@ public sealed class ConsumerRehearsalTests
     }
 
     [Fact]
+    public void Package_version_cache_provenance_requires_sidecar_archive_and_payload_match()
+    {
+        using var corpus = PackedCorpus.Create();
+        var package = corpus.Pack("Documentation/Documentation.csproj");
+        var config = Config(new PackageExpectation
+        {
+            Id = "Fixture.Documentation",
+            Kind = "library",
+            Version = "1.0.0",
+            Artifacts = Artifacts(package)
+        });
+
+        var intact = ConsumerRehearsal.RunDetailed(
+            config,
+            corpus.OutputPath,
+            TimeSpan.FromMinutes(2),
+            new ConsumerRehearsalOptions(PublicFeedPath: corpus.OutputPath));
+        var missingSidecar = ConsumerRehearsal.RunDetailed(
+            config,
+            corpus.OutputPath,
+            TimeSpan.FromMinutes(2),
+            new ConsumerRehearsalOptions(
+                PublicFeedPath: corpus.OutputPath,
+                ProcessRunner: AfterRestore(cachePackage => File.Delete(Path.Combine(cachePackage, "Fixture.Documentation.1.0.0.nupkg.sha512")))));
+        var tamperedCachedPackage = ConsumerRehearsal.RunDetailed(
+            config,
+            corpus.OutputPath,
+            TimeSpan.FromMinutes(2),
+            new ConsumerRehearsalOptions(
+                PublicFeedPath: corpus.OutputPath,
+                ProcessRunner: AfterRestore(cachePackage => File.AppendAllText(Path.Combine(cachePackage, "Fixture.Documentation.1.0.0.nupkg"), "tampered"))));
+        var missingCachedXml = ConsumerRehearsal.RunDetailed(
+            config,
+            corpus.OutputPath,
+            TimeSpan.FromMinutes(2),
+            new ConsumerRehearsalOptions(
+                PublicFeedPath: corpus.OutputPath,
+                ProcessRunner: AfterRestore(cachePackage => File.Delete(Path.Combine(cachePackage, "lib", "net8.0", "Documentation.xml")))));
+
+        testOutput.WriteLine($"intact: {intact.Single().Result.Status.ToUpperInvariant()}");
+        testOutput.WriteLine($"missing-sidecar: {missingSidecar.Single().Result.Status.ToUpperInvariant()}");
+        testOutput.WriteLine($"tampered-cached-nupkg: {tamperedCachedPackage.Single().Result.Status.ToUpperInvariant()}");
+        testOutput.WriteLine($"missing-cached-xml: {missingCachedXml.Single().Result.Status.ToUpperInvariant()}");
+
+        Assert.Equal("pass", intact.Single().Result.Status);
+        Assert.NotEqual("pass", missingSidecar.Single().Result.Status);
+        Assert.Contains("provenance sidecar", missingSidecar.Single().Diagnostic, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(corpus.Root.FullName, missingSidecar.Single().Diagnostic, StringComparison.OrdinalIgnoreCase);
+        Assert.NotEqual("pass", tamperedCachedPackage.Single().Result.Status);
+        Assert.NotEqual("pass", missingCachedXml.Single().Result.Status);
+    }
+
+    [Fact]
     public void Related_packages_rehearse_with_the_internal_dependency_from_the_local_feed()
     {
         using var corpus = PackedCorpus.Create();
@@ -561,6 +614,25 @@ public sealed class ConsumerRehearsalTests
     private static List<string> Artifacts(string package)
     {
         return new List<string> { Path.GetFileName(package) };
+    }
+
+    private static ConsumerProcessRunner AfterRestore(Action<string> mutateCache)
+    {
+        return async (fileName, arguments, workingDirectory, environment, timeout) =>
+        {
+            var result = await BoundedProcess.RunAsync(fileName, arguments, workingDirectory, environment, timeout);
+            if (arguments.Count > 0 && arguments[0].Equals("restore", StringComparison.OrdinalIgnoreCase))
+            {
+                var cachePath = environment["NUGET_PACKAGES"]!;
+                var packageRoot = Directory.EnumerateDirectories(cachePath)
+                    .Single(path => Path.GetFileName(path).Equals("Fixture.Documentation", StringComparison.OrdinalIgnoreCase));
+                var packageCache = Directory.EnumerateDirectories(packageRoot)
+                    .Single(path => Path.GetFileName(path).Equals("1.0.0", StringComparison.OrdinalIgnoreCase));
+                mutateCache(packageCache);
+            }
+
+            return result;
+        };
     }
 
     private sealed class EnvironmentVariableScope : IDisposable

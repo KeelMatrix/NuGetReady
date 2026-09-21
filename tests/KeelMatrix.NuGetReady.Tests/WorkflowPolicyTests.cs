@@ -242,6 +242,100 @@ public sealed class WorkflowPolicyTests
     }
 
     [Fact]
+    public void Reusable_workflow_job_is_reported_as_limited_unproven_instead_of_missing_publication()
+    {
+        using var repository = WorkflowRepository.Create("release.yml", """
+            name: release
+            on:
+              push:
+                tags: ["v*.*.*"]
+            jobs:
+              publish:
+                uses: ./.github/workflows/reusable-publish.yml
+            """);
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+        var finding = Assert.Single(findings, finding => finding.IsWarning && finding.Message.Contains("unproven", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains("reusable", finding.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(findings, finding => finding.Message.Contains("does not contain an executable package publication step", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void Composite_action_publication_path_is_reported_as_limited_unproven()
+    {
+        using var repository = WorkflowRepository.Create("release.yml", """
+            name: release
+            on:
+              push:
+                tags: ["v*.*.*"]
+            jobs:
+              publish:
+                steps:
+                  - uses: ./.github/actions/publish
+            """);
+        var actionDirectory = Directory.CreateDirectory(Path.Combine(repository.Root.FullName, ".github", "actions", "publish"));
+        File.WriteAllText(Path.Combine(actionDirectory.FullName, "action.yml"), """
+            name: publish
+            description: Publish the package
+            runs:
+              using: composite
+              steps:
+                - shell: pwsh
+                  run: dotnet nuget push artifacts/KeelMatrix.NuGetReady.1.0.0.nupkg
+            """);
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+        var finding = Assert.Single(findings, finding => finding.IsWarning && finding.Message.Contains("unproven", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains("composite", finding.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(findings, finding => finding.Message.Contains("does not contain an executable package publication step", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void Unsupported_reusable_workflow_is_a_warning_without_a_pass_or_blocking_exit()
+    {
+        using var corpus = PackedCorpus.Create();
+        var package = corpus.Pack("Standard/Standard.csproj");
+        using var repository = WorkflowRepository.Create("release.yml", """
+            name: release
+            on:
+              push:
+                tags: ["v*.*.*"]
+            jobs:
+              publish:
+                uses: ./.github/workflows/reusable-publish.yml
+            """);
+
+        var report = CheckRunner.Run(
+            new NuGetReadyConfig
+            {
+                SchemaVersion = 1,
+                Packages =
+                [
+                    new PackageExpectation
+                    {
+                        Id = "Fixture.Standard",
+                        Kind = "library",
+                        Version = "1.0.0",
+                        Artifacts = [Path.GetFileName(package), Path.GetFileName(Path.ChangeExtension(package, ".snupkg"))]
+                    }
+                ]
+            },
+            corpus.OutputPath,
+            repository.Root.FullName,
+            TimeSpan.FromMinutes(2),
+            new ConsumerRehearsalOptions(PublicFeedPath: corpus.OutputPath));
+
+        Assert.True(
+            report.Status == "warn",
+            $"status={report.Status}; exitCode={report.ExitCode}; failures={string.Join(" | ", report.Failures.Select(failure => failure.Message))}");
+        Assert.Equal(0, report.ExitCode);
+        Assert.Equal("warn", report.Checks.Single(check => check.Id == "workflow-policy").Status);
+        Assert.DoesNotContain(report.Failures, failure => failure.Message.Contains("does not contain an executable package publication step", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
     public void Missing_oidc_permission_is_blocking()
     {
         using var repository = WorkflowRepository.Create("release.yml", ReleaseWorkflow.Replace("id-token: write", "contents: read"));

@@ -730,14 +730,16 @@ internal static class ConsumerRehearsal
             }
 
             var hashPath = cachedArchives[0] + ".sha512";
-            if (File.Exists(hashPath))
+            if (!File.Exists(hashPath))
             {
-                var actualHash = File.ReadAllText(hashPath).Trim();
-                if (!string.Equals(actualHash, expectedHash, StringComparison.Ordinal) &&
-                    !string.Equals(actualHash, $"sha512-{expectedHash}", StringComparison.Ordinal))
-                {
-                    return new TargetRehearsalOutcome(false, false, "The restored package hash did not match the supplied artifact.");
-                }
+                return new TargetRehearsalOutcome(false, false, "The restored package provenance sidecar was missing.");
+            }
+
+            var actualHash = File.ReadAllText(hashPath).Trim();
+            if (!string.Equals(actualHash, expectedHash, StringComparison.Ordinal) &&
+                !string.Equals(actualHash, $"sha512-{expectedHash}", StringComparison.Ordinal))
+            {
+                return new TargetRehearsalOutcome(false, false, "The restored package hash did not match the supplied artifact.");
             }
 
             using var reader = new PackageArchiveReader(packagePath);
