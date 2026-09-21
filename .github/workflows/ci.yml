@@ -70,6 +70,12 @@ jobs:
           dotnet test KeelMatrix.NuGetReady.sln --configuration Release --no-build --no-restore --nologo --logger "console;verbosity=minimal"
           if ($LASTEXITCODE -ne 0) { throw "Fixture corpus or regression tests failed." }
 
+      - name: Verify bounded descendant cleanup regressions
+        shell: pwsh
+        run: |
+          dotnet test tests/KeelMatrix.NuGetReady.Tests/KeelMatrix.NuGetReady.Tests.csproj --configuration Release --no-build --no-restore --nologo --filter "FullyQualifiedName~BoundedProcessTests" --logger "console;verbosity=normal"
+          if ($LASTEXITCODE -ne 0) { throw "Bounded descendant cleanup regressions failed." }
+
       - name: Build fixture corpus
         shell: pwsh
         run: |
