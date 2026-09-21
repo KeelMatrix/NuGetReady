@@ -73,6 +73,49 @@ public sealed class PackageInspectionContractTests
     }
 
     [Fact]
+    public async Task Package_inspection_rejects_the_manifest_generated_exact_name_corpus_through_the_sensitive_rule()
+    {
+        using var fixture = PackageFixture.Create();
+        var manifest = PackageSensitiveFilePolicy.ReadManifestForTests();
+        var corpus = SensitivePathCorpus.GenerateExactNameCorpus(manifest);
+        var symbols = CreateArchive(
+            Path.Combine(fixture.ArtifactsPath, "KeelMatrix.NuGetReady.0.1.0.snupkg"),
+            symbols: true,
+            extraEntry: null);
+        var script = FindRepositoryFile("scripts", "inspect-package.ps1");
+
+        var index = 0;
+        foreach (var batch in corpus.Chunk(32))
+        {
+            var package = CreateArchive(
+                Path.Combine(fixture.ArtifactsPath, $"KeelMatrix.NuGetReady.0.1.0-{index++}.nupkg"),
+                symbols: false,
+                extraEntries: batch);
+
+            var result = await BoundedProcess.RunAsync(
+                "pwsh",
+                [
+                    "-NoProfile",
+                    "-File",
+                    script,
+                    "-PackagePath",
+                    package,
+                    "-SymbolsPackagePath",
+                    symbols
+                ],
+                fixture.Root.FullName,
+                new Dictionary<string, string?> { ["DOTNET_CLI_TELEMETRY_OPTOUT"] = "1" },
+                TimeSpan.FromSeconds(30));
+
+            Assert.True(result.Started, result.StandardError);
+            Assert.NotEqual(0, result.ExitCode);
+            Assert.Contains("Forbidden archive entries found", result.StandardError, StringComparison.OrdinalIgnoreCase);
+        }
+
+        Assert.Equal((corpus.Count + 31) / 32, index);
+    }
+
+    [Fact]
     public async Task Pack_fails_closed_for_local_environment_and_telemetry_files_even_when_directory_targets_are_disabled()
     {
         var project = FindRepositoryFile("src", "KeelMatrix.NuGetReady", "KeelMatrix.NuGetReady.csproj");
@@ -122,21 +165,24 @@ public sealed class PackageInspectionContractTests
         }
     }
 
-    [Fact]
-    public async Task Pack_fails_closed_for_extended_sensitive_name_families_and_writes_no_archives()
+    [Theory]
+    [InlineData(".local-telemetry.json.bak")]
+    [InlineData("xlocal-telemetry.json.bak")]
+    [InlineData(".keelmatrix.telemetry.json")]
+    [InlineData("xNuGet.config.bak")]
+    [InlineData(".global.jsonx")]
+    [InlineData("xAGENTS.md.bak")]
+    [InlineData(".apikeyx")]
+    [InlineData("xcredentials.json.bak")]
+    public async Task Pack_fails_closed_for_extended_sensitive_name_families_and_writes_no_archives(string sensitiveFile)
     {
         var project = FindRepositoryFile("src", "KeelMatrix.NuGetReady", "KeelMatrix.NuGetReady.csproj");
         var projectDirectory = Path.GetDirectoryName(project)!;
-        var sensitiveFiles = new[] { "local-telemetry.json.bak", "local-telemetry.jsonx" }
-            .Select(name => Path.Combine(projectDirectory, name))
-            .ToArray();
+        var sensitivePath = Path.Combine(projectDirectory, sensitiveFile);
         var output = Directory.CreateTempSubdirectory("nugetready-pack-family-guard-");
         try
         {
-            foreach (var path in sensitiveFiles)
-            {
-                File.WriteAllText(path, "local-only");
-            }
+            File.WriteAllText(sensitivePath, "local-only");
 
             var result = await BoundedProcess.RunAsync(
                 "dotnet",
@@ -164,12 +210,9 @@ public sealed class PackageInspectionContractTests
         }
         finally
         {
-            foreach (var path in sensitiveFiles)
+            if (File.Exists(sensitivePath))
             {
-                if (File.Exists(path))
-                {
-                    File.Delete(path);
-                }
+                File.Delete(sensitivePath);
             }
 
             output.Delete(recursive: true);
@@ -177,6 +220,11 @@ public sealed class PackageInspectionContractTests
     }
 
     private static string CreateArchive(string path, bool symbols, string? extraEntry)
+    {
+        return CreateArchive(path, symbols, extraEntry is null ? Array.Empty<string>() : new[] { extraEntry });
+    }
+
+    private static string CreateArchive(string path, bool symbols, IEnumerable<string> extraEntries)
     {
         using var stream = File.Create(path);
         using var archive = new ZipArchive(stream, ZipArchiveMode.Create);
@@ -188,7 +236,7 @@ public sealed class PackageInspectionContractTests
             AddBytes(archive, "tools/net8.0/any/KeelMatrix.NuGetReady.dll", new byte[] { 1 });
             AddBytes(archive, "tools/net8.0/any/KeelMatrix.Telemetry.dll", new byte[] { 1 });
             AddBytes(archive, "tools/net8.0/any/DotnetToolSettings.xml", new byte[] { 1 });
-            if (extraEntry is not null)
+            foreach (var extraEntry in extraEntries)
             {
                 AddBytes(archive, extraEntry, new byte[] { 1 });
             }

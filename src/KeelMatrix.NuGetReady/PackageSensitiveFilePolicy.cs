@@ -17,6 +17,8 @@ internal sealed class PackageSensitivePathManifest
 
     public string[] PathFragments { get; set; } = Array.Empty<string>();
 
+    public string[] FileNameFragments { get; set; } = Array.Empty<string>();
+
     public string[] FamilyExceptions { get; set; } = Array.Empty<string>();
 
     public PackageSensitiveFamilyRule[] FamilyRules { get; set; } = Array.Empty<PackageSensitiveFamilyRule>();
@@ -83,6 +85,12 @@ internal static class PackageSensitiveFilePolicy
                 {
                     return true;
                 }
+
+                if (rule.Match.Equals("contains", StringComparison.OrdinalIgnoreCase) &&
+                    values.Any(value => segment.Contains(value, StringComparison.OrdinalIgnoreCase)))
+                {
+                    return true;
+                }
             }
         }
 
@@ -101,6 +109,7 @@ internal static class PackageSensitiveFilePolicy
             "fileNamePrefixes" => Manifest.FileNamePrefixes,
             "fileNameSuffixes" => Manifest.FileNameSuffixes,
             "fileExtensions" => Manifest.FileExtensions,
+            "fileNameFragments" => Manifest.FileNameFragments,
             "pathSegments" => Manifest.PathSegments,
             _ => throw new InvalidOperationException($"The package-sensitive path manifest contains an unsupported family rule source: {source}.")
         };

@@ -11,6 +11,7 @@ function Get-FamilyValues {
         "fileNamePrefixes" { return @($packageSensitivePathPolicy.fileNamePrefixes) }
         "fileNameSuffixes" { return @($packageSensitivePathPolicy.fileNameSuffixes) }
         "fileExtensions" { return @($packageSensitivePathPolicy.fileExtensions) }
+        "fileNameFragments" { return @($packageSensitivePathPolicy.fileNameFragments) }
         "pathSegments" { return @($packageSensitivePathPolicy.pathSegments) }
         default { throw "Unsupported package-sensitive family rule source: $Source" }
     }
@@ -59,7 +60,8 @@ function Test-SensitivePackagePath {
             foreach ($value in $values) {
                 if ($familyRule.match -eq "prefix" -and $segment.StartsWith($value, [StringComparison]::Ordinal)) { return $true }
                 if ($familyRule.match -eq "extension" -and (Test-ExtensionFamily $segment $value)) { return $true }
-                if ($familyRule.match -notin @("prefix", "extension")) {
+                if ($familyRule.match -eq "contains" -and $segment.Contains($value, [StringComparison]::Ordinal)) { return $true }
+                if ($familyRule.match -notin @("prefix", "extension", "contains")) {
                     throw "Unsupported package-sensitive family rule match: $($familyRule.match)"
                 }
             }

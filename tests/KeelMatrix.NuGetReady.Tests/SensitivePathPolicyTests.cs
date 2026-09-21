@@ -8,14 +8,7 @@ public sealed class SensitivePathPolicyTests
     public async Task Tool_pack_guard_and_archive_inspection_share_manifest_family_semantics()
     {
         var manifest = PackageSensitiveFilePolicy.ReadManifestForTests();
-        var corpus = manifest.ExactFileNames
-            .SelectMany(name => new[]
-            {
-                name,
-                $"{name}.bak",
-                $"deep/{name}/child.bin",
-                $"deep\\{name.ToUpperInvariant()}\\child.bin"
-            })
+        var corpus = SensitivePathCorpus.GenerateExactNameCorpus(manifest)
             .Concat(manifest.FileNamePrefixes.Select(prefix => $"{prefix}.local"))
             .Concat(manifest.FileNameSuffixes.Select(suffix => $"local{suffix}.bak"))
             .Concat(manifest.FileExtensions.Select(extension => $"release{extension}.bak"))
@@ -32,7 +25,28 @@ public sealed class SensitivePathPolicyTests
             "LICENSE",
             "icon.png",
             "KeelMatrix.NuGetReady.0.1.0.nupkg",
-            "KeelMatrix.NuGetReady.0.1.0.snupkg"
+            "KeelMatrix.NuGetReady.0.1.0.snupkg",
+            "_rels/.rels",
+            "KeelMatrix.NuGetReady.nuspec",
+            "tools/net8.0/any/DotnetToolSettings.xml",
+            "tools/net8.0/any/KeelMatrix.NuGetReady.dll",
+            "tools/net8.0/any/KeelMatrix.NuGetReady.deps.json",
+            "tools/net8.0/any/KeelMatrix.NuGetReady.runtimeconfig.json",
+            "tools/net8.0/any/KeelMatrix.NuGetReady.pdb",
+            "tools/net8.0/any/KeelMatrix.Telemetry.dll",
+            "tools/net8.0/any/Newtonsoft.Json.dll",
+            "tools/net8.0/any/NuGet.Common.dll",
+            "tools/net8.0/any/NuGet.Configuration.dll",
+            "tools/net8.0/any/NuGet.Frameworks.dll",
+            "tools/net8.0/any/NuGet.Packaging.dll",
+            "tools/net8.0/any/NuGet.Versioning.dll",
+            "tools/net8.0/any/System.Security.Cryptography.Pkcs.dll",
+            "tools/net8.0/any/System.Security.Cryptography.ProtectedData.dll",
+            "tools/net8.0/any/runtimes/win/lib/net8.0/System.Security.Cryptography.Pkcs.dll",
+            "package/services/metadata/core-properties/488dca78b17847359446f37e5ec6caab.psmdcp",
+            "tools/net8.0/any/KeelMatrix.NuGetReady.pdb",
+            "[Content_Types].xml",
+            "package/services/metadata/core-properties/a93271adeac642279987e486df9ee25a.psmdcp"
         };
 
         Assert.All(corpus, path => Assert.True(PackageSensitiveFilePolicy.IsSensitive(path), $"Tool accepted generated protected path: {path}"));
@@ -78,25 +92,19 @@ public sealed class SensitivePathPolicyTests
     }
 
     [Fact]
-    public void Tool_policy_rejects_extended_family_for_every_manifest_exact_name()
+    public void Tool_policy_rejects_full_generated_exact_name_transformation_space()
     {
         var manifest = PackageSensitiveFilePolicy.ReadManifestForTests();
-        var variants = manifest.ExactFileNames.SelectMany(name => new[]
-        {
-            $"{name}.bak",
-            $"{name}.old",
-            $"{name}.tmp",
-            $"{name}x",
-            $"{name}/child.bin",
-            $"deep/nested/{name}/child.bin",
-            $"{name.ToUpperInvariant()}.bak",
-            $"deep\\nested\\{name.ToUpperInvariant()}\\child.bin"
-        });
+        Assert.Contains("local-telemetry.json", manifest.FileNameFragments, StringComparer.OrdinalIgnoreCase);
+        Assert.Contains(manifest.FamilyRules, rule =>
+            rule.Source.Equals("fileNameFragments", StringComparison.OrdinalIgnoreCase) &&
+            rule.Match.Equals("contains", StringComparison.OrdinalIgnoreCase) &&
+            rule.Scope.Equals("pathSegments", StringComparison.OrdinalIgnoreCase));
 
-        foreach (var variant in variants)
-        {
-            Assert.True(PackageSensitiveFilePolicy.IsSensitive(variant), $"Extended protected path was accepted: {variant}");
-        }
+        var variants = SensitivePathCorpus.GenerateExactNameCorpus(manifest);
+        var accepted = variants.Where(path => !PackageSensitiveFilePolicy.IsSensitive(path)).ToArray();
+
+        Assert.Empty(accepted);
     }
 
     [Fact]

@@ -47,14 +47,32 @@
   "pathFragments": [
     "../"
   ],
+  "fileNameFragments": [
+    "AGENTS.md",
+    "CHANGELOG.md",
+    "SECURITY.md",
+    "PRIVACY.md",
+    "NuGet.config",
+    "global.json",
+    "local-telemetry.json",
+    "keelmatrix.telemetry.json",
+    "apikey",
+    "api-key",
+    "access-token",
+    "credentials.json",
+    "password",
+    "secret"
+  ],
   "familyExceptions": [
-    "NuGet.Configuration.dll"
+    "NuGet.Configuration.dll",
+    "Microsoft.Extensions.Configuration.UserSecrets.dll"
   ],
   "familyRules": [
     { "source": "exactFileNames", "match": "prefix", "scope": "pathSegments" },
     { "source": "fileNamePrefixes", "match": "prefix", "scope": "pathSegments" },
     { "source": "fileNameSuffixes", "match": "extension", "scope": "pathSegments" },
     { "source": "fileExtensions", "match": "extension", "scope": "pathSegments" },
+    { "source": "fileNameFragments", "match": "contains", "scope": "pathSegments" },
     { "source": "pathSegments", "match": "prefix", "scope": "pathSegments" }
   ]
 }
