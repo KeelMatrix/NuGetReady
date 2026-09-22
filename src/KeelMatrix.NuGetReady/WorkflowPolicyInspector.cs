@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.RegularExpressions;
 
 namespace KeelMatrix.NuGetReady;
@@ -87,7 +88,8 @@ internal static class WorkflowPolicyInspector
         if (workflow.HasPublicationShapedTrigger ||
             workflow.HasPublicationInput ||
             workflow.HasUninspectableStructure ||
-            workflow.Jobs.Any(job => IsDirectPublicationJob(job)))
+            workflow.Jobs.Any(job => IsDirectPublicationJob(job) ||
+                                     job.Steps.Any(IsPublicationRelevantStep)))
         {
             return true;
         }
@@ -103,6 +105,11 @@ internal static class WorkflowPolicyInspector
         }
 
         if (job.HasUninspectableStructure || job.Steps.Any(step => step.HasUninspectableStructure))
+        {
+            return true;
+        }
+
+        if (job.Steps.Any(step => HasIndirectPublicationPath(repositoryPath, step)))
         {
             return true;
         }
@@ -244,6 +251,7 @@ internal static class WorkflowPolicyInspector
         }
 
         var unsupportedPublicationPath = InspectUnsupportedPublicationPaths(repositoryPath, workflow, failures);
+        var hasPublicationRelevantStep = workflow.Jobs.Any(job => job.Steps.Any(IsPublicationRelevantStep));
         var hasReleaseVocabulary = HasReleasePublicationSignal(Path.GetFileNameWithoutExtension(path)) ||
                                     HasReleasePublicationSignal(workflow.Name) ||
                                     workflow.Jobs.Any(job =>
@@ -252,11 +260,11 @@ internal static class WorkflowPolicyInspector
                                           HasReleasePublicationSignal(job.Name) ||
                                           HasReleasePublicationSignal(job.Uses)));
         var limitedUnprovenShape = workflow.HasPublicationShapedTrigger ||
-                                    workflow.HasPublicationInput ||
-                                    workflow.HasUninspectableStructure ||
+            workflow.HasPublicationInput ||
+            workflow.HasUninspectableStructure ||
                                     workflow.Jobs.Any(job => job.HasUninspectableStructure ||
                                                             job.Steps.Any(step => step.HasUninspectableStructure)) ||
-                                    (publishingJobs.Length == 0 && hasReleaseVocabulary);
+                                    (publishingJobs.Length == 0 && (hasReleaseVocabulary || hasPublicationRelevantStep));
         if (limitedUnprovenShape && !unsupportedPublicationPath)
         {
             failures.Add(new Failure(
@@ -375,15 +383,23 @@ internal static class WorkflowPolicyInspector
 
             foreach (var step in job.Steps)
             {
-                if (IsExplicitlyDisabled(step.Condition) || !IsUnsupportedCompositePublicationPath(repositoryPath, step.Uses))
+                if (IsExplicitlyDisabled(step.Condition))
                 {
                     continue;
                 }
 
-                failures.Add(new Failure(
-                    "workflow-policy",
-                    "Release workflow uses a composite action publication path; package publication policy is limited/unproven.",
-                    IsWarning: true));
+                var indirectPath = InspectIndirectPublicationPath(repositoryPath, step);
+                if (indirectPath is null || indirectPath == IndirectPublicationPath.ProvenNonPublishing)
+                {
+                    continue;
+                }
+
+                var message = IsLocalActionReference(step.Uses)
+                    ? "Release workflow uses a composite action publication path; package publication policy is limited/unproven."
+                    : !string.IsNullOrWhiteSpace(step.Uses)
+                        ? "Release workflow uses an opaque publication action; package publication policy is limited/unproven."
+                        : "Release workflow uses a referenced script publication path; package publication policy is limited/unproven.";
+                failures.Add(new Failure("workflow-policy", message, IsWarning: true));
                 foundUnsupportedPath = true;
             }
         }
@@ -391,72 +407,245 @@ internal static class WorkflowPolicyInspector
         return foundUnsupportedPath;
     }
 
-    private static bool IsUnsupportedCompositePublicationPath(string repositoryPath, string? uses)
+    private static bool HasIndirectPublicationPath(string repositoryPath, WorkflowStep step)
     {
-        if (!IsLocalActionReference(uses))
+        var result = InspectIndirectPublicationPath(repositoryPath, step);
+        return result is not null && result != IndirectPublicationPath.ProvenNonPublishing;
+    }
+
+    private static IndirectPublicationPath? InspectIndirectPublicationPath(string repositoryPath, WorkflowStep step)
+    {
+        if (IsExplicitlyDisabled(step.Condition))
         {
-            return false;
+            return null;
         }
 
-        string actionDirectory;
+        var scriptReferences = FindReferencedScripts(step.Run);
+        if (scriptReferences.Count > 0)
+        {
+            var scriptResult = InspectReferencedScripts(repositoryPath, step, scriptReferences);
+            if (scriptResult != IndirectPublicationPath.ProvenNonPublishing)
+            {
+                return scriptResult;
+            }
+        }
+
+        if (IsLocalActionReference(step.Uses))
+        {
+            return InspectLocalCompositeAction(repositoryPath, step.Uses!, new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+        }
+
+        if (IsPotentiallyPublicationAction(step))
+        {
+            return IndirectPublicationPath.Unknown;
+        }
+
+        return null;
+    }
+
+    private static IndirectPublicationPath InspectReferencedScripts(
+        string repositoryPath,
+        WorkflowStep step,
+        IReadOnlyList<string> scriptReferences)
+    {
+        var result = IndirectPublicationPath.ProvenNonPublishing;
+        foreach (var reference in scriptReferences)
+        {
+            var scriptResult = InspectReferencedScript(repositoryPath, step, reference);
+            if (scriptResult == IndirectPublicationPath.Publication)
+            {
+                return scriptResult;
+            }
+
+            if (scriptResult == IndirectPublicationPath.Unknown)
+            {
+                result = scriptResult;
+            }
+        }
+
+        return result;
+    }
+
+    private static IndirectPublicationPath InspectReferencedScript(
+        string repositoryPath,
+        WorkflowStep step,
+        string reference)
+    {
+        string scriptPath;
         try
         {
             var repositoryRoot = Path.GetFullPath(repositoryPath);
-            actionDirectory = Path.GetFullPath(Path.Combine(repositoryRoot, uses![2..].Replace('/', Path.DirectorySeparatorChar)));
-            if (!actionDirectory.StartsWith(repositoryRoot + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+            var workingDirectory = ResolveWorkingDirectory(repositoryRoot, step.WorkingDirectory);
+            if (workingDirectory is null || ContainsExpression(reference))
             {
-                return false;
+                return IndirectPublicationPath.Unknown;
+            }
+
+            scriptPath = Path.GetFullPath(Path.Combine(
+                workingDirectory,
+                reference.Replace('/', Path.DirectorySeparatorChar).Replace('\\', Path.DirectorySeparatorChar)));
+            if (!IsWithinRepository(repositoryRoot, scriptPath))
+            {
+                return IndirectPublicationPath.Unknown;
             }
         }
         catch (ArgumentException)
         {
-            return false;
+            return IndirectPublicationPath.Unknown;
         }
 
-        foreach (var metadataName in new[] { "action.yml", "action.yaml" })
+        try
         {
-            var metadataPath = Path.Combine(actionDirectory, metadataName);
-            if (!File.Exists(metadataPath))
+            var file = new FileInfo(scriptPath);
+            if (!file.Exists || file.Length > MaxWorkflowBytes)
             {
-                continue;
+                return IndirectPublicationPath.Unknown;
             }
 
-            try
-            {
-                var file = new FileInfo(metadataPath);
-                if (file.Length > MaxWorkflowBytes)
-                {
-                    return true;
-                }
-
-                var content = File.ReadAllText(metadataPath);
-                return IsCompositeAction(content) &&
-                    (ContainsExecutableCommand(content, "nuget push") ||
-                     Regex.IsMatch(content, @"^\s*run\s*:\s*(?:\|\s*)?(?:&\s*)?(?:dotnet\s+)?nuget\s+push(?:\s|$)", RegexOptions.IgnoreCase | RegexOptions.Multiline));
-            }
-            catch (IOException)
-            {
-                return true;
-            }
-            catch (UnauthorizedAccessException)
-            {
-                return true;
-            }
+            return ContainsExecutablePublicationCommand(File.ReadAllText(scriptPath))
+                ? IndirectPublicationPath.Publication
+                : IndirectPublicationPath.ProvenNonPublishing;
         }
-
-        return false;
+        catch (IOException)
+        {
+            return IndirectPublicationPath.Unknown;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return IndirectPublicationPath.Unknown;
+        }
     }
 
-    private static bool IsCompositeAction(string content)
+    private static IndirectPublicationPath InspectLocalCompositeAction(
+        string repositoryPath,
+        string uses,
+        HashSet<string> visitedPaths)
     {
-        return content
-            .Replace("\r\n", "\n", StringComparison.Ordinal)
-            .Replace('\r', '\n')
-            .Split('\n')
-            .Select(line => line.Trim())
-            .Where(line => line.StartsWith("using:", StringComparison.OrdinalIgnoreCase))
-            .Select(line => line["using:".Length..].Trim().Trim('\'', '"'))
-            .Any(value => value.Equals("composite", StringComparison.OrdinalIgnoreCase));
+        string actionDirectory;
+        try
+        {
+            var repositoryRoot = Path.GetFullPath(repositoryPath);
+            actionDirectory = Path.GetFullPath(Path.Combine(
+                repositoryRoot,
+                uses[2..].Replace('/', Path.DirectorySeparatorChar).Replace('\\', Path.DirectorySeparatorChar)));
+            if (!IsWithinRepository(repositoryRoot, actionDirectory) || !visitedPaths.Add(actionDirectory))
+            {
+                return IndirectPublicationPath.Unknown;
+            }
+        }
+        catch (ArgumentException)
+        {
+            return IndirectPublicationPath.Unknown;
+        }
+
+        string? metadataPath = null;
+        foreach (var metadataName in new[] { "action.yml", "action.yaml" })
+        {
+            var candidate = Path.Combine(actionDirectory, metadataName);
+            if (File.Exists(candidate))
+            {
+                metadataPath = candidate;
+                break;
+            }
+        }
+
+        if (metadataPath is null)
+        {
+            return IndirectPublicationPath.Unknown;
+        }
+
+        try
+        {
+            var file = new FileInfo(metadataPath);
+            if (file.Length > MaxWorkflowBytes)
+            {
+                return IndirectPublicationPath.Unknown;
+            }
+
+            var action = SupportedYaml.ParseCompositeAction(File.ReadAllText(metadataPath));
+            if (!action.IsComposite || !action.HasInspectableSteps)
+            {
+                return IndirectPublicationPath.Unknown;
+            }
+
+            var result = IndirectPublicationPath.ProvenNonPublishing;
+            foreach (var step in action.Steps)
+            {
+                if (IsExplicitlyDisabled(step.Condition))
+                {
+                    continue;
+                }
+
+                if (ContainsExecutablePublicationCommand(step.Run))
+                {
+                    return IndirectPublicationPath.Publication;
+                }
+
+                var nested = IsLocalActionReference(step.Uses)
+                    ? IndirectPublicationPath.Unknown
+                    : InspectIndirectPublicationPath(repositoryPath, step);
+                if (nested == IndirectPublicationPath.Publication)
+                {
+                    return nested.Value;
+                }
+
+                if (nested == IndirectPublicationPath.Unknown)
+                {
+                    result = IndirectPublicationPath.Unknown;
+                }
+            }
+
+            return result;
+        }
+        catch (IOException)
+        {
+            return IndirectPublicationPath.Unknown;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return IndirectPublicationPath.Unknown;
+        }
+    }
+
+    private static bool IsWithinRepository(string repositoryRoot, string candidate)
+    {
+        return candidate.Equals(repositoryRoot, StringComparison.OrdinalIgnoreCase) ||
+               candidate.StartsWith(repositoryRoot + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string? ResolveWorkingDirectory(string repositoryRoot, string? workingDirectory)
+    {
+        if (string.IsNullOrWhiteSpace(workingDirectory) || ContainsExpression(workingDirectory))
+        {
+            return repositoryRoot;
+        }
+
+        try
+        {
+            var resolved = Path.GetFullPath(Path.Combine(
+                repositoryRoot,
+                workingDirectory.Replace('/', Path.DirectorySeparatorChar).Replace('\\', Path.DirectorySeparatorChar)));
+            return IsWithinRepository(repositoryRoot, resolved) ? resolved : null;
+        }
+        catch (ArgumentException)
+        {
+            return null;
+        }
+    }
+
+    private static bool IsPotentiallyPublicationAction(WorkflowStep step)
+    {
+        return !IsLocalActionReference(step.Uses) &&
+               !string.IsNullOrWhiteSpace(step.Uses) &&
+               !(step.Uses?.StartsWith("NuGet/login@", StringComparison.OrdinalIgnoreCase) ?? false) &&
+               HasReleasePublicationSignal(step.Uses);
+    }
+
+    private enum IndirectPublicationPath
+    {
+        ProvenNonPublishing,
+        Publication,
+        Unknown
     }
 
     private static bool IsLocalActionReference(string? uses)
@@ -473,7 +662,13 @@ internal static class WorkflowPolicyInspector
 
     private static bool IsPublishStep(WorkflowStep step)
     {
-        return !IsExplicitlyDisabled(step.Condition) && ContainsExecutableCommand(step.Run, "nuget push");
+        return !IsExplicitlyDisabled(step.Condition) && ContainsExecutablePackagePublicationCommand(step.Run);
+    }
+
+    private static bool IsPublicationRelevantStep(WorkflowStep step)
+    {
+        return !IsExplicitlyDisabled(step.Condition) &&
+               (ContainsExecutablePackagePublicationCommand(step.Run) || ContainsExecutableReleasePublicationCommand(step.Run));
     }
 
     private static bool IsTrustedPublishingStep(WorkflowStep step)
@@ -616,6 +811,240 @@ internal static class WorkflowPolicyInspector
         return false;
     }
 
+    private static bool ContainsExecutablePublicationCommand(string? content)
+    {
+        return ContainsExecutablePackagePublicationCommand(content) ||
+               ContainsExecutableReleasePublicationCommand(content);
+    }
+
+    private static bool ContainsExecutablePackagePublicationCommand(string? content)
+    {
+        if (string.IsNullOrWhiteSpace(content))
+        {
+            return false;
+        }
+
+        foreach (var rawLine in content.Split('\n'))
+        {
+            var line = rawLine.Trim();
+            if (line.Length == 0 || line.StartsWith('#') || IsOutputOnlyCommand(line))
+            {
+                continue;
+            }
+
+            if (Regex.IsMatch(
+                    line,
+                    @"^(?:&\s*)?(?:(?:dotnet\s+)?nuget(?:\.exe)?\s+push)(?:\s|$)",
+                    RegexOptions.IgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool ContainsExecutableReleasePublicationCommand(string? content)
+    {
+        if (string.IsNullOrWhiteSpace(content))
+        {
+            return false;
+        }
+
+        foreach (var rawLine in content.Split('\n'))
+        {
+            var line = rawLine.Trim();
+            if (line.Length == 0 || line.StartsWith('#') || IsOutputOnlyCommand(line))
+            {
+                continue;
+            }
+
+            if (Regex.IsMatch(line, @"^(?:&\s*)?gh(?:\.exe)?\s+release\s+create(?:\s|$)", RegexOptions.IgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static IReadOnlyList<string> FindReferencedScripts(string? run)
+    {
+        if (string.IsNullOrWhiteSpace(run))
+        {
+            return Array.Empty<string>();
+        }
+
+        var references = new List<string>();
+        foreach (var rawLine in run.Split('\n'))
+        {
+            var line = rawLine.Trim();
+            if (line.Length == 0 || line.StartsWith('#') || IsOutputOnlyCommand(line))
+            {
+                continue;
+            }
+
+            var tokens = TokenizeCommandLine(line);
+            if (tokens.Length == 0)
+            {
+                continue;
+            }
+
+            var command = tokens[0].TrimStart('&');
+            if (IsScriptInterpreter(command))
+            {
+                for (var index = 1; index < tokens.Length; index++)
+                {
+                    var token = tokens[index];
+                    if (token.Equals("-c", StringComparison.OrdinalIgnoreCase) ||
+                        token.Equals("-Command", StringComparison.OrdinalIgnoreCase) ||
+                        token.Equals("--command", StringComparison.OrdinalIgnoreCase))
+                    {
+                        break;
+                    }
+
+                    if (token.Equals("-File", StringComparison.OrdinalIgnoreCase) ||
+                        token.Equals("-f", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var foundReference = false;
+                        for (var referenceIndex = index + 1; referenceIndex < tokens.Length; referenceIndex++)
+                        {
+                            if (IsScriptPathToken(tokens[referenceIndex]))
+                            {
+                                references.Add(tokens[referenceIndex]);
+                                foundReference = true;
+                                break;
+                            }
+                        }
+
+                        if (!foundReference)
+                        {
+                            references.Add(index + 1 < tokens.Length ? tokens[index + 1] : string.Empty);
+                        }
+
+                        break;
+                    }
+
+                    if (!token.StartsWith('-') &&
+                        IsScriptPathToken(token))
+                    {
+                        references.Add(token);
+                        break;
+                    }
+                }
+
+                continue;
+            }
+
+            if (IsScriptPathToken(command))
+            {
+                references.Add(command);
+            }
+        }
+
+        return references;
+    }
+
+    private static bool IsScriptInterpreter(string command)
+    {
+        return command.Equals("pwsh", StringComparison.OrdinalIgnoreCase) ||
+               command.Equals("pwsh.exe", StringComparison.OrdinalIgnoreCase) ||
+               command.Equals("powershell", StringComparison.OrdinalIgnoreCase) ||
+               command.Equals("powershell.exe", StringComparison.OrdinalIgnoreCase) ||
+               command.Equals("bash", StringComparison.OrdinalIgnoreCase) ||
+               command.Equals("sh", StringComparison.OrdinalIgnoreCase) ||
+               command.Equals("dash", StringComparison.OrdinalIgnoreCase) ||
+               command.Equals("zsh", StringComparison.OrdinalIgnoreCase) ||
+               command.Equals("cmd", StringComparison.OrdinalIgnoreCase) ||
+               command.Equals("cmd.exe", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsScriptPathToken(string token)
+    {
+        var normalized = token.Trim().Trim(';', '|', '&');
+        return normalized.StartsWith("./", StringComparison.Ordinal) ||
+               normalized.StartsWith(".\\", StringComparison.Ordinal) ||
+               normalized.StartsWith("../", StringComparison.Ordinal) ||
+               normalized.StartsWith("..\\", StringComparison.Ordinal) ||
+               normalized.StartsWith('/') ||
+               normalized.StartsWith("scripts/", StringComparison.OrdinalIgnoreCase) ||
+               normalized.StartsWith("scripts\\", StringComparison.OrdinalIgnoreCase) ||
+               normalized.StartsWith("tools/", StringComparison.OrdinalIgnoreCase) ||
+               normalized.StartsWith("tools\\", StringComparison.OrdinalIgnoreCase) ||
+               normalized.Contains('/', StringComparison.Ordinal) &&
+               (normalized.EndsWith(".ps1", StringComparison.OrdinalIgnoreCase) ||
+                normalized.EndsWith(".sh", StringComparison.OrdinalIgnoreCase) ||
+                normalized.EndsWith(".bash", StringComparison.OrdinalIgnoreCase) ||
+                normalized.EndsWith(".cmd", StringComparison.OrdinalIgnoreCase) ||
+                normalized.EndsWith(".bat", StringComparison.OrdinalIgnoreCase)) ||
+               normalized.EndsWith(".ps1", StringComparison.OrdinalIgnoreCase) ||
+               normalized.EndsWith(".sh", StringComparison.OrdinalIgnoreCase) ||
+               normalized.EndsWith(".bash", StringComparison.OrdinalIgnoreCase) ||
+               normalized.EndsWith(".cmd", StringComparison.OrdinalIgnoreCase) ||
+               normalized.EndsWith(".bat", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string[] TokenizeCommandLine(string line)
+    {
+        var tokens = new List<string>();
+        var token = new StringBuilder();
+        var quote = '\0';
+        foreach (var character in line)
+        {
+            if (quote != '\0')
+            {
+                if (character == quote)
+                {
+                    quote = '\0';
+                }
+                else
+                {
+                    token.Append(character);
+                }
+
+                continue;
+            }
+
+            if (character is '\'' or '"')
+            {
+                quote = character;
+            }
+            else if (char.IsWhiteSpace(character))
+            {
+                if (token.Length > 0)
+                {
+                    var cleaned = CleanCommandToken(token.ToString());
+                    if (cleaned.Length > 0)
+                    {
+                        tokens.Add(cleaned);
+                    }
+
+                    token.Clear();
+                }
+            }
+            else
+            {
+                token.Append(character);
+            }
+        }
+
+        if (token.Length > 0)
+        {
+            var cleaned = CleanCommandToken(token.ToString());
+            if (cleaned.Length > 0)
+            {
+                tokens.Add(cleaned);
+            }
+        }
+
+        return tokens.ToArray();
+    }
+
+    private static string CleanCommandToken(string token)
+    {
+        return token.Trim('`', ',', ';', '|', '&', '(', ')');
+    }
+
     private static bool ContainsExecutableValidationScript(string? run)
     {
         if (string.IsNullOrWhiteSpace(run))
@@ -698,6 +1127,13 @@ internal static class WorkflowPolicyInspector
             (pair.Value.Equals("1", StringComparison.OrdinalIgnoreCase) || pair.Value.Equals("true", StringComparison.OrdinalIgnoreCase)));
     }
 
+    private sealed class CompositeActionDocument
+    {
+        public bool IsComposite { get; set; }
+        public bool HasInspectableSteps { get; set; }
+        public List<WorkflowStep> Steps { get; } = new();
+    }
+
     private sealed class WorkflowDocument
     {
         public string? Name { get; set; }
@@ -735,6 +1171,7 @@ internal static class WorkflowPolicyInspector
         public string? Uses { get; set; }
         public string? Run { get; set; }
         public string? Condition { get; set; }
+        public string? WorkingDirectory { get; set; }
         public bool HasUninspectableStructure { get; set; }
         public Dictionary<string, string> Environment { get; } = new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, string> With { get; } = new(StringComparer.OrdinalIgnoreCase);
@@ -742,6 +1179,95 @@ internal static class WorkflowPolicyInspector
 
     private static class SupportedYaml
     {
+        public static CompositeActionDocument ParseCompositeAction(string content)
+        {
+            var action = new CompositeActionDocument();
+            var lines = content.Replace("\r\n", "\n", StringComparison.Ordinal).Replace('\r', '\n').Split('\n');
+            var inRuns = false;
+            var inSteps = false;
+            var blockRunStep = (WorkflowStep?)null;
+            var blockRunIndent = -1;
+            WorkflowStep? currentStep = null;
+
+            foreach (var rawLine in lines)
+            {
+                var line = RemoveComment(rawLine);
+                if (string.IsNullOrWhiteSpace(line) || line.TrimStart().StartsWith("---", StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                var indent = line.Length - line.TrimStart(' ').Length;
+                var trimmed = line.Trim();
+                if (blockRunStep is not null && indent > blockRunIndent)
+                {
+                    blockRunStep.Run = string.IsNullOrWhiteSpace(blockRunStep.Run)
+                        ? trimmed
+                        : blockRunStep.Run + "\n" + trimmed;
+                    continue;
+                }
+
+                if (blockRunStep is not null && indent <= blockRunIndent)
+                {
+                    blockRunStep = null;
+                    blockRunIndent = -1;
+                }
+
+                if (indent == 0 && TryParseKeyValue(trimmed, out var topKey, out _))
+                {
+                    inRuns = topKey.Equals("runs", StringComparison.OrdinalIgnoreCase);
+                    inSteps = false;
+                    currentStep = null;
+                    continue;
+                }
+
+                if (inRuns && indent == 2 && TryParseKeyValue(trimmed, out var runsKey, out var runsValue))
+                {
+                    if (runsKey.Equals("using", StringComparison.OrdinalIgnoreCase))
+                    {
+                        action.IsComposite = Unquote(runsValue).Equals("composite", StringComparison.OrdinalIgnoreCase);
+                    }
+                    else if (runsKey.Equals("steps", StringComparison.OrdinalIgnoreCase))
+                    {
+                        action.HasInspectableSteps = string.IsNullOrWhiteSpace(runsValue) || runsValue.Equals("[]", StringComparison.Ordinal);
+                        inSteps = action.HasInspectableSteps;
+                    }
+
+                    continue;
+                }
+
+                if (inSteps && indent == 4 && trimmed.StartsWith('-'))
+                {
+                    currentStep = new WorkflowStep();
+                    action.Steps.Add(currentStep);
+                    var inlineStep = trimmed[1..].Trim();
+                    if (TryParseKeyValue(inlineStep, out var stepKey, out var stepValue))
+                    {
+                        AssignStepValue(currentStep, stepKey, stepValue);
+                        if (stepKey.Equals("run", StringComparison.OrdinalIgnoreCase) && (stepValue == "|" || stepValue == ">"))
+                        {
+                            blockRunStep = currentStep;
+                            blockRunIndent = indent;
+                        }
+                    }
+
+                    continue;
+                }
+
+                if (currentStep is not null && indent >= 6 && TryParseKeyValue(trimmed, out var key, out var value))
+                {
+                    AssignStepValue(currentStep, key, value);
+                    if (key.Equals("run", StringComparison.OrdinalIgnoreCase) && (value == "|" || value == ">"))
+                    {
+                        blockRunStep = currentStep;
+                        blockRunIndent = indent;
+                    }
+                }
+            }
+
+            return action;
+        }
+
         public static WorkflowDocument Parse(string content)
         {
             var workflow = new WorkflowDocument();
@@ -1108,6 +1634,10 @@ internal static class WorkflowPolicyInspector
             else if (key.Equals("if", StringComparison.OrdinalIgnoreCase))
             {
                 step.Condition = Unquote(value);
+            }
+            else if (key.Equals("working-directory", StringComparison.OrdinalIgnoreCase))
+            {
+                step.WorkingDirectory = Unquote(value);
             }
             else if (!IsSupportedStepKey(key))
             {

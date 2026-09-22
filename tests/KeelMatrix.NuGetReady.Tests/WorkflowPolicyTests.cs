@@ -383,6 +383,296 @@ public sealed class WorkflowPolicyTests
     }
 
     [Fact]
+    public void Scheduled_workflow_with_a_local_publication_script_is_limited_unproven()
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", """
+            name: maintenance
+            on:
+              schedule:
+                - cron: "0 0 * * *"
+            jobs:
+              maintenance:
+                steps:
+                  - run: pwsh scripts/publish.ps1
+            """);
+        repository.WriteFile("scripts/publish.ps1", "dotnet nuget push artifacts/package.nupkg");
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        AssertLimitedUnproven(inspection);
+    }
+
+    [Fact]
+    public void Workflow_run_with_a_local_publication_script_is_limited_unproven()
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", """
+            name: maintenance
+            on:
+              workflow_run:
+                workflows: [build]
+                types: [completed]
+            jobs:
+              maintenance:
+                steps:
+                  - run: bash tools/publish.sh
+            """);
+        repository.WriteFile("tools/publish.sh", "nuget push artifacts/package.nupkg");
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        AssertLimitedUnproven(inspection);
+    }
+
+    [Fact]
+    public void Branch_workflow_with_a_local_publication_script_is_limited_unproven()
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", """
+            name: continuous integration
+            on:
+              push:
+                branches: [main]
+            jobs:
+              build:
+                steps:
+                  - run: ./release.sh
+            """);
+        repository.WriteFile("release.sh", "gh release create v1.0.0");
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        AssertLimitedUnproven(inspection);
+    }
+
+    [Fact]
+    public void Matrix_workflow_with_a_local_publication_script_is_limited_unproven()
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", """
+            name: continuous integration
+            on:
+              push:
+                branches: [main]
+            jobs:
+              build:
+                strategy:
+                  matrix:
+                    os: [ubuntu-latest, windows-latest]
+                steps:
+                  - run: sh tools/publish.sh
+            """);
+        repository.WriteFile("tools/publish.sh", "NuGet.exe push artifacts/package.nupkg");
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        AssertLimitedUnproven(inspection);
+    }
+
+    [Fact]
+    public void Ordinary_ci_with_a_local_composite_publication_action_is_limited_unproven()
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", """
+            name: continuous integration
+            on:
+              push:
+                branches: [main]
+            jobs:
+              build:
+                steps:
+                  - uses: ./.github/actions/build
+            """);
+        repository.WriteFile(".github/actions/build/action.yml", """
+            name: build
+            description: Build the package
+            runs:
+              using: composite
+              steps:
+                - shell: bash
+                  run: dotnet nuget push artifacts/package.nupkg
+            """);
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        AssertLimitedUnproven(inspection);
+    }
+
+    [Fact]
+    public void Resolvable_local_script_without_publication_keeps_ci_quiet()
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", """
+            name: continuous integration
+            on:
+              pull_request:
+            jobs:
+              build:
+                steps:
+                  - run: bash scripts/build.sh
+            """);
+        repository.WriteFile("scripts/build.sh", "dotnet build --no-restore");
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        Assert.False(inspection.Evaluated);
+        Assert.Empty(inspection.Failures);
+    }
+
+    [Fact]
+    public void Resolvable_local_composite_without_publication_keeps_ci_quiet()
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", """
+            name: continuous integration
+            on:
+              push:
+                branches: [main]
+            jobs:
+              build:
+                steps:
+                  - uses: ./.github/actions/build
+            """);
+        repository.WriteFile(".github/actions/build/action.yaml", """
+            name: build
+            description: Build the package
+            runs:
+              using: composite
+              steps:
+                - shell: bash
+                  run: dotnet build --no-restore
+            """);
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        Assert.False(inspection.Evaluated);
+        Assert.Empty(inspection.Failures);
+    }
+
+    [Fact]
+    public void Local_composite_action_with_a_referenced_publication_script_is_limited_unproven()
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", """
+            name: continuous integration
+            on:
+              push:
+                branches: [main]
+            jobs:
+              build:
+                steps:
+                  - uses: ./.github/actions/build
+            """);
+        repository.WriteFile(".github/actions/build/action.yml", """
+            name: build
+            description: Build the package
+            runs:
+              using: composite
+              steps:
+                - shell: pwsh
+                  run: pwsh scripts/publish.ps1
+            """);
+        repository.WriteFile("scripts/publish.ps1", "gh release create v1.0.0");
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        AssertLimitedUnproven(inspection);
+    }
+
+    [Fact]
+    public void Missing_local_composite_metadata_is_limited_unproven_instead_of_quiet()
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", """
+            name: continuous integration
+            on:
+              push:
+                branches: [main]
+            jobs:
+              build:
+                steps:
+                  - uses: ./.github/actions/build
+            """);
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        AssertLimitedUnproven(inspection);
+    }
+
+    [Fact]
+    public void Remote_publication_action_is_limited_unproven_instead_of_quiet()
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", """
+            name: continuous integration
+            on:
+              push:
+                branches: [main]
+            jobs:
+              build:
+                steps:
+                  - uses: owner/publish-action@v1
+            """);
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        AssertLimitedUnproven(inspection);
+    }
+
+    [Fact]
+    public void Missing_local_script_is_limited_unproven_instead_of_quiet()
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", """
+            name: continuous integration
+            on:
+              push:
+                branches: [main]
+            jobs:
+              build:
+                steps:
+                  - run: bash scripts/missing.sh
+            """);
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        AssertLimitedUnproven(inspection);
+    }
+
+    [Fact]
+    public void Scheduled_script_publication_is_a_warning_not_not_applicable()
+    {
+        using var corpus = PackedCorpus.Create();
+        var package = corpus.Pack("Standard/Standard.csproj");
+        using var repository = WorkflowRepository.Create("ci.yml", """
+            name: nightly maintenance
+            on:
+              schedule:
+                - cron: "0 0 * * *"
+            jobs:
+              maintenance:
+                steps:
+                  - run: pwsh scripts/publish.ps1
+            """);
+        repository.WriteFile("scripts/publish.ps1", "dotnet nuget push artifacts/package.nupkg");
+
+        var report = CheckRunner.Run(
+            new NuGetReadyConfig
+            {
+                SchemaVersion = 1,
+                Packages =
+                [
+                    new PackageExpectation
+                    {
+                        Id = "Fixture.Standard",
+                        Kind = "library",
+                        Version = "1.0.0",
+                        Artifacts = [Path.GetFileName(package), Path.GetFileName(Path.ChangeExtension(package, ".snupkg"))]
+                    }
+                ]
+            },
+            corpus.OutputPath,
+            repository.Root.FullName,
+            TimeSpan.FromMinutes(2),
+            new ConsumerRehearsalOptions(PublicFeedPath: corpus.OutputPath));
+
+        Assert.Equal("warn", report.Status);
+        Assert.Equal(0, report.ExitCode);
+        Assert.Equal("warn", report.Checks.Single(check => check.Id == "workflow-policy").Status);
+        Assert.DoesNotContain(report.Failures, failure => failure.Message.Contains("not-applicable", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
     public void Publish_workflow_filename_marks_a_reusable_target_as_limited_unproven()
     {
         using var repository = WorkflowRepository.Create("publish.yml", """
@@ -964,6 +1254,13 @@ internal sealed class WorkflowRepository : IDisposable
     {
         var directory = Directory.CreateDirectory(Path.Combine(Root.FullName, ".github", "workflows"));
         File.WriteAllText(Path.Combine(directory.FullName, fileName), content);
+    }
+
+    public void WriteFile(string relativePath, string content)
+    {
+        var path = Path.Combine(Root.FullName, relativePath.Replace('/', Path.DirectorySeparatorChar));
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        File.WriteAllText(path, content);
     }
 
     public void Dispose()

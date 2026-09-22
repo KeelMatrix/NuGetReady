@@ -15,4 +15,5 @@ The 0.1.0 release is planned and unreleased.
 - Verifies library package-cache and installed-tool-store identity/provenance and compares the full expanded payload, including XML documentation; unsupported tool layouts are reported as unproven rather than passing.
 - Requires the package-specific provenance sidecar and reports unsupported reusable/composite publication paths as limited warnings rather than publication proof.
 - Uses a conservative workflow-policy default: release-shaped vocabulary, triggers/inputs, opaque reusable targets, and uninspectable job structure are limited/unproven warnings, while inspectable branch CI with locally resolvable non-publishing reusable workflows stays quiet.
+- Extends the conservative workflow-policy inspection to repository-local publication scripts and local composite action steps, including unattended `schedule` and `workflow_run` paths; resolvable non-publishing indirection stays quiet while unknown paths remain warnings.
 - Establishes Unix process groups before target execution and confirms bounded descendant cleanup after successful completion, timeout, or cancellation; Windows retains job-object cleanup.
