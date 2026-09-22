@@ -70,72 +70,204 @@ internal static class WorkflowPolicyInspector
             }
 
             var workflow = SupportedYaml.Parse(content);
-            if (!LooksLikeReleaseWorkflow(path, workflow))
+            if (!LooksLikeReleaseWorkflow(repositoryPath, path, workflow))
             {
                 continue;
             }
 
             evaluated = true;
-            InspectWorkflow(repositoryPath, workflow, failures);
+            InspectWorkflow(repositoryPath, path, workflow, failures);
         }
 
         return new WorkflowInspectionResult(failures.OrderBy(failure => failure.Message, StringComparer.Ordinal).ToArray(), evaluated);
     }
 
-    private static bool LooksLikeReleaseWorkflow(string path, WorkflowDocument workflow)
+    private static bool LooksLikeReleaseWorkflow(string repositoryPath, string path, WorkflowDocument workflow)
     {
-        if (workflow.Jobs.Any(job => job.Steps.Any(IsPublishStep)))
+        if (workflow.HasPublicationShapedTrigger ||
+            workflow.HasPublicationInput ||
+            workflow.HasUninspectableStructure ||
+            workflow.Jobs.Any(job => IsDirectPublicationJob(job)))
         {
             return true;
         }
 
-        return workflow.Jobs.Any(job => IsReleaseLikePublicationJob(path, workflow, job));
+        return workflow.Jobs.Any(job => IsReleaseLikePublicationJob(repositoryPath, path, workflow, job));
     }
 
-    private static bool IsReleaseLikePublicationJob(string path, WorkflowDocument workflow, WorkflowJob job)
+    private static bool IsReleaseLikePublicationJob(string repositoryPath, string path, WorkflowDocument workflow, WorkflowJob job)
     {
         if (IsExplicitlyDisabled(job.Condition))
         {
             return false;
         }
 
-        var hasReusableTarget = !string.IsNullOrWhiteSpace(job.Uses);
-        var hasCompositeTarget = job.Steps.Any(step =>
-            !IsExplicitlyDisabled(step.Condition) && IsLocalActionReference(step.Uses));
-        if (!hasReusableTarget && !hasCompositeTarget)
+        if (job.HasUninspectableStructure || job.Steps.Any(step => step.HasUninspectableStructure))
+        {
+            return true;
+        }
+
+        if (HasReleasePublicationSignal(Path.GetFileNameWithoutExtension(path)) ||
+               HasReleasePublicationSignal(workflow.Name) ||
+               HasReleasePublicationSignal(job.Id) ||
+               HasReleasePublicationSignal(job.Name) ||
+               HasReleasePublicationSignal(job.Uses))
+        {
+            return true;
+        }
+
+        if (string.IsNullOrWhiteSpace(job.Uses))
         {
             return false;
         }
 
-        return HasReleasePublicationSignal(Path.GetFileNameWithoutExtension(path)) ||
-               HasReleasePublicationSignal(workflow.Name) ||
-               HasReleasePublicationSignal(job.Id) ||
-               HasReleasePublicationSignal(job.Uses) ||
-               job.Steps.Any(step => HasReleasePublicationSignal(step.Name) ||
-                                     HasReleasePublicationSignal(step.Uses) ||
-                                     HasReleasePublicationSignal(step.Run));
+        return !TryProveLocalReusableWorkflow(repositoryPath, job.Uses, new HashSet<string>(StringComparer.OrdinalIgnoreCase));
     }
 
     private static bool HasReleasePublicationSignal(string? value)
     {
         return value is not null && Regex.IsMatch(
             value,
-            @"(?:^|[-_./\s])(?:release|publish|publishing|nuget|deploy)(?:$|[-_./\s])",
+            @"(?:^|[-_./\s])(?:release|publish|publishing|nuget|deploy|ship|push)(?:$|[-_./\s])",
             RegexOptions.IgnoreCase);
     }
 
-    private static void InspectWorkflow(string repositoryPath, WorkflowDocument workflow, List<Failure> failures)
+    private static bool IsDirectPublicationJob(WorkflowJob job)
     {
+        return !IsExplicitlyDisabled(job.Condition) && job.Steps.Any(IsPublishStep);
+    }
+
+    private static bool TryProveLocalReusableWorkflow(
+        string repositoryPath,
+        string uses,
+        HashSet<string> visitedPaths)
+    {
+        if (!IsLocalWorkflowReference(uses) || ContainsExpression(uses))
+        {
+            return false;
+        }
+
+        string workflowPath;
+        try
+        {
+            var repositoryRoot = Path.GetFullPath(repositoryPath);
+            workflowPath = Path.GetFullPath(Path.Combine(
+                repositoryRoot,
+                uses[2..].Replace('/', Path.DirectorySeparatorChar).Replace('\\', Path.DirectorySeparatorChar)));
+            if (!workflowPath.StartsWith(repositoryRoot + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase) ||
+                (!workflowPath.EndsWith(".yml", StringComparison.OrdinalIgnoreCase) &&
+                 !workflowPath.EndsWith(".yaml", StringComparison.OrdinalIgnoreCase)))
+            {
+                return false;
+            }
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+
+        if (!visitedPaths.Add(workflowPath))
+        {
+            return false;
+        }
+
+        try
+        {
+            var file = new FileInfo(workflowPath);
+            if (!file.Exists || file.Length > MaxWorkflowBytes)
+            {
+                return false;
+            }
+
+            var workflow = SupportedYaml.Parse(File.ReadAllText(workflowPath));
+            if (workflow.Jobs.Count == 0 ||
+                workflow.HasPublicationShapedTrigger ||
+                workflow.HasPublicationInput ||
+                workflow.HasUninspectableStructure ||
+                workflow.Jobs.Any(job => IsDirectPublicationJob(job)) ||
+                HasReleasePublicationSignal(Path.GetFileNameWithoutExtension(workflowPath)) ||
+                HasReleasePublicationSignal(workflow.Name))
+            {
+                return false;
+            }
+
+            foreach (var job in workflow.Jobs)
+            {
+                if (IsExplicitlyDisabled(job.Condition))
+                {
+                    continue;
+                }
+
+                if (job.HasUninspectableStructure ||
+                    job.Steps.Any(step => step.HasUninspectableStructure) ||
+                    HasReleasePublicationSignal(job.Id) ||
+                    HasReleasePublicationSignal(job.Name) ||
+                    HasReleasePublicationSignal(job.Uses))
+                {
+                    return false;
+                }
+
+                if (!string.IsNullOrWhiteSpace(job.Uses) &&
+                    !TryProveLocalReusableWorkflow(repositoryPath, job.Uses, visitedPaths))
+                {
+                    return false;
+                }
+            }
+
+            visitedPaths.Remove(workflowPath);
+            return true;
+        }
+        catch (IOException)
+        {
+            return false;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    private static bool ContainsExpression(string? value)
+    {
+        return value?.Contains("${{", StringComparison.Ordinal) == true;
+    }
+
+    private static void InspectWorkflow(string repositoryPath, string path, WorkflowDocument workflow, List<Failure> failures)
+    {
+        var publishingJobs = workflow.Jobs.Where(job => job.Steps.Any(IsPublishStep)).ToArray();
         if (!workflow.HasVersionedTagTrigger || workflow.HasUnsupportedTagPattern)
         {
-            failures.Add(new Failure("workflow-policy", "Release workflow is not gated by a versioned tag trigger."));
+            if (publishingJobs.Length > 0)
+            {
+                failures.Add(new Failure("workflow-policy", "Release workflow is not gated by a versioned tag trigger."));
+            }
         }
 
         var unsupportedPublicationPath = InspectUnsupportedPublicationPaths(repositoryPath, workflow, failures);
-        var publishingJobs = workflow.Jobs.Where(job => job.Steps.Any(IsPublishStep)).ToArray();
+        var hasReleaseVocabulary = HasReleasePublicationSignal(Path.GetFileNameWithoutExtension(path)) ||
+                                    HasReleasePublicationSignal(workflow.Name) ||
+                                    workflow.Jobs.Any(job =>
+                                        !IsExplicitlyDisabled(job.Condition) &&
+                                         (HasReleasePublicationSignal(job.Id) ||
+                                          HasReleasePublicationSignal(job.Name) ||
+                                          HasReleasePublicationSignal(job.Uses)));
+        var limitedUnprovenShape = workflow.HasPublicationShapedTrigger ||
+                                    workflow.HasPublicationInput ||
+                                    workflow.HasUninspectableStructure ||
+                                    workflow.Jobs.Any(job => job.HasUninspectableStructure ||
+                                                            job.Steps.Any(step => step.HasUninspectableStructure)) ||
+                                    (publishingJobs.Length == 0 && hasReleaseVocabulary);
+        if (limitedUnprovenShape && !unsupportedPublicationPath)
+        {
+            failures.Add(new Failure(
+                "workflow-policy",
+                "Workflow publication policy is limited/unproven because a release-shaped trigger or unsupported structure could not be inspected safely.",
+                IsWarning: true));
+        }
+
         if (publishingJobs.Length == 0)
         {
-            if (!unsupportedPublicationPath)
+            if (!unsupportedPublicationPath && !limitedUnprovenShape)
             {
                 failures.Add(new Failure("workflow-policy", "Release workflow does not contain an executable package publication step."));
             }
@@ -330,6 +462,13 @@ internal static class WorkflowPolicyInspector
     private static bool IsLocalActionReference(string? uses)
     {
         return uses is not null && (uses.StartsWith("./", StringComparison.Ordinal) || uses.StartsWith(".\\", StringComparison.Ordinal));
+    }
+
+    private static bool IsLocalWorkflowReference(string? uses)
+    {
+        return uses is not null && IsLocalActionReference(uses) &&
+               (uses.EndsWith(".yml", StringComparison.OrdinalIgnoreCase) ||
+                uses.EndsWith(".yaml", StringComparison.OrdinalIgnoreCase));
     }
 
     private static bool IsPublishStep(WorkflowStep step)
@@ -562,6 +701,9 @@ internal static class WorkflowPolicyInspector
     private sealed class WorkflowDocument
     {
         public string? Name { get; set; }
+        public bool HasPublicationShapedTrigger { get; set; }
+        public bool HasPublicationInput { get; set; }
+        public bool HasUninspectableStructure { get; set; }
         public bool HasVersionedTagTrigger { get; set; }
         public bool HasUnsupportedTagPattern { get; set; }
         public bool HasPushBranchTrigger { get; set; }
@@ -576,8 +718,10 @@ internal static class WorkflowPolicyInspector
     {
         public WorkflowJob(string id) => Id = id;
         public string Id { get; }
+        public string? Name { get; set; }
         public string? Uses { get; set; }
         public string? Condition { get; set; }
+        public bool HasUninspectableStructure { get; set; }
         public bool PermissionsSpecified { get; set; }
         public HashSet<string> DependsOn { get; } = new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, string> Permissions { get; } = new(StringComparer.OrdinalIgnoreCase);
@@ -591,7 +735,9 @@ internal static class WorkflowPolicyInspector
         public string? Uses { get; set; }
         public string? Run { get; set; }
         public string? Condition { get; set; }
+        public bool HasUninspectableStructure { get; set; }
         public Dictionary<string, string> Environment { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public Dictionary<string, string> With { get; } = new(StringComparer.OrdinalIgnoreCase);
     }
 
     private static class SupportedYaml
@@ -602,6 +748,9 @@ internal static class WorkflowPolicyInspector
             var lines = content.Replace("\r\n", "\n", StringComparison.Ordinal).Replace('\r', '\n').Split('\n');
             var inOn = false;
             var inPush = false;
+            var activeTrigger = string.Empty;
+            var inTriggerInputs = false;
+            var triggerInputsIndent = -1;
             var inJobs = false;
             string? activeTriggerOption = null;
             WorkflowJob? currentJob = null;
@@ -641,6 +790,12 @@ internal static class WorkflowPolicyInspector
                     activeMapIndent = -1;
                 }
 
+                if (inTriggerInputs && indent <= triggerInputsIndent)
+                {
+                    inTriggerInputs = false;
+                    triggerInputsIndent = -1;
+                }
+
                 if (activeMap is not null && indent > activeMapIndent && TryParseKeyValue(trimmed, out var mapKey, out var mapValue))
                 {
                     activeMap[mapKey] = Unquote(mapValue);
@@ -652,6 +807,9 @@ internal static class WorkflowPolicyInspector
                     inOn = topKey.Equals("on", StringComparison.OrdinalIgnoreCase);
                     inJobs = topKey.Equals("jobs", StringComparison.OrdinalIgnoreCase);
                     inPush = false;
+                    activeTrigger = string.Empty;
+                    inTriggerInputs = false;
+                    triggerInputsIndent = -1;
                     activeTriggerOption = null;
                     currentJob = null;
                     currentStep = null;
@@ -696,7 +854,12 @@ internal static class WorkflowPolicyInspector
                 if (inOn && indent == 2 && TryParseKeyValue(trimmed, out var triggerKey, out var triggerValue))
                 {
                     inPush = triggerKey.Equals("push", StringComparison.OrdinalIgnoreCase);
+                    activeTrigger = triggerKey;
                     activeTriggerOption = null;
+                    if (triggerKey.Equals("release", StringComparison.OrdinalIgnoreCase))
+                    {
+                        workflow.HasPublicationShapedTrigger = true;
+                    }
                     if (inPush)
                     {
                         ParseTriggerOptions(triggerValue, workflow);
@@ -704,6 +867,26 @@ internal static class WorkflowPolicyInspector
                     else
                     {
                         workflow.HasOtherTrigger = true;
+                    }
+
+                    continue;
+                }
+
+                if (inOn && !inPush && indent == 4 &&
+                    activeTrigger is "workflow_call" or "workflow_dispatch" &&
+                    TryParseKeyValue(trimmed, out var triggerOptionKey, out _))
+                {
+                    inTriggerInputs = triggerOptionKey.Equals("inputs", StringComparison.OrdinalIgnoreCase);
+                    triggerInputsIndent = inTriggerInputs ? indent : -1;
+                    continue;
+                }
+
+                if (inOn && !inPush && inTriggerInputs && indent == triggerInputsIndent + 2 &&
+                    TryParseKeyValue(trimmed, out var inputName, out _))
+                {
+                    if (HasReleasePublicationSignal(inputName))
+                    {
+                        workflow.HasPublicationInput = true;
                     }
 
                     continue;
@@ -776,6 +959,10 @@ internal static class WorkflowPolicyInspector
                             activeMapIndent = indent;
                         }
                     }
+                    else if (jobKey.Equals("name", StringComparison.OrdinalIgnoreCase))
+                    {
+                        currentJob.Name = Unquote(jobValue);
+                    }
                     else if (jobKey.Equals("env", StringComparison.OrdinalIgnoreCase))
                     {
                         ParseInlineMap(jobValue, currentJob.Environment);
@@ -787,6 +974,12 @@ internal static class WorkflowPolicyInspector
                     }
                     else if (jobKey.Equals("steps", StringComparison.OrdinalIgnoreCase))
                     {
+                        if (!string.IsNullOrWhiteSpace(jobValue) && !jobValue.Equals("[]", StringComparison.Ordinal))
+                        {
+                            currentJob.HasUninspectableStructure = true;
+                            workflow.HasUninspectableStructure = true;
+                        }
+
                         currentStep = null;
                     }
                     else if (jobKey.Equals("needs", StringComparison.OrdinalIgnoreCase))
@@ -803,6 +996,16 @@ internal static class WorkflowPolicyInspector
                     else if (jobKey.Equals("uses", StringComparison.OrdinalIgnoreCase))
                     {
                         currentJob.Uses = Unquote(jobValue);
+                        if (string.IsNullOrWhiteSpace(currentJob.Uses))
+                        {
+                            currentJob.HasUninspectableStructure = true;
+                            workflow.HasUninspectableStructure = true;
+                        }
+                    }
+                    else if (!IsSupportedJobKey(jobKey))
+                    {
+                        currentJob.HasUninspectableStructure = true;
+                        workflow.HasUninspectableStructure = true;
                     }
 
                     continue;
@@ -837,6 +1040,13 @@ internal static class WorkflowPolicyInspector
                         activeMapIndent = indent;
                         activeStepMap = true;
                     }
+                    else if (key.Equals("with", StringComparison.OrdinalIgnoreCase))
+                    {
+                        AssignStepValue(currentStep, key, value);
+                        activeMap = currentStep.With;
+                        activeMapIndent = indent;
+                        activeStepMap = true;
+                    }
                     else
                     {
                         AssignStepValue(currentStep, key, value);
@@ -859,6 +1069,28 @@ internal static class WorkflowPolicyInspector
             return workflow;
         }
 
+        private static bool IsSupportedJobKey(string key)
+        {
+            return key.Equals("name", StringComparison.OrdinalIgnoreCase) ||
+                   key.Equals("uses", StringComparison.OrdinalIgnoreCase) ||
+                   key.Equals("if", StringComparison.OrdinalIgnoreCase) ||
+                   key.Equals("permissions", StringComparison.OrdinalIgnoreCase) ||
+                   key.Equals("env", StringComparison.OrdinalIgnoreCase) ||
+                   key.Equals("needs", StringComparison.OrdinalIgnoreCase) ||
+                   key.Equals("steps", StringComparison.OrdinalIgnoreCase) ||
+                   key.Equals("runs-on", StringComparison.OrdinalIgnoreCase) ||
+                   key.Equals("strategy", StringComparison.OrdinalIgnoreCase) ||
+                   key.Equals("continue-on-error", StringComparison.OrdinalIgnoreCase) ||
+                   key.Equals("timeout-minutes", StringComparison.OrdinalIgnoreCase) ||
+                   key.Equals("container", StringComparison.OrdinalIgnoreCase) ||
+                   key.Equals("services", StringComparison.OrdinalIgnoreCase) ||
+                   key.Equals("outputs", StringComparison.OrdinalIgnoreCase) ||
+                   key.Equals("defaults", StringComparison.OrdinalIgnoreCase) ||
+                   key.Equals("concurrency", StringComparison.OrdinalIgnoreCase) ||
+                   key.Equals("with", StringComparison.OrdinalIgnoreCase) ||
+                   key.Equals("secrets", StringComparison.OrdinalIgnoreCase);
+        }
+
         private static void AssignStepValue(WorkflowStep step, string key, string value)
         {
             if (key.Equals("name", StringComparison.OrdinalIgnoreCase))
@@ -877,6 +1109,25 @@ internal static class WorkflowPolicyInspector
             {
                 step.Condition = Unquote(value);
             }
+            else if (!IsSupportedStepKey(key))
+            {
+                step.HasUninspectableStructure = true;
+            }
+        }
+
+        private static bool IsSupportedStepKey(string key)
+        {
+            return key.Equals("name", StringComparison.OrdinalIgnoreCase) ||
+                   key.Equals("uses", StringComparison.OrdinalIgnoreCase) ||
+                   key.Equals("run", StringComparison.OrdinalIgnoreCase) ||
+                   key.Equals("if", StringComparison.OrdinalIgnoreCase) ||
+                   key.Equals("env", StringComparison.OrdinalIgnoreCase) ||
+                   key.Equals("with", StringComparison.OrdinalIgnoreCase) ||
+                   key.Equals("id", StringComparison.OrdinalIgnoreCase) ||
+                   key.Equals("shell", StringComparison.OrdinalIgnoreCase) ||
+                   key.Equals("working-directory", StringComparison.OrdinalIgnoreCase) ||
+                   key.Equals("continue-on-error", StringComparison.OrdinalIgnoreCase) ||
+                   key.Equals("timeout-minutes", StringComparison.OrdinalIgnoreCase);
         }
 
         private static void ParseTriggerOptions(string value, WorkflowDocument workflow)

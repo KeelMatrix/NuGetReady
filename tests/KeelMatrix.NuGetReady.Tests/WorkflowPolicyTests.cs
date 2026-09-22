@@ -367,6 +367,15 @@ public sealed class WorkflowPolicyTests
               build:
                 uses: ./.github/workflows/reusable-build.yml
             """);
+        repository.WriteWorkflow("reusable-build.yml", """
+            name: reusable build
+            on:
+              workflow_call:
+            jobs:
+              build:
+                steps:
+                  - run: dotnet build
+            """);
 
         var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
 
@@ -390,6 +399,189 @@ public sealed class WorkflowPolicyTests
 
         Assert.Contains(findings, finding => finding.IsWarning && finding.Message.Contains("unproven", StringComparison.OrdinalIgnoreCase));
         Assert.DoesNotContain(findings, finding => finding.Message.Contains("does not contain an executable package publication step", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void Ship_named_workflow_is_reported_as_limited_unproven()
+    {
+        using var repository = WorkflowRepository.Create("ship.yml", """
+            name: ship
+            on:
+              push:
+                branches: ["main"]
+            jobs:
+              build:
+                steps:
+                  - run: dotnet build
+            """);
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        AssertLimitedUnproven(inspection);
+    }
+
+    [Fact]
+    public void Opaque_reusable_target_is_reported_as_limited_unproven()
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", """
+            name: ci
+            on:
+              push:
+                branches: ["main"]
+            jobs:
+              build:
+                uses: ${{ inputs.workflow }}
+            """);
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        AssertLimitedUnproven(inspection);
+    }
+
+    [Fact]
+    public void Remote_reusable_target_is_reported_as_limited_unproven()
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", """
+            name: ci
+            on:
+              push:
+                branches: ["main"]
+            jobs:
+              build:
+                uses: owner/repository/.github/workflows/build.yml@main
+            """);
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        AssertLimitedUnproven(inspection);
+    }
+
+    [Fact]
+    public void Publication_named_workflow_call_input_is_reported_as_limited_unproven()
+    {
+        using var repository = WorkflowRepository.Create("reusable.yml", """
+            name: reusable
+            on:
+              workflow_call:
+                inputs:
+                  publish:
+                    required: false
+                    type: boolean
+            jobs:
+              build:
+                steps:
+                  - run: dotnet build
+            """);
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        AssertLimitedUnproven(inspection);
+    }
+
+    [Theory]
+    [InlineData("release.yml", """
+        name: release event
+        on:
+          release:
+            types: [published]
+        jobs:
+          build:
+            steps:
+              - run: dotnet build
+        """)]
+    [InlineData("dispatch.yml", """
+        name: dispatch
+        on:
+          workflow_dispatch:
+            inputs:
+              publish:
+                required: false
+                type: boolean
+        jobs:
+          build:
+            steps:
+              - run: dotnet build
+        """)]
+    public void Publication_shaped_trigger_without_visible_push_is_reported_as_limited_unproven(string fileName, string workflow)
+    {
+        using var repository = WorkflowRepository.Create(fileName, workflow);
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        AssertLimitedUnproven(inspection);
+    }
+
+    [Fact]
+    public void Uninspectable_job_steps_are_reported_as_limited_unproven()
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", """
+            name: ci
+            on:
+              push:
+                branches: ["main"]
+            jobs:
+              build:
+                steps: ${{ inputs.steps }}
+            """);
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        AssertLimitedUnproven(inspection);
+    }
+
+    [Fact]
+    public void Unsupported_step_key_is_reported_as_limited_unproven()
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", """
+            name: ci
+            on:
+              push:
+                branches: ["main"]
+            jobs:
+              build:
+                steps:
+                  - run: dotnet build
+                    unsupported-key: true
+            """);
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        AssertLimitedUnproven(inspection);
+    }
+
+    [Fact]
+    public void Deterministic_release_violation_remains_fail_closed()
+    {
+        using var corpus = PackedCorpus.Create();
+        var package = corpus.Pack("Standard/Standard.csproj");
+        using var repository = WorkflowRepository.Create("release.yml", ReleaseWorkflow.Replace(
+            "id-token: write",
+            "contents: read",
+            StringComparison.Ordinal));
+
+        var report = CheckRunner.Run(
+            new NuGetReadyConfig
+            {
+                SchemaVersion = 1,
+                Packages =
+                [
+                    new PackageExpectation
+                    {
+                        Id = "Fixture.Standard",
+                        Kind = "library",
+                        Version = "1.0.0",
+                        Artifacts = [Path.GetFileName(package), Path.GetFileName(Path.ChangeExtension(package, ".snupkg"))]
+                    }
+                ]
+            },
+            corpus.OutputPath,
+            repository.Root.FullName,
+            TimeSpan.FromMinutes(2),
+            new ConsumerRehearsalOptions(PublicFeedPath: corpus.OutputPath));
+
+        Assert.Equal("fail", report.Status);
+        Assert.Equal(1, report.ExitCode);
+        Assert.Contains(report.Failures, failure => failure.Message.Contains("id-token", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]
@@ -741,6 +933,14 @@ public sealed class WorkflowPolicyTests
               - uses: NuGet/login@v1
               - run: dotnet nuget push artifacts/KeelMatrix.NuGetReady.1.0.0.nupkg
         """;
+
+    private static void AssertLimitedUnproven(WorkflowInspectionResult inspection)
+    {
+        Assert.True(
+            inspection.Evaluated,
+            $"EVALUATED={inspection.Evaluated}; FINDINGS={(inspection.Failures.Count == 0 ? "none" : string.Join(" | ", inspection.Failures.Select(failure => failure.Message)))}");
+        Assert.Contains(inspection.Failures, failure => failure.IsWarning && failure.Message.Contains("unproven", StringComparison.OrdinalIgnoreCase));
+    }
 }
 
 internal sealed class WorkflowRepository : IDisposable
@@ -758,6 +958,12 @@ internal sealed class WorkflowRepository : IDisposable
         var directory = Directory.CreateDirectory(Path.Combine(root.FullName, ".github", "workflows"));
         File.WriteAllText(Path.Combine(directory.FullName, fileName), content);
         return new WorkflowRepository(root);
+    }
+
+    public void WriteWorkflow(string fileName, string content)
+    {
+        var directory = Directory.CreateDirectory(Path.Combine(Root.FullName, ".github", "workflows"));
+        File.WriteAllText(Path.Combine(directory.FullName, fileName), content);
     }
 
     public void Dispose()
