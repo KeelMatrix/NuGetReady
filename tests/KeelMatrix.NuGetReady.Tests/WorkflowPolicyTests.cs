@@ -205,6 +205,74 @@ public sealed class WorkflowPolicyTests
     }
 
     [Fact]
+    public void Explicitly_empty_job_permissions_do_not_inherit_workflow_oidc_permission()
+    {
+        using var repository = WorkflowRepository.Create("release.yml", """
+            name: release
+            on:
+              push:
+                tags: ["v*.*.*"]
+            permissions:
+              id-token: write
+              contents: read
+            jobs:
+              publish:
+                permissions: {}
+                env:
+                  KEELMATRIX_NO_TELEMETRY: '1'
+                steps:
+                  - run: dotnet nugetready check --artifacts artifacts/packages
+                  - uses: NuGet/login@v1
+                  - run: dotnet nuget push artifacts/KeelMatrix.NuGetReady.1.0.0.nupkg
+            """);
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+        Assert.Contains(findings, finding => finding.Message.Contains("id-token", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void Authentication_after_publication_does_not_prove_the_publication_path()
+    {
+        using var repository = WorkflowRepository.Create("release.yml", """
+            name: release
+            on:
+              push:
+                tags: ["v*.*.*"]
+            permissions:
+              contents: read
+            jobs:
+              publish:
+                permissions:
+                  id-token: write
+                  contents: read
+                env:
+                  KEELMATRIX_NO_TELEMETRY: '1'
+                steps:
+                  - run: dotnet nugetready check --artifacts artifacts/packages
+                  - run: dotnet nuget push artifacts/KeelMatrix.NuGetReady.1.0.0.nupkg
+                  - uses: NuGet/login@v1
+            """);
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+        Assert.Contains(findings, finding => finding.Message.Contains("authentication", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void Conditional_authentication_does_not_prove_an_executed_authentication_step()
+    {
+        using var repository = WorkflowRepository.Create("release.yml", ReleaseWorkflow.Replace(
+            "- uses: NuGet/login@v1",
+            "- if: github.ref_type == 'tag'\n              uses: NuGet/login@v1",
+            StringComparison.Ordinal));
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+        Assert.Contains(findings, finding => finding.Message.Contains("authentication", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
     public void An_unconstrained_tag_pattern_is_not_a_version_gate()
     {
         using var repository = WorkflowRepository.Create("release.yml", ReleaseWorkflow.Replace("v*.*.*", "*", StringComparison.Ordinal));
@@ -225,6 +293,32 @@ public sealed class WorkflowPolicyTests
         var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
 
         Assert.Contains(findings, finding => finding.Message.Contains("branch", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void Branches_ignore_also_indicates_a_branch_trigger_when_tags_are_configured()
+    {
+        using var repository = WorkflowRepository.Create("release.yml", ReleaseWorkflow.Replace(
+            "tags: [\"v*.*.*\"]",
+            "tags: [\"v*.*.*\"]\n            branches-ignore: [\"main\"]",
+            StringComparison.Ordinal));
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+        Assert.Contains(findings, finding => finding.Message.Contains("branch", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void Tags_ignore_is_not_a_versioned_tag_gate()
+    {
+        using var repository = WorkflowRepository.Create("release.yml", ReleaseWorkflow.Replace(
+            "tags: [\"v*.*.*\"]",
+            "tags-ignore: [\"v0.*\"]",
+            StringComparison.Ordinal));
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+        Assert.Contains(findings, finding => finding.Message.Contains("versioned tag", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]
@@ -365,6 +459,21 @@ public sealed class WorkflowPolicyTests
         Assert.Contains(findings, finding => finding.Message.Contains("long-lived", StringComparison.OrdinalIgnoreCase));
     }
 
+    [Theory]
+    [InlineData("secrets['NUGET_API_KEY']")]
+    [InlineData("secrets[\"NUGET_API_KEY\"]")]
+    [InlineData("secrets[NUGET_API_KEY]")]
+    public void Bracket_secret_references_are_blocking(string secretReference)
+    {
+        using var repository = WorkflowRepository.Create(
+            "release.yml",
+            ReleaseWorkflow + "\n          - run: dotnet nuget push --api-key ${{ " + secretReference + " }}\n");
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+        Assert.Contains(findings, finding => finding.Message.Contains("long-lived", StringComparison.OrdinalIgnoreCase));
+    }
+
     [Fact]
     public void Broad_package_wildcard_is_reported_as_a_warning()
     {
@@ -475,6 +584,86 @@ public sealed class WorkflowPolicyTests
         var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
 
         Assert.Contains(findings, finding => finding.Message.Contains("telemetry", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void Job_telemetry_opt_out_overrides_workflow_opt_out_when_disabled()
+    {
+        using var repository = WorkflowRepository.Create("release.yml", """
+            name: release
+            on:
+              push:
+                tags: ["v*.*.*"]
+            env:
+              KEELMATRIX_NO_TELEMETRY: '1'
+            permissions:
+              contents: read
+            jobs:
+              publish:
+                permissions:
+                  id-token: write
+                  contents: read
+                env:
+                  KEELMATRIX_NO_TELEMETRY: '0'
+                steps:
+                  - run: dotnet nugetready check --artifacts artifacts/packages
+                  - uses: NuGet/login@v1
+                  - run: dotnet nuget push artifacts/KeelMatrix.NuGetReady.1.0.0.nupkg
+            """);
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+        Assert.Contains(findings, finding => finding.Message.Contains("telemetry", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void An_opt_out_confined_to_an_unrelated_step_does_not_suppress_release_telemetry()
+    {
+        using var repository = WorkflowRepository.Create("release.yml", """
+            name: release
+            on:
+              push:
+                tags: ["v*.*.*"]
+            permissions:
+              contents: read
+            jobs:
+              publish:
+                permissions:
+                  id-token: write
+                  contents: read
+                steps:
+                  - name: unrelated setup
+                    env:
+                      KEELMATRIX_NO_TELEMETRY: '1'
+                    run: echo setup
+                  - run: dotnet nugetready check --artifacts artifacts/packages
+                  - uses: NuGet/login@v1
+                  - run: dotnet nuget push artifacts/KeelMatrix.NuGetReady.1.0.0.nupkg
+            """);
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+        Assert.Contains(findings, finding => finding.Message.Contains("telemetry", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void Publish_named_reusable_workflow_is_reported_as_limited_unproven()
+    {
+        using var repository = WorkflowRepository.Create("publish.yml", """
+            name: publish
+            on:
+              push:
+                tags: ["v*.*.*"]
+            jobs:
+              publish:
+                uses: ./.github/workflows/reusable-publish.yml
+            """);
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+        var finding = Assert.Single(findings, finding => finding.IsWarning && finding.Message.Contains("unproven", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains("reusable", finding.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(findings, finding => finding.Message.Contains("does not contain an executable package publication step", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]

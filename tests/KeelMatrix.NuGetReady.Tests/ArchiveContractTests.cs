@@ -41,6 +41,51 @@ public sealed class ArchiveContractTests
     }
 
     [Fact]
+    public void Multi_package_archive_failures_identify_the_defective_configured_artifact_in_text_and_json()
+    {
+        using var fixture = PackageFixture.Create();
+        fixture.AddPackage("Example.Good.1.2.3.nupkg", "Example.Good", "1.2.3");
+        fixture.AddPackage("Example.Bad.1.2.3.nupkg", "Example.Bad", "1.2.3", includeReadme: false);
+        var config = new NuGetReadyConfig
+        {
+            SchemaVersion = 1,
+            Packages =
+            [
+                new()
+                {
+                    Id = "Example.Good",
+                    Kind = "library",
+                    Version = "1.2.3",
+                    Artifacts = ["Example.Good.1.2.3.nupkg"]
+                },
+                new()
+                {
+                    Id = "Example.Bad",
+                    Kind = "library",
+                    Version = "1.2.3",
+                    Artifacts = ["Example.Bad.1.2.3.nupkg"]
+                }
+            ]
+        };
+
+        var report = CheckRunner.Run(config, fixture.ArtifactsPath);
+        var text = ReportWriter.RenderText(report);
+        var json = ReportWriter.RenderJson(report);
+
+        Assert.Equal(1, report.ExitCode);
+        Assert.Contains("Example.Bad", text, StringComparison.Ordinal);
+        Assert.Contains("1.2.3", text, StringComparison.Ordinal);
+        Assert.Contains("Example.Bad.1.2.3.nupkg", text, StringComparison.Ordinal);
+        Assert.Contains("expectation 'Example.Bad'", text, StringComparison.Ordinal);
+        Assert.Contains("\"packageId\": \"Example.Bad\"", json, StringComparison.Ordinal);
+        Assert.Contains("\"packageVersion\": \"1.2.3\"", json, StringComparison.Ordinal);
+        Assert.Contains("\"artifactFileName\": \"Example.Bad.1.2.3.nupkg\"", json, StringComparison.Ordinal);
+        Assert.Contains("\"expectationName\": \"Example.Bad\"", json, StringComparison.Ordinal);
+        Assert.DoesNotContain(fixture.Root.FullName, text, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(fixture.Root.FullName, json, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public void Wrong_identity_or_version_is_reported()
     {
         using var fixture = PackageFixture.Create();
@@ -339,6 +384,11 @@ public sealed class ArchiveContractTests
         Assert.Equal("error", report.Status);
         Assert.Contains(report.Failures, failure => failure.CheckId == "archive-parse" && failure.IsError);
         Assert.Equal("error", report.Checks.Single(check => check.Id == "archive-parse").Status);
+        var parseFailure = Assert.Single(report.Failures, failure => failure.CheckId == "archive-parse");
+        Assert.Equal("Example.Core", parseFailure.PackageId);
+        Assert.Equal("1.2.3", parseFailure.PackageVersion);
+        Assert.Equal("Example.Core.1.2.3.nupkg", parseFailure.ArtifactFileName);
+        Assert.Equal("Example.Core", parseFailure.ExpectationName);
         Assert.All(
             report.Checks.Where(check => check.Id is "archive-metadata" or "archive-layout" or "dependency-groups" or "dependency-coherence" or "archive-security"),
             check => Assert.Equal("not-run", check.Status));

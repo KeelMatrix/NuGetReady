@@ -1,4 +1,5 @@
 using NuGet.Versioning;
+using System.Text.Json.Serialization;
 
 namespace KeelMatrix.NuGetReady;
 
@@ -66,7 +67,34 @@ internal static class PackageArtifacts
     }
 }
 
-internal sealed record Failure(string CheckId, string Message, bool IsError = false, bool IsWarning = false);
+internal sealed record Failure(string CheckId, string Message, bool IsError = false, bool IsWarning = false)
+{
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? PackageId { get; init; }
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? PackageVersion { get; init; }
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ArtifactFileName { get; init; }
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ExpectationName { get; init; }
+}
+
+internal static class FailureContext
+{
+    public static Failure ForArchive(Failure failure, PackageExpectation expectation, string artifactFileName)
+    {
+        return failure with
+        {
+            PackageId = expectation.Id,
+            PackageVersion = VersionText.Normalize(expectation.Version!),
+            ArtifactFileName = Path.GetFileName(artifactFileName),
+            ExpectationName = expectation.Id
+        };
+    }
+}
 
 internal static class CheckContract
 {
@@ -106,7 +134,13 @@ internal sealed class CheckResult
     public CheckResult(string id, IReadOnlyList<Failure> failures, string? state = null)
     {
         Id = id;
-        Failures = failures.OrderBy(failure => failure.Message, StringComparer.Ordinal).ToArray();
+        Failures = failures
+            .OrderBy(failure => failure.Message, StringComparer.Ordinal)
+            .ThenBy(failure => failure.PackageId, StringComparer.Ordinal)
+            .ThenBy(failure => failure.PackageVersion, StringComparer.Ordinal)
+            .ThenBy(failure => failure.ArtifactFileName, StringComparer.Ordinal)
+            .ThenBy(failure => failure.ExpectationName, StringComparer.Ordinal)
+            .ToArray();
         Status = state ?? (Failures.Any(failure => failure.IsError)
             ? CheckContract.Error
             : Failures.Any(failure => !failure.IsWarning)

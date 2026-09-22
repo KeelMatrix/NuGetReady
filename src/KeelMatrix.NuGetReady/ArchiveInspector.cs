@@ -13,7 +13,8 @@ internal static class ArchiveInspector
         string path,
         PackageExpectation expectation,
         bool symbols,
-        string? mainPackagePath = null)
+        string? mainPackagePath = null,
+        string? artifactFileName = null)
     {
         using var reader = new PackageArchiveReader(path);
         var nuspec = reader.NuspecReader;
@@ -31,7 +32,7 @@ internal static class ArchiveInspector
             CheckSymbols(reader, files, mainPackagePath, failures);
 
             CheckUnexpectedFiles(files, failures);
-            return failures;
+            return WithArtifactContext(failures, expectation, artifactFileName ?? Path.GetFileName(path));
         }
 
         if (string.IsNullOrWhiteSpace(nuspec.GetAuthors()))
@@ -81,7 +82,17 @@ internal static class ArchiveInspector
         CheckDependencyGroups(nuspec, files, failures);
         CheckLayout(reader, expectation, files, failures);
         CheckUnexpectedFiles(files, failures);
-        return failures;
+        return WithArtifactContext(failures, expectation, artifactFileName ?? Path.GetFileName(path));
+    }
+
+    private static Failure[] WithArtifactContext(
+        IReadOnlyList<Failure> failures,
+        PackageExpectation expectation,
+        string artifactFileName)
+    {
+        return failures
+            .Select(failure => FailureContext.ForArchive(failure, expectation, artifactFileName))
+            .ToArray();
     }
 
     private static void CheckIdentity(PackageIdentity identity, PackageExpectation expectation, List<Failure> failures)

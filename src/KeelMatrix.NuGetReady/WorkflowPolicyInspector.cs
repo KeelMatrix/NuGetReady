@@ -85,7 +85,9 @@ internal static class WorkflowPolicyInspector
     private static bool LooksLikeReleaseWorkflow(string path, WorkflowDocument workflow)
     {
         return Path.GetFileName(path).Contains("release", StringComparison.OrdinalIgnoreCase) ||
-               workflow.Jobs.Any(job => job.Steps.Any(IsPublishStep));
+               workflow.Jobs.Any(job =>
+                   job.Steps.Any(IsPublishStep) ||
+                   (!IsExplicitlyDisabled(job.Condition) && !string.IsNullOrWhiteSpace(job.Uses)));
     }
 
     private static void InspectWorkflow(string repositoryPath, WorkflowDocument workflow, List<Failure> failures)
@@ -109,7 +111,7 @@ internal static class WorkflowPolicyInspector
 
         foreach (var job in publishingJobs)
         {
-            var effectivePermissions = job.Permissions.Count == 0 ? workflow.Permissions : job.Permissions;
+            var effectivePermissions = job.PermissionsSpecified ? job.Permissions : workflow.Permissions;
             if (IsWriteAll(effectivePermissions) || HasOverbroadPublicationPermission(effectivePermissions))
             {
                 failures.Add(new Failure("workflow-policy", "Release workflow grants permissions broader than the OIDC publication path requires."));
@@ -120,9 +122,16 @@ internal static class WorkflowPolicyInspector
                 failures.Add(new Failure("workflow-policy", "Release workflow does not grant the required id-token write permission for Trusted Publishing in the publishing job."));
             }
 
-            if (!job.Steps.Any(IsTrustedPublishingStep))
+            var steps = job.Steps.ToArray();
+            var pushIndices = steps
+                .Select((step, index) => (step, index))
+                .Where(item => IsPublishStep(item.step))
+                .Select(item => item.index)
+                .ToArray();
+            var authenticationIndex = Array.FindIndex(steps, IsTrustedPublishingStep);
+            if (authenticationIndex < 0 || pushIndices.Any(index => authenticationIndex > index))
             {
-                failures.Add(new Failure("workflow-policy", "Release workflow does not execute Trusted Publishing authentication in the publishing job."));
+                failures.Add(new Failure("workflow-policy", "Release workflow does not execute Trusted Publishing authentication before publication in the publishing job."));
             }
 
             var conditionScope = GetPublicationConditionScope(job.Condition);
@@ -142,7 +151,6 @@ internal static class WorkflowPolicyInspector
                         : "Release workflow has a publication path that is not restricted to version tags."));
             }
 
-            var steps = job.Steps.ToArray();
             var pushIndex = Array.FindIndex(steps, IsPublishStep);
             var validationIndex = Array.FindIndex(steps, IsArtifactValidationStep);
             if (validationIndex < 0)
@@ -297,7 +305,7 @@ internal static class WorkflowPolicyInspector
 
     private static bool IsTrustedPublishingStep(WorkflowStep step)
     {
-        return !IsExplicitlyDisabled(step.Condition) &&
+        return IsDefinitelyEnabled(step.Condition) &&
                step.Uses?.Contains("nuget/login@", StringComparison.OrdinalIgnoreCase) == true;
     }
 
@@ -309,7 +317,10 @@ internal static class WorkflowPolicyInspector
 
     private static bool ContainsLongLivedCredential(string? run)
     {
-        return run is not null && Regex.IsMatch(run, @"secrets\s*\.\s*NUGET(?:_|-)?API(?:_|-)?KEY\b", RegexOptions.IgnoreCase);
+        return run is not null && Regex.IsMatch(
+            run,
+            @"secrets\s*(?:\.\s*NUGET(?:_|-)?API(?:_|-)?KEY\b|\[\s*['""]?\s*NUGET(?:_|-)?API(?:_|-)?KEY\s*['""]?\s*\])",
+            RegexOptions.IgnoreCase);
     }
 
     private static bool ContainsLongLivedCredential(IReadOnlyDictionary<string, string> environment)
@@ -472,7 +483,39 @@ internal static class WorkflowPolicyInspector
 
     private static bool HasTelemetrySuppression(WorkflowDocument workflow, WorkflowJob job)
     {
-        return HasTelemetrySuppression(workflow.Environment) || HasTelemetrySuppression(job.Environment) || job.Steps.Any(step => HasTelemetrySuppression(step.Environment));
+        var inheritedEnvironment = new Dictionary<string, string>(workflow.Environment, StringComparer.OrdinalIgnoreCase);
+        ApplyEnvironment(inheritedEnvironment, job.Environment);
+
+        var relevantSteps = job.Steps
+            .Where(IsTelemetryRelevantStep)
+            .ToArray();
+        if (relevantSteps.Length == 0)
+        {
+            return false;
+        }
+
+        return relevantSteps.All(step =>
+        {
+            var effectiveEnvironment = new Dictionary<string, string>(inheritedEnvironment, StringComparer.OrdinalIgnoreCase);
+            ApplyEnvironment(effectiveEnvironment, step.Environment);
+            return HasTelemetrySuppression(effectiveEnvironment);
+        });
+    }
+
+    private static bool IsTelemetryRelevantStep(WorkflowStep step)
+    {
+        return !IsExplicitlyDisabled(step.Condition) &&
+               (ContainsExecutableCommand(step.Run, "dotnet") ||
+                ContainsExecutableCommand(step.Run, "nugetready") ||
+                ContainsExecutableCommand(step.Run, "nuget"));
+    }
+
+    private static void ApplyEnvironment(Dictionary<string, string> destination, IReadOnlyDictionary<string, string> source)
+    {
+        foreach (var pair in source)
+        {
+            destination[pair.Key] = pair.Value;
+        }
     }
 
     private static bool HasTelemetrySuppression(IReadOnlyDictionary<string, string> environment)
@@ -488,6 +531,7 @@ internal static class WorkflowPolicyInspector
         public bool HasUnsupportedTagPattern { get; set; }
         public bool HasPushBranchTrigger { get; set; }
         public bool HasOtherTrigger { get; set; }
+        public bool PermissionsSpecified { get; set; }
         public Dictionary<string, string> Permissions { get; } = new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, string> Environment { get; } = new(StringComparer.OrdinalIgnoreCase);
         public List<WorkflowJob> Jobs { get; } = new();
@@ -499,6 +543,7 @@ internal static class WorkflowPolicyInspector
         public string Id { get; }
         public string? Uses { get; set; }
         public string? Condition { get; set; }
+        public bool PermissionsSpecified { get; set; }
         public HashSet<string> DependsOn { get; } = new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, string> Permissions { get; } = new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, string> Environment { get; } = new(StringComparer.OrdinalIgnoreCase);
@@ -578,6 +623,7 @@ internal static class WorkflowPolicyInspector
                     activeStepMap = false;
                     if (topKey.Equals("permissions", StringComparison.OrdinalIgnoreCase))
                     {
+                        workflow.PermissionsSpecified = true;
                         ParseInlineMap(topValue, workflow.Permissions);
                         if (string.IsNullOrWhiteSpace(topValue))
                         {
@@ -646,6 +692,16 @@ internal static class WorkflowPolicyInspector
                         activeTriggerOption = triggerOption;
                         workflow.HasPushBranchTrigger = true;
                     }
+                    else if (triggerOption.Equals("branches-ignore", StringComparison.OrdinalIgnoreCase))
+                    {
+                        activeTriggerOption = triggerOption;
+                        workflow.HasPushBranchTrigger = true;
+                    }
+                    else if (triggerOption.Equals("tags-ignore", StringComparison.OrdinalIgnoreCase))
+                    {
+                        activeTriggerOption = triggerOption;
+                        workflow.HasUnsupportedTagPattern = true;
+                    }
                     else
                     {
                         activeTriggerOption = null;
@@ -673,6 +729,7 @@ internal static class WorkflowPolicyInspector
                     activeStepMap = false;
                     if (jobKey.Equals("permissions", StringComparison.OrdinalIgnoreCase))
                     {
+                        currentJob.PermissionsSpecified = true;
                         ParseInlineMap(jobValue, currentJob.Permissions);
                         if (string.IsNullOrWhiteSpace(jobValue))
                         {
@@ -805,6 +862,14 @@ internal static class WorkflowPolicyInspector
                 else if (key.Equals("branches", StringComparison.OrdinalIgnoreCase))
                 {
                     workflow.HasPushBranchTrigger = true;
+                }
+                else if (key.Equals("branches-ignore", StringComparison.OrdinalIgnoreCase))
+                {
+                    workflow.HasPushBranchTrigger = true;
+                }
+                else if (key.Equals("tags-ignore", StringComparison.OrdinalIgnoreCase))
+                {
+                    workflow.HasUnsupportedTagPattern = true;
                 }
             }
         }

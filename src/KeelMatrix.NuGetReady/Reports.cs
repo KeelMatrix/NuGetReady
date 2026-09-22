@@ -41,7 +41,7 @@ internal static class ReportWriter
             lines.Add($"{check.Status.ToUpperInvariant()} {DisplayName(check.Id)}");
             foreach (var failure in check.Failures)
             {
-                lines.Add($"  {failure.Message}");
+                lines.Add($"  {FormatFailure(failure)}");
             }
         }
 
@@ -84,5 +84,17 @@ internal static class ReportWriter
             "consumer-rehearsal" => "consumer rehearsal",
             _ => checkId
         };
+    }
+
+    private static string FormatFailure(Failure failure)
+    {
+        if (failure.PackageId is null || failure.PackageVersion is null ||
+            failure.ArtifactFileName is null || failure.ExpectationName is null)
+        {
+            return failure.Message;
+        }
+
+        return $"Package '{failure.PackageId}' version '{failure.PackageVersion}' " +
+               $"(artifact '{failure.ArtifactFileName}', expectation '{failure.ExpectationName}'): {failure.Message}";
     }
 }

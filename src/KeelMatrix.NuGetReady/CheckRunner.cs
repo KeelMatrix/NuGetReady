@@ -113,7 +113,8 @@ internal static class CheckRunner
                     absolutePath,
                     package,
                     expected.EndsWith(".snupkg", StringComparison.OrdinalIgnoreCase),
-                    mainPackagePath);
+                    mainPackagePath,
+                    expected);
                 foreach (var failure in inspectionFailures)
                 {
                     failures[failure.CheckId].Add(failure);
@@ -121,11 +122,17 @@ internal static class CheckRunner
             }
             catch (NuGetReadyInputException exception)
             {
-                failures["archive-parse"].Add(new Failure("archive-parse", exception.Message, true));
+                failures["archive-parse"].Add(FailureContext.ForArchive(
+                    new Failure("archive-parse", exception.Message, true),
+                    package,
+                    expected));
             }
             catch (Exception)
             {
-                failures["archive-parse"].Add(new Failure("archive-parse", "A package archive could not be parsed as a NuGet archive.", true));
+                failures["archive-parse"].Add(FailureContext.ForArchive(
+                    new Failure("archive-parse", "A package archive could not be parsed as a NuGet archive.", true),
+                    package,
+                    expected));
             }
         }
 
@@ -340,6 +347,10 @@ internal static class CheckRunner
             .SelectMany(check => check.Failures)
             .OrderBy(failure => failure.CheckId, StringComparer.Ordinal)
             .ThenBy(failure => failure.Message, StringComparer.Ordinal)
+            .ThenBy(failure => failure.PackageId, StringComparer.Ordinal)
+            .ThenBy(failure => failure.PackageVersion, StringComparer.Ordinal)
+            .ThenBy(failure => failure.ArtifactFileName, StringComparer.Ordinal)
+            .ThenBy(failure => failure.ExpectationName, StringComparer.Ordinal)
             .ToArray();
         var hasError = allFailures.Any(failure => failure.IsError);
         var hasFailure = allFailures.Any(failure => !failure.IsWarning);
