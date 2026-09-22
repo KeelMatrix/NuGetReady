@@ -321,7 +321,7 @@ internal static class ConsumerRehearsal
             return Failure(package, "The isolated tool could not be installed from the controlled feed.", installOutcome.IsError, installOutcome.Diagnostic);
         }
 
-        var provenance = VerifyInstalledToolPackage(packagePath, toolPath);
+        var provenance = VerifyInstalledToolPackage(package, packagePath, toolPath);
         if (!provenance.Passed)
         {
             return Failure(package, "The isolated tool did not restore the exact supplied artifact.", provenance.IsError, provenance.Diagnostic);
@@ -418,6 +418,11 @@ internal static class ConsumerRehearsal
         if (result.TimedOut && !result.CleanupConfirmed)
         {
             return new TargetRehearsalOutcome(false, true, "The bounded child process timed out and its process-group cleanup could not be confirmed.");
+        }
+
+        if (result.Started && !result.TimedOut && result.ExitCode == 0 && !result.CleanupConfirmed)
+        {
+            return new TargetRehearsalOutcome(false, true, "The bounded child process completed successfully, but its process-group cleanup could not be confirmed.");
         }
 
         if (Succeeded(result) && !HasUnusableAssetDiagnostic(result))
@@ -681,41 +686,67 @@ internal static class ConsumerRehearsal
         IReadOnlyDictionary<string, string?> environment,
         string? installedToolPath = null)
     {
-        string? packageDirectory;
-        if (installedToolPath is not null)
-        {
-            var version = VersionText.Normalize(package.Version!);
-            packageDirectory = Directory.EnumerateDirectories(installedToolPath, version, SearchOption.AllDirectories)
-                .FirstOrDefault(path => Directory.EnumerateFiles(path, "*.nuspec", SearchOption.TopDirectoryOnly).Any());
-        }
-        else
-        {
-            if (!environment.TryGetValue("NUGET_PACKAGES", out var cachePath) || string.IsNullOrWhiteSpace(cachePath))
-            {
-                return new TargetRehearsalOutcome(false, true, "The isolated package cache was not configured.");
-            }
-
-            var version = VersionText.Normalize(package.Version!);
-            packageDirectory = Directory.EnumerateDirectories(cachePath)
-                .FirstOrDefault(path => string.Equals(Path.GetFileName(path), package.Id, StringComparison.OrdinalIgnoreCase));
-            packageDirectory = packageDirectory is null
-                ? null
-                : Directory.EnumerateDirectories(packageDirectory)
-                    .FirstOrDefault(path => string.Equals(Path.GetFileName(path), version, StringComparison.OrdinalIgnoreCase));
-        }
-
-        if (packageDirectory is null)
-        {
-            return new TargetRehearsalOutcome(false, true, installedToolPath is null
-                ? "The isolated package cache did not contain the restored package."
-                : "The installed tool store did not contain the restored package.");
-        }
-
         try
         {
+            using var reader = new PackageArchiveReader(packagePath);
+            var expectedIdentity = reader.GetIdentity();
+            var expectedVersion = VersionText.Normalize(package.Version!);
+            if (!expectedIdentity.Id.Equals(package.Id, StringComparison.OrdinalIgnoreCase) ||
+                !string.Equals(expectedIdentity.Version.ToNormalizedString(), expectedVersion, StringComparison.OrdinalIgnoreCase))
+            {
+                return new TargetRehearsalOutcome(false, false, "The supplied package identity did not match the configured package expectation.");
+            }
+
+            string? packageDirectory;
+            if (installedToolPath is not null)
+            {
+                packageDirectory = Directory.EnumerateDirectories(installedToolPath, expectedVersion, SearchOption.AllDirectories)
+                    .Where(path => Directory.EnumerateFiles(path, "*.nuspec", SearchOption.TopDirectoryOnly).Any())
+                    .SingleOrDefault();
+            }
+            else
+            {
+                if (!environment.TryGetValue("NUGET_PACKAGES", out var cachePath) || string.IsNullOrWhiteSpace(cachePath))
+                {
+                    return new TargetRehearsalOutcome(false, true, "The isolated package cache was not configured.");
+                }
+
+                packageDirectory = Directory.EnumerateDirectories(cachePath)
+                    .FirstOrDefault(path => string.Equals(Path.GetFileName(path), package.Id, StringComparison.OrdinalIgnoreCase));
+                packageDirectory = packageDirectory is null
+                    ? null
+                    : Directory.EnumerateDirectories(packageDirectory)
+                        .FirstOrDefault(path => string.Equals(Path.GetFileName(path), expectedVersion, StringComparison.OrdinalIgnoreCase));
+            }
+
+            if (packageDirectory is null)
+            {
+                return new TargetRehearsalOutcome(false, true, installedToolPath is null
+                    ? "The isolated package cache did not contain the restored package."
+                    : "The installed tool store did not contain the restored package.");
+            }
+
+            if (installedToolPath is not null)
+            {
+                var toolAssetRoots = ReadToolAssetRoots(reader);
+                if (toolAssetRoots.Length == 0)
+                {
+                    return new TargetRehearsalOutcome(false, false, "The installed tool uses an unsupported layout; expected at least one tools/<tfm>/any asset root, so exact-artifact verification is unproven.");
+                }
+
+                if (!toolAssetRoots.Any(root => Directory.Exists(Path.Combine(packageDirectory, root.Replace('/', Path.DirectorySeparatorChar)))))
+                {
+                    return new TargetRehearsalOutcome(false, false, "The installed tool uses an unsupported framework layout; no supplied tools/<tfm>/any asset root was selected, so exact-artifact verification is unproven.");
+                }
+            }
+
             var expectedHash = Convert.ToBase64String(System.Security.Cryptography.SHA512.HashData(File.ReadAllBytes(packagePath)));
             var cachedArchives = Directory.EnumerateFiles(packageDirectory, "*", SearchOption.TopDirectoryOnly)
                 .Where(path => string.Equals(Path.GetExtension(path), ".nupkg", StringComparison.OrdinalIgnoreCase))
+                .Where(path => installedToolPath is null || string.Equals(
+                    Path.GetFileName(path),
+                    $"{package.Id}.{expectedVersion}.nupkg",
+                    StringComparison.OrdinalIgnoreCase))
                 .OrderBy(path => path, StringComparer.Ordinal)
                 .ToArray();
             if (cachedArchives.Length != 1)
@@ -736,22 +767,38 @@ internal static class ConsumerRehearsal
             }
 
             var actualHash = File.ReadAllText(hashPath).Trim();
-            if (!string.Equals(actualHash, expectedHash, StringComparison.Ordinal) &&
-                !string.Equals(actualHash, $"sha512-{expectedHash}", StringComparison.Ordinal))
+            var expectedToolStoreHash = installedToolPath is null ? null : ReadNuspecHash(reader);
+            if (!HashSidecarMatches(actualHash, expectedHash) &&
+                !HashSidecarMatches(actualHash, expectedToolStoreHash))
             {
                 return new TargetRehearsalOutcome(false, false, "The restored package hash did not match the supplied artifact.");
             }
 
-            using var reader = new PackageArchiveReader(packagePath);
-            foreach (var file in reader.GetFiles().Select(NormalizeArchivePath))
+            using (var cachedReader = new PackageArchiveReader(cachedArchives[0]))
             {
-                if (file.StartsWith("_rels/", StringComparison.OrdinalIgnoreCase) ||
-                    file.Equals("[Content_Types].xml", StringComparison.OrdinalIgnoreCase) ||
-                    file.StartsWith("package/services/", StringComparison.OrdinalIgnoreCase))
+                var cachedIdentity = cachedReader.GetIdentity();
+                if (!cachedIdentity.Id.Equals(expectedIdentity.Id, StringComparison.OrdinalIgnoreCase) ||
+                    !string.Equals(cachedIdentity.Version.ToNormalizedString(), expectedIdentity.Version.ToNormalizedString(), StringComparison.OrdinalIgnoreCase))
                 {
-                    continue;
+                    return new TargetRehearsalOutcome(false, false, "The restored package identity did not match the supplied artifact.");
                 }
+            }
 
+            var expectedPayload = reader.GetFiles()
+                .Select(NormalizeArchivePath)
+                .Where(file => !IsGeneratedPackageEntry(file))
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var restoredPayload = Directory.EnumerateFiles(packageDirectory, "*", SearchOption.AllDirectories)
+                .Select(path => NormalizeArchivePath(Path.GetRelativePath(packageDirectory, path)))
+                .Where(file => !IsGeneratedToolStoreFile(file))
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            if (!expectedPayload.SetEquals(restoredPayload))
+            {
+                return new TargetRehearsalOutcome(false, false, "The restored package contents did not match the supplied artifact.");
+            }
+
+            foreach (var file in expectedPayload)
+            {
                 var restoredFile = FindRestoredFile(packageDirectory, file);
                 if (restoredFile is null)
                 {
@@ -792,49 +839,60 @@ internal static class ConsumerRehearsal
         return matches.Length == 1 ? matches[0] : null;
     }
 
-    private static TargetRehearsalOutcome VerifyInstalledToolPackage(string packagePath, string toolPath)
+    private static TargetRehearsalOutcome VerifyInstalledToolPackage(PackageExpectation package, string packagePath, string toolPath)
     {
-        try
-        {
-            using var reader = new PackageArchiveReader(packagePath);
-            var toolFiles = reader.GetFiles()
-                .Select(NormalizeArchivePath)
-                .Where(file => file.StartsWith("tools/net8.0/any/", StringComparison.OrdinalIgnoreCase) &&
-                               file.EndsWith(".dll", StringComparison.OrdinalIgnoreCase))
-                .ToArray();
-            foreach (var toolFile in toolFiles)
-            {
-                var installedFile = Directory.EnumerateFiles(toolPath, Path.GetFileName(toolFile), SearchOption.AllDirectories)
-                    .FirstOrDefault(candidate =>
-                    {
-                        var normalized = candidate.Replace('\\', '/');
-                        var marker = normalized.IndexOf("/tools/net8.0/any/", StringComparison.OrdinalIgnoreCase);
-                        return marker >= 0 && normalized[(marker + 1)..].Equals(toolFile, StringComparison.OrdinalIgnoreCase);
-                    });
-                if (!File.Exists(installedFile))
-                {
-                    return new TargetRehearsalOutcome(false, true, "The installed tool did not contain an artifact asset from the supplied package.");
-                }
+        return VerifyRestoredPackage(package, packagePath, new Dictionary<string, string?>(), toolPath);
+    }
 
-                using var source = reader.GetStream(toolFile);
-                using var expected = new MemoryStream();
-                source.CopyTo(expected);
-                if (!expected.ToArray().AsSpan().SequenceEqual(File.ReadAllBytes(installedFile)))
-                {
-                    return new TargetRehearsalOutcome(false, false, "The installed tool asset did not match the supplied artifact.");
-                }
-            }
+    private static string[] ReadToolAssetRoots(PackageArchiveReader reader)
+    {
+        return reader.GetFiles()
+            .Select(NormalizeArchivePath)
+            .Select(path => (Path: path, Parts: path.Split('/')))
+            .Where(item => item.Parts.Length >= 4 &&
+                           item.Parts[0].Equals("tools", StringComparison.OrdinalIgnoreCase) &&
+                           !string.IsNullOrWhiteSpace(item.Parts[1]) &&
+                           item.Parts[2].Equals("any", StringComparison.OrdinalIgnoreCase))
+            .Select(item => $"tools/{item.Parts[1]}/any")
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(path => path, StringComparer.Ordinal)
+            .ToArray();
+    }
 
-            return new TargetRehearsalOutcome(true, false, string.Empty);
-        }
-        catch (IOException)
+    private static string? ReadNuspecHash(PackageArchiveReader reader)
+    {
+        var nuspec = reader.GetFiles()
+            .Select(NormalizeArchivePath)
+            .SingleOrDefault(file => file.EndsWith(".nuspec", StringComparison.OrdinalIgnoreCase));
+        if (nuspec is null)
         {
-            return new TargetRehearsalOutcome(false, true, "The installed tool could not be checked against the supplied artifact.");
+            return null;
         }
-        catch (UnauthorizedAccessException)
-        {
-            return new TargetRehearsalOutcome(false, true, "The installed tool could not be checked against the supplied artifact.");
-        }
+
+        using var stream = reader.GetStream(nuspec);
+        return Convert.ToBase64String(System.Security.Cryptography.SHA512.HashData(stream));
+    }
+
+    private static bool HashSidecarMatches(string actualHash, string? expectedHash)
+    {
+        return expectedHash is not null &&
+               (string.Equals(actualHash, expectedHash, StringComparison.Ordinal) ||
+                string.Equals(actualHash, $"sha512-{expectedHash}", StringComparison.Ordinal));
+    }
+
+    private static bool IsGeneratedPackageEntry(string file)
+    {
+        return file.StartsWith("_rels/", StringComparison.OrdinalIgnoreCase) ||
+               file.Equals("[Content_Types].xml", StringComparison.OrdinalIgnoreCase) ||
+               file.StartsWith("package/services/", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsGeneratedToolStoreFile(string file)
+    {
+        return file.EndsWith(".nupkg", StringComparison.OrdinalIgnoreCase) ||
+               file.EndsWith(".nupkg.sha512", StringComparison.OrdinalIgnoreCase) ||
+               file.Equals(".nupkg.metadata", StringComparison.OrdinalIgnoreCase);
     }
 
     private static string Combine(ProcessResult result)

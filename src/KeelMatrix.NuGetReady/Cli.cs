@@ -71,9 +71,9 @@ internal static partial class CliParser
 
         Check statuses are pass, warn, fail, error, not-run, and not-applicable.
         Each package expects exactly one primary .nupkg and at most one associated .snupkg; duplicate primary identities fail closed.
-        Consumer provenance checks the package-version cache's .nupkg/.nupkg.sha512 and expanded payload, including XML documentation.
+        Consumer provenance checks the library package cache or installed tool store's versioned .nupkg/.nupkg.sha512, package identity, and expanded payload, including XML documentation; tool asset roots are derived from tools/<tfm>/any and unsupported layouts are unproven.
         Unsupported reusable workflow and composite publication paths are reported as limited warnings, never as publication proof.
-        Unix child processes run in a dedicated process group with bounded descendant cleanup after timeout or cancellation.
+        Unix child processes run in a dedicated process group with bounded descendant cleanup and verification on successful completion, timeout, and cancellation.
         """.TrimEnd();
 
     private static string ReadValue(IReadOnlyList<string> args, ref int index, string option, OutputFormat format)

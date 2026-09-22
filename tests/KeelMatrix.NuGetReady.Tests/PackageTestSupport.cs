@@ -212,6 +212,24 @@ internal static class ArchiveMutator
         });
     }
 
+    public static string ReplaceEntryPaths(string packagePath, Func<string, string> replacement, string? outputName = null)
+    {
+        var outputPath = Path.Combine(Path.GetDirectoryName(packagePath)!, outputName ?? Path.GetFileNameWithoutExtension(packagePath) + ".renamed.nupkg");
+        using (var input = ZipFile.OpenRead(packagePath))
+        using (var output = ZipFile.Open(outputPath, ZipArchiveMode.Create))
+        {
+            foreach (var entry in input.Entries)
+            {
+                var destination = output.CreateEntry(replacement(entry.FullName), CompressionLevel.NoCompression);
+                using var destinationStream = destination.Open();
+                using var sourceStream = entry.Open();
+                sourceStream.CopyTo(destinationStream);
+            }
+        }
+
+        return outputPath;
+    }
+
     private static string ReplaceEntries(
         string packagePath,
         string? outputName,

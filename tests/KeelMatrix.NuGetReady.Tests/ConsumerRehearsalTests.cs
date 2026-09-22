@@ -40,6 +40,107 @@ public sealed class ConsumerRehearsalTests
     }
 
     [Fact]
+    public void Tool_install_requires_the_package_provenance_sidecar()
+    {
+        using var corpus = PackedCorpus.Create();
+        var package = corpus.Pack("Tool/Tool.csproj");
+        var config = Config(new PackageExpectation
+        {
+            Id = "Fixture.Tool",
+            Kind = "dotnetTool",
+            Version = "1.0.0",
+            Artifacts = Artifacts(package),
+            Command = "fixture-tool",
+            Smoke = new List<string> { "--help" }
+        });
+
+        var outcomes = ConsumerRehearsal.RunDetailed(
+            config,
+            corpus.OutputPath,
+            TimeSpan.FromMinutes(2),
+            new ConsumerRehearsalOptions(
+                PublicFeedPath: Directory.CreateDirectory(Path.Combine(corpus.Root.FullName, "empty-public-feed")).FullName,
+                ProcessRunner: AfterToolInstall((workingDirectory, packageDirectory, _) =>
+                {
+                    File.Delete(Directory.EnumerateFiles(packageDirectory, "*.nupkg.sha512", SearchOption.TopDirectoryOnly).Single());
+                })));
+
+        Assert.Single(outcomes);
+        Assert.NotEqual("pass", outcomes[0].Result.Status);
+        Assert.Contains("provenance sidecar", outcomes[0].Result.Message + outcomes[0].Diagnostic, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Tool_install_rejects_changed_non_dll_payload_even_when_the_smoke_command_still_succeeds()
+    {
+        using var corpus = PackedCorpus.Create();
+        var package = corpus.Pack("Tool/Tool.csproj");
+        var config = Config(new PackageExpectation
+        {
+            Id = "Fixture.Tool",
+            Kind = "dotnetTool",
+            Version = "1.0.0",
+            Artifacts = Artifacts(package),
+            Command = "fixture-tool",
+            Smoke = new List<string> { "--help" }
+        });
+
+        var outcomes = ConsumerRehearsal.RunDetailed(
+            config,
+            corpus.OutputPath,
+            TimeSpan.FromMinutes(2),
+            new ConsumerRehearsalOptions(
+                PublicFeedPath: Directory.CreateDirectory(Path.Combine(corpus.Root.FullName, "empty-public-feed")).FullName,
+                ProcessRunner: AfterToolInstall((workingDirectory, packageDirectory, environment) =>
+                {
+                    var executable = Path.Combine(workingDirectory, "tool", OperatingSystem.IsWindows() ? "fixture-tool.exe" : "fixture-tool");
+                    var smoke = BoundedProcess.RunAsync(executable, ["--help"], workingDirectory, environment, TimeSpan.FromMinutes(1)).GetAwaiter().GetResult();
+                    Assert.True(smoke.Started && !smoke.TimedOut && smoke.ExitCode == 0, $"The mutated tool smoke command did not succeed: {smoke.StandardError}");
+                    var runtimeConfig = Directory.EnumerateFiles(packageDirectory, "*.runtimeconfig.json", SearchOption.AllDirectories).Single();
+                    File.AppendAllText(runtimeConfig, Environment.NewLine);
+                })));
+
+        Assert.Single(outcomes);
+        Assert.NotEqual("pass", outcomes[0].Result.Status);
+        Assert.True(
+            (outcomes[0].Result.Message + outcomes[0].Diagnostic).Contains("contents", StringComparison.OrdinalIgnoreCase),
+            outcomes[0].Result.Message + " " + outcomes[0].Diagnostic);
+    }
+
+    [Fact]
+    public void Tool_install_derives_a_non_net8_asset_layout_from_the_package()
+    {
+        using var corpus = PackedCorpus.Create();
+        var package = corpus.Pack("Tool/Tool.csproj");
+        var nonNet8Package = ArchiveMutator.ReplaceEntryPaths(
+            package,
+            path => path.Replace("tools/net8.0/any/", "tools/net7.0/any/", StringComparison.OrdinalIgnoreCase),
+            "Fixture.Tool.non-net8.nupkg");
+        var nonNet8Artifacts = Directory.CreateDirectory(Path.Combine(corpus.Root.FullName, "non-net8-artifacts"));
+        var nonNet8Artifact = Path.Combine(nonNet8Artifacts.FullName, "Fixture.Tool.1.0.0.nupkg");
+        File.Copy(nonNet8Package, nonNet8Artifact);
+        var config = Config(new PackageExpectation
+        {
+            Id = "Fixture.Tool",
+            Kind = "dotnetTool",
+            Version = "1.0.0",
+            Artifacts = Artifacts(nonNet8Artifact),
+            Command = "fixture-tool",
+            Smoke = new List<string> { "--help" }
+        });
+
+        var outcomes = ConsumerRehearsal.RunDetailed(
+            config,
+            nonNet8Artifacts.FullName,
+            TimeSpan.FromMinutes(2),
+            new ConsumerRehearsalOptions(
+                PublicFeedPath: Directory.CreateDirectory(Path.Combine(corpus.Root.FullName, "empty-public-feed")).FullName));
+
+        Assert.Single(outcomes);
+        Assert.True(outcomes[0].Result.Status == "pass", outcomes[0].Result.Message + " " + outcomes[0].Diagnostic);
+    }
+
+    [Fact]
     public void Duplicate_primary_archives_for_one_identity_never_pass_consumer_rehearsal()
     {
         using var corpus = PackedCorpus.Create();
@@ -336,9 +437,10 @@ public sealed class ConsumerRehearsalTests
             TimeSpan timeout) => Task.FromResult(new ProcessResult(
                 Started: true,
                 ExitCode: 0,
-                TimedOut: false,
-                StandardOutput: string.Empty,
-                StandardError: "warning MSB3246: bad image in C:\\Users\\test user\\NuGetReady\\bad.dll; metadata is invalid"));
+            TimedOut: false,
+            StandardOutput: string.Empty,
+            StandardError: "warning MSB3246: bad image in C:\\Users\\test user\\NuGetReady\\bad.dll; metadata is invalid",
+            CleanupConfirmed: true));
 
         var report = CheckRunner.Run(
             config,
@@ -451,9 +553,10 @@ public sealed class ConsumerRehearsalTests
             TimeSpan timeout) => Task.FromResult(new ProcessResult(
                 Started: true,
                 ExitCode: 1,
-                TimedOut: false,
-                StandardOutput: string.Empty,
-                StandardError: "Authorization: Bearer super-secret elapsed 17ms"));
+            TimedOut: false,
+            StandardOutput: string.Empty,
+            StandardError: "Authorization: Bearer super-secret elapsed 17ms",
+            CleanupConfirmed: true));
 
         var first = ConsumerRehearsal.RunDetailed(
             config,
@@ -632,6 +735,23 @@ public sealed class ConsumerRehearsalTests
                     .Single(path => !path.EndsWith(".snupkg", StringComparison.OrdinalIgnoreCase));
                 Assert.True(File.Exists(cachedArchive + ".sha512"), "The restore harness did not produce the package-specific provenance sidecar.");
                 mutateCache(packageCache, cachedArchive);
+            }
+
+            return result;
+        };
+    }
+
+    private static ConsumerProcessRunner AfterToolInstall(Action<string, string, IReadOnlyDictionary<string, string?>> mutateTool)
+    {
+        return async (fileName, arguments, workingDirectory, environment, timeout) =>
+        {
+            var result = await BoundedProcess.RunAsync(fileName, arguments, workingDirectory, environment, timeout);
+            if (arguments.Count > 1 && arguments[0].Equals("tool", StringComparison.OrdinalIgnoreCase) && arguments[1].Equals("install", StringComparison.OrdinalIgnoreCase))
+            {
+                var toolRoot = Path.Combine(workingDirectory, "tool");
+                var packageDirectory = Directory.EnumerateDirectories(toolRoot, "1.0.0", SearchOption.AllDirectories)
+                    .Single(path => Directory.EnumerateFiles(path, "*.nuspec", SearchOption.TopDirectoryOnly).Any());
+                mutateTool(workingDirectory, packageDirectory, environment);
             }
 
             return result;

@@ -73,7 +73,7 @@ public sealed class PackageInspectionContractTests
     }
 
     [Fact]
-    public async Task Package_inspection_accepts_a_manifest_exempt_tool_payload_assembly()
+    public async Task Package_inspection_rejects_a_manifest_exempt_tool_payload_assembly_as_unexpected()
     {
         using var fixture = PackageFixture.Create();
         var package = CreateArchive(
@@ -102,7 +102,46 @@ public sealed class PackageInspectionContractTests
             TimeSpan.FromSeconds(30));
 
         Assert.True(result.Started, result.StandardError);
-        Assert.Equal(0, result.ExitCode);
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("Unexpected package entries", result.StandardError, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData(false, "tools/net8.0/any/Unexpected.dll")]
+    [InlineData(false, "tools/net8.0/any/Unexpected.xml")]
+    [InlineData(true, "tools/net8.0/any/Unexpected.dll")]
+    [InlineData(true, "tools/net8.0/any/Unexpected.xml")]
+    public async Task Package_inspection_rejects_unexpected_binary_and_xml_entries_in_both_archive_types(bool symbolsArchive, string unexpectedEntry)
+    {
+        using var fixture = PackageFixture.Create();
+        var package = CreateArchive(
+            Path.Combine(fixture.ArtifactsPath, "KeelMatrix.NuGetReady.0.1.0.nupkg"),
+            symbols: false,
+            extraEntry: symbolsArchive ? null : unexpectedEntry);
+        var symbols = CreateArchive(
+            Path.Combine(fixture.ArtifactsPath, "KeelMatrix.NuGetReady.0.1.0.snupkg"),
+            symbols: true,
+            extraEntry: symbolsArchive ? unexpectedEntry : null);
+        var script = FindRepositoryFile("scripts", "inspect-package.ps1");
+
+        var result = await BoundedProcess.RunAsync(
+            "pwsh",
+            [
+                "-NoProfile",
+                "-File",
+                script,
+                "-PackagePath",
+                package,
+                "-SymbolsPackagePath",
+                symbols
+            ],
+            fixture.Root.FullName,
+            new Dictionary<string, string?> { ["DOTNET_CLI_TELEMETRY_OPTOUT"] = "1" },
+            TimeSpan.FromSeconds(30));
+
+        Assert.True(result.Started, result.StandardError);
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("Unexpected package entries", result.StandardError, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -269,14 +308,15 @@ public sealed class PackageInspectionContractTests
             AddBytes(archive, "tools/net8.0/any/KeelMatrix.NuGetReady.dll", new byte[] { 1 });
             AddBytes(archive, "tools/net8.0/any/KeelMatrix.Telemetry.dll", new byte[] { 1 });
             AddBytes(archive, "tools/net8.0/any/DotnetToolSettings.xml", new byte[] { 1 });
-            foreach (var extraEntry in extraEntries)
-            {
-                AddBytes(archive, extraEntry, new byte[] { 1 });
-            }
         }
         else
         {
             AddBytes(archive, "tools/net8.0/any/KeelMatrix.NuGetReady.pdb", new byte[] { 1 });
+        }
+
+        foreach (var extraEntry in extraEntries)
+        {
+            AddBytes(archive, extraEntry, new byte[] { 1 });
         }
 
         return path;

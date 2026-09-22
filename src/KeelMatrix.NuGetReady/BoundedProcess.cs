@@ -98,7 +98,7 @@ internal static class BoundedProcess
         using var lifecycleCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         try
         {
-            var cleanupConfirmed = true;
+            var cleanupConfirmed = false;
             var standardOutput = CaptureAsync(process.StandardOutput, outputLimit, lifecycleCancellation.Token);
             var standardError = CaptureAsync(process.StandardError, outputLimit, lifecycleCancellation.Token);
             var waitForExit = process.WaitForExitAsync(CancellationToken.None);
@@ -109,7 +109,7 @@ internal static class BoundedProcess
 
             if (completed == cancellationTask)
             {
-                _ = Terminate(process, processJob, useUnixProcessGroup);
+                cleanupConfirmed = Terminate(process, processJob, useUnixProcessGroup);
                 await DrainAfterTerminationAsync(completeLifecycle, lifecycleCancellation).ConfigureAwait(false);
                 cancellationToken.ThrowIfCancellationRequested();
             }
@@ -119,6 +119,11 @@ internal static class BoundedProcess
             {
                 cleanupConfirmed = Terminate(process, processJob, useUnixProcessGroup);
                 await DrainAfterTerminationAsync(completeLifecycle, lifecycleCancellation).ConfigureAwait(false);
+            }
+
+            if (!timedOut && completed == completeLifecycle)
+            {
+                cleanupConfirmed = Terminate(process, processJob, useUnixProcessGroup);
             }
 
             if (completeLifecycle.IsCompletedSuccessfully)

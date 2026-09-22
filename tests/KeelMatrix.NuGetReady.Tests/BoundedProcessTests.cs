@@ -48,6 +48,47 @@ public sealed class BoundedProcessTests
         }
     }
 
+    [Fact]
+    public async Task Successful_parent_exit_with_redirected_descendant_is_cleaned_up()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        var pidFile = Path.Combine(Path.GetTempPath(), $"nugetready-success-pids-{Guid.NewGuid():N}.txt");
+        try
+        {
+            var result = await BoundedProcess.RunAsync(
+                "sh",
+                ["-c", "sleep 30 >/dev/null 2>&1 & child=$!; printf '%s\\n' \"$child\" > \"$1\"; exit 0", "nugetready-test", pidFile],
+                Environment.CurrentDirectory,
+                new Dictionary<string, string?>(),
+                TimeSpan.FromSeconds(2));
+
+            Assert.False(result.TimedOut);
+            Assert.Equal(0, result.ExitCode);
+            Assert.True(result.CleanupConfirmed);
+
+            var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(2);
+            while (!File.Exists(pidFile) && DateTime.UtcNow < deadline)
+            {
+                await Task.Delay(25);
+            }
+
+            Assert.True(File.Exists(pidFile), "The successful shell did not record its descendant PID.");
+            var pid = int.Parse(File.ReadAllText(pidFile).Trim(), System.Globalization.CultureInfo.InvariantCulture);
+            Assert.True(WaitForExit(pid), $"Unix descendant PID {pid} survived successful-completion cleanup.");
+        }
+        finally
+        {
+            if (File.Exists(pidFile))
+            {
+                File.Delete(pidFile);
+            }
+        }
+    }
+
     private static (string FileName, IReadOnlyList<string> Arguments, string? PidFile) CreatePipeHoldingProcess()
     {
         if (OperatingSystem.IsWindows())
