@@ -84,10 +84,44 @@ internal static class WorkflowPolicyInspector
 
     private static bool LooksLikeReleaseWorkflow(string path, WorkflowDocument workflow)
     {
-        return Path.GetFileName(path).Contains("release", StringComparison.OrdinalIgnoreCase) ||
-               workflow.Jobs.Any(job =>
-                   job.Steps.Any(IsPublishStep) ||
-                   (!IsExplicitlyDisabled(job.Condition) && !string.IsNullOrWhiteSpace(job.Uses)));
+        if (workflow.Jobs.Any(job => job.Steps.Any(IsPublishStep)))
+        {
+            return true;
+        }
+
+        return workflow.Jobs.Any(job => IsReleaseLikePublicationJob(path, workflow, job));
+    }
+
+    private static bool IsReleaseLikePublicationJob(string path, WorkflowDocument workflow, WorkflowJob job)
+    {
+        if (IsExplicitlyDisabled(job.Condition))
+        {
+            return false;
+        }
+
+        var hasReusableTarget = !string.IsNullOrWhiteSpace(job.Uses);
+        var hasCompositeTarget = job.Steps.Any(step =>
+            !IsExplicitlyDisabled(step.Condition) && IsLocalActionReference(step.Uses));
+        if (!hasReusableTarget && !hasCompositeTarget)
+        {
+            return false;
+        }
+
+        return HasReleasePublicationSignal(Path.GetFileNameWithoutExtension(path)) ||
+               HasReleasePublicationSignal(workflow.Name) ||
+               HasReleasePublicationSignal(job.Id) ||
+               HasReleasePublicationSignal(job.Uses) ||
+               job.Steps.Any(step => HasReleasePublicationSignal(step.Name) ||
+                                     HasReleasePublicationSignal(step.Uses) ||
+                                     HasReleasePublicationSignal(step.Run));
+    }
+
+    private static bool HasReleasePublicationSignal(string? value)
+    {
+        return value is not null && Regex.IsMatch(
+            value,
+            @"(?:^|[-_./\s])(?:release|publish|publishing|nuget|deploy)(?:$|[-_./\s])",
+            RegexOptions.IgnoreCase);
     }
 
     private static void InspectWorkflow(string repositoryPath, WorkflowDocument workflow, List<Failure> failures)
@@ -527,6 +561,7 @@ internal static class WorkflowPolicyInspector
 
     private sealed class WorkflowDocument
     {
+        public string? Name { get; set; }
         public bool HasVersionedTagTrigger { get; set; }
         public bool HasUnsupportedTagPattern { get; set; }
         public bool HasPushBranchTrigger { get; set; }
@@ -630,6 +665,10 @@ internal static class WorkflowPolicyInspector
                             activeMap = workflow.Permissions;
                             activeMapIndent = indent;
                         }
+                    }
+                    else if (topKey.Equals("name", StringComparison.OrdinalIgnoreCase))
+                    {
+                        workflow.Name = Unquote(topValue);
                     }
                     else if (topKey.Equals("env", StringComparison.OrdinalIgnoreCase))
                     {

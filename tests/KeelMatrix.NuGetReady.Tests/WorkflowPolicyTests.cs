@@ -356,6 +356,43 @@ public sealed class WorkflowPolicyTests
     }
 
     [Fact]
+    public void Non_release_ci_reusable_build_job_is_not_classified_as_release()
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", """
+            name: ci
+            on:
+              push:
+                branches: ["main"]
+            jobs:
+              build:
+                uses: ./.github/workflows/reusable-build.yml
+            """);
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+        Assert.Empty(findings);
+    }
+
+    [Fact]
+    public void Publish_workflow_filename_marks_a_reusable_target_as_limited_unproven()
+    {
+        using var repository = WorkflowRepository.Create("publish.yml", """
+            name: ci
+            on:
+              push:
+                tags: ["v*.*.*"]
+            jobs:
+              build:
+                uses: ./.github/workflows/reusable-build.yml
+            """);
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+        Assert.Contains(findings, finding => finding.IsWarning && finding.Message.Contains("unproven", StringComparison.OrdinalIgnoreCase));
+        Assert.DoesNotContain(findings, finding => finding.Message.Contains("does not contain an executable package publication step", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
     public void Composite_action_publication_path_is_reported_as_limited_unproven()
     {
         using var repository = WorkflowRepository.Create("release.yml", """
