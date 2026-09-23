@@ -30,6 +30,15 @@ public sealed class CliContractTests
     }
 
     [Fact]
+    public void Help_documents_the_conservative_workflow_soundness_boundary()
+    {
+        Assert.Contains("every publication-relevant element", CliParser.HelpText, StringComparison.Ordinal);
+        Assert.Contains("actions/checkout", CliParser.HelpText, StringComparison.Ordinal);
+        Assert.Contains("Unallowlisted remote actions", CliParser.HelpText, StringComparison.Ordinal);
+        Assert.Contains("never proof of safety", CliParser.HelpText, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Missing_json_option_value_preserves_the_requested_json_error_contract()
     {
         var exception = Assert.Throws<CliInputException>(() => CliParser.Parse(new[] { "check", "--format", "json", "--config" }));

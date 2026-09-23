@@ -544,6 +544,167 @@ public sealed class WorkflowPolicyTests
     }
 
     [Fact]
+    public void Nested_unix_script_publication_is_limited_unproven()
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", """
+            name: continuous integration
+            on:
+              push:
+                branches: [main]
+            jobs:
+              build:
+                steps:
+                  - run: bash scripts/outer.sh
+            """);
+        repository.WriteFile("scripts/outer.sh", "bash scripts/inner.sh");
+        repository.WriteFile("scripts/inner.sh", "dotnet nuget push artifacts/package.nupkg");
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        AssertLimitedUnproven(inspection);
+    }
+
+    [Fact]
+    public void Nested_powershell_script_publication_is_limited_unproven()
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", """
+            name: continuous integration
+            on:
+              push:
+                branches: [main]
+            jobs:
+              build:
+                steps:
+                  - run: pwsh -File scripts/outer.ps1
+            """);
+        repository.WriteFile("scripts/outer.ps1", "pwsh -File scripts/inner.ps1");
+        repository.WriteFile("scripts/inner.ps1", "dotnet nuget push artifacts/package.nupkg");
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        AssertLimitedUnproven(inspection);
+    }
+
+    [Fact]
+    public void Fully_resolved_nested_nonpublishing_scripts_keep_ci_quiet()
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", """
+            name: continuous integration
+            on:
+              pull_request:
+            jobs:
+              build:
+                steps:
+                  - run: bash scripts/outer.sh
+            """);
+        repository.WriteFile("scripts/outer.sh", "bash scripts/inner.sh");
+        repository.WriteFile("scripts/inner.sh", "dotnet build --no-restore");
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        Assert.False(inspection.Evaluated);
+        Assert.Empty(inspection.Failures);
+    }
+
+    [Fact]
+    public void Indirect_script_depth_limit_is_limited_unproven()
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", """
+            name: continuous integration
+            on:
+              push:
+                branches: [main]
+            jobs:
+              build:
+                steps:
+                  - run: bash scripts/level0.sh
+            """);
+        for (var level = 0; level <= 8; level++)
+        {
+            repository.WriteFile(
+                $"scripts/level{level}.sh",
+                level == 8 ? "dotnet build --no-restore" : $"bash scripts/level{level + 1}.sh");
+        }
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        AssertLimitedUnproven(inspection);
+    }
+
+    [Theory]
+    [InlineData("bash -c './scripts/publish.sh'")]
+    [InlineData("bash -c 'dotnet nuget push artifacts/package.nupkg'")]
+    [InlineData("powershell -Command \"& ./scripts/publish.ps1\"")]
+    [InlineData("powershell -Command \"dotnet nuget push artifacts/package.nupkg\"")]
+    [InlineData("pwsh -File \"scripts/publish.ps1\"")]
+    [InlineData("pwsh -File $env:SCRIPT_PATH")]
+    [InlineData("bash ${{ inputs.script }}")]
+    [InlineData("bash \"$SCRIPT_PATH\"")]
+    public void Wrapped_or_derived_script_paths_are_limited_unproven(string command)
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", $"""
+            name: continuous integration
+            on:
+              push:
+                branches: [main]
+            jobs:
+              build:
+                steps:
+                  - run: {command}
+            """);
+        repository.WriteFile("scripts/publish.sh", "dotnet nuget push artifacts/package.nupkg");
+        repository.WriteFile("scripts/publish.ps1", "dotnet nuget push artifacts/package.nupkg");
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        AssertLimitedUnproven(inspection);
+    }
+
+    [Fact]
+    public void Ordinary_remote_action_is_limited_unproven()
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", """
+            name: continuous integration
+            on:
+              push:
+                branches: [main]
+            jobs:
+              build:
+                steps:
+                  - uses: owner/repository/action@v1
+            """);
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        AssertLimitedUnproven(inspection);
+        Assert.Contains(inspection.Failures, failure => failure.Message.Contains("remote action", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void Allowlisted_ci_actions_keep_ci_quiet()
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", """
+            name: continuous integration
+            on:
+              push:
+                branches: [main]
+            jobs:
+              build:
+                steps:
+                  - uses: actions/checkout@v6
+                  - uses: actions/setup-dotnet@v5
+                  - uses: actions/upload-artifact@v4
+                  - uses: actions/download-artifact@v4
+                  - uses: NuGet/login@v1
+            """);
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        Assert.False(inspection.Evaluated);
+        Assert.Empty(inspection.Failures);
+    }
+
+    [Fact]
     public void Local_composite_action_with_a_referenced_publication_script_is_limited_unproven()
     {
         using var repository = WorkflowRepository.Create("ci.yml", """

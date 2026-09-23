@@ -147,7 +147,7 @@ jobs:
           New-Item $packages -ItemType Directory -Force | Out-Null
           dotnet pack src/KeelMatrix.NuGetReady/KeelMatrix.NuGetReady.csproj --configuration Release --no-build --no-restore --include-symbols -p:SymbolPackageFormat=snupkg --output $packages --nologo -p:UseSharedCompilation=false
           if ($LASTEXITCODE -ne 0) { throw "Tool package creation failed." }
-          pwsh -NoProfile -File (Join-Path $root 'scripts/inspect-package.ps1') `
+          pwsh -NoProfile -File scripts/inspect-package.ps1 `
             -PackagePath (Join-Path $packages 'KeelMatrix.NuGetReady.0.1.0.nupkg') `
             -SymbolsPackagePath (Join-Path $packages 'KeelMatrix.NuGetReady.0.1.0.snupkg')
           if ($LASTEXITCODE -ne 0) { throw "Tool package inspection failed." }

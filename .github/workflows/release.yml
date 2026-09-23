@@ -69,14 +69,14 @@ jobs:
             $mode = 'PreRelease'
           }
 
-          $arguments = @(
-            '-NoProfile', '-NonInteractive', '-File', 'scripts/validate-release-contract.ps1',
-            '-RepositoryRoot', $env:GITHUB_WORKSPACE,
-            '-Mode', $mode,
-            '-ExpectedVersion', $version
-          )
-          if ($mode -eq 'Tag') { $arguments += @('-TagVersion', $env:GITHUB_REF_NAME) }
-          & pwsh @arguments
+          if ($mode -eq 'Tag') {
+            & pwsh -NoProfile -NonInteractive -File scripts/validate-release-contract.ps1 `
+              -RepositoryRoot $env:GITHUB_WORKSPACE -Mode Tag -ExpectedVersion $version -TagVersion $env:GITHUB_REF_NAME
+          }
+          else {
+            & pwsh -NoProfile -NonInteractive -File scripts/validate-release-contract.ps1 `
+              -RepositoryRoot $env:GITHUB_WORKSPACE -Mode PreRelease -ExpectedVersion $version
+          }
           if ($LASTEXITCODE -ne 0) { throw "Release contract validation failed." }
           "version=$version" >> $env:GITHUB_OUTPUT
 
