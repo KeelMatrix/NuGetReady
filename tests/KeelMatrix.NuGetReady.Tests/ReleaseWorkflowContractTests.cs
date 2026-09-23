@@ -31,6 +31,19 @@ public sealed class ReleaseWorkflowContractTests
         Assert.DoesNotMatch(new Regex("dotnet\\s+nuget\\s+push[^\\r\\n]*\\.snupkg", RegexOptions.IgnoreCase), workflow);
     }
 
+    [Fact]
+    public void Ci_installed_tool_rehearses_corpus_outside_repository()
+    {
+        var root = FindRepositoryRoot();
+        var workflowPath = Path.Combine(root, ".github", "workflows", "ci.yml");
+        var workflow = File.ReadAllText(workflowPath);
+
+        Assert.Contains("$corpus = Join-Path $runRoot 'corpus'", workflow, StringComparison.Ordinal);
+        Assert.Contains("Copy-Item -Path (Join-Path $root 'artifacts/corpus/*.nupkg') -Destination $corpus", workflow, StringComparison.Ordinal);
+        Assert.Contains("Copy-Item -LiteralPath (Join-Path $root 'artifacts/corpus/nugetready.json') -Destination $corpus", workflow, StringComparison.Ordinal);
+        Assert.DoesNotContain("$corpusConfig = Join-Path $root 'artifacts/corpus/nugetready.json'", workflow, StringComparison.Ordinal);
+    }
+
     private static string FindRepositoryRoot()
     {
         var directory = new DirectoryInfo(AppContext.BaseDirectory);

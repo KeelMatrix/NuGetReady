@@ -166,10 +166,13 @@ jobs:
           $httpCache = Join-Path $runRoot 'http-cache'
           $cliHome = Join-Path $runRoot 'cli-home'
           $toolPath = Join-Path $runRoot 'tool'
+          $corpus = Join-Path $runRoot 'corpus'
           $publicSubstitute = Join-Path $runRoot 'public-substitute'
           $negativeLocal = Join-Path $runRoot 'negative-local'
-          New-Item $feed, $cache, $httpCache, $cliHome, $toolPath, $publicSubstitute, $negativeLocal -ItemType Directory -Force | Out-Null
+          New-Item $feed, $cache, $httpCache, $cliHome, $toolPath, $corpus, $publicSubstitute, $negativeLocal -ItemType Directory -Force | Out-Null
           Copy-Item (Join-Path $root 'artifacts/packages/KeelMatrix.NuGetReady.0.1.0.nupkg') $feed
+          Copy-Item -Path (Join-Path $root 'artifacts/corpus/*.nupkg') -Destination $corpus
+          Copy-Item -LiteralPath (Join-Path $root 'artifacts/corpus/nugetready.json') -Destination $corpus
 
           $config = Join-Path $root '.github/nugetready-ci.config'
           $env:NUGETREADY_FEED = $feed
@@ -184,8 +187,7 @@ jobs:
           $toolName = if ($IsWindows) { 'nugetready.exe' } else { 'nugetready' }
           $tool = Join-Path $toolPath $toolName
           if (-not (Test-Path $tool)) { throw "The isolated tool executable was not created." }
-          $corpusConfig = Join-Path $root 'artifacts/corpus/nugetready.json'
-          $corpus = Join-Path $root 'artifacts/corpus'
+          $corpusConfig = Join-Path $corpus 'nugetready.json'
           $env:PATH = "$toolPath$([IO.Path]::PathSeparator)$env:PATH"
           nugetready check --config $corpusConfig --artifacts $corpus --format json
           if ($LASTEXITCODE -ne 0) { throw "The installed tool failed the end-to-end corpus rehearsal." }
