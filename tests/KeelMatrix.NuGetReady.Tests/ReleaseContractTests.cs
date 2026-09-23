@@ -213,7 +213,7 @@ public sealed class ReleaseContractTests
                 <Project>
                   <PropertyGroup><ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally></PropertyGroup>
                   <ItemGroup>
-                    <PackageVersion Include="KeelMatrix.Telemetry" Version="[0.1.0]" />
+                    <PackageVersion Include="KeelMatrix.Telemetry" Version="[0.1.1]" />
                   </ItemGroup>
                 </Project>
                 """, Encoding.UTF8);
@@ -249,7 +249,7 @@ public sealed class ReleaseContractTests
                 dotnet tool install --global KeelMatrix.NuGetReady
                 ```
 
-                KeelMatrix.Telemetry 0.1.0 provides the shared contract.
+                KeelMatrix.Telemetry 0.1.1 provides the shared contract.
                 """;
             File.WriteAllText(Path.Combine(root.FullName, "README.md"), readme ?? defaultReadme, Encoding.UTF8);
             File.WriteAllText(Path.Combine(projectDirectory.FullName, "README.md"), defaultReadme, Encoding.UTF8);

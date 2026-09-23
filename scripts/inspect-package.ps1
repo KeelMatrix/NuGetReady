@@ -67,7 +67,7 @@ function Assert-NuspecContract {
     Assert-Contract (($dependencyIds -join ",") -eq "KeelMatrix.Telemetry,NuGet.Packaging") "Unexpected dependency set: $($dependencyIds -join ', ')."
     $telemetry = $dependencies | Where-Object { $_.id -eq "KeelMatrix.Telemetry" } | Select-Object -First 1
     Assert-Contract ($null -ne $telemetry) "KeelMatrix.Telemetry dependency is missing."
-    Assert-Contract ($telemetry.version -eq "[0.1.0]") "KeelMatrix.Telemetry must be pinned to [0.1.0]."
+    Assert-Contract ($telemetry.version -eq "[0.1.1]") "KeelMatrix.Telemetry must be pinned to [0.1.1]."
     Assert-Contract ($telemetry.exclude -eq "Build,Analyzers") "KeelMatrix.Telemetry dependency exclusions are incorrect."
 }
 

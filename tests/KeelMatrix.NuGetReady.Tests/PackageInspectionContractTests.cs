@@ -370,7 +370,7 @@ public sealed class PackageInspectionContractTests
                 <version>0.1.0</version>
                 {metadata}
                 {packageType}
-                <dependencies><group targetFramework="net8.0"><dependency id="KeelMatrix.Telemetry" version="[0.1.0]" exclude="Build,Analyzers" /><dependency id="NuGet.Packaging" version="[7.9.0]" /></group></dependencies>
+                <dependencies><group targetFramework="net8.0"><dependency id="KeelMatrix.Telemetry" version="[0.1.1]" exclude="Build,Analyzers" /><dependency id="NuGet.Packaging" version="[7.9.0]" /></group></dependencies>
               </metadata>
             </package>
             """;
