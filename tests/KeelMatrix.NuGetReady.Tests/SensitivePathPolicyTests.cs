@@ -81,6 +81,7 @@ public sealed class SensitivePathPolicyTests
             "tools/net8.0/any/NuGet.Frameworks.dll",
             "tools/net8.0/any/NuGet.Packaging.dll",
             "tools/net8.0/any/NuGet.Versioning.dll",
+            "tools/net8.0/any/YamlDotNet.dll",
             "tools/net8.0/any/System.Security.Cryptography.Pkcs.dll",
             "tools/net8.0/any/System.Security.Cryptography.ProtectedData.dll",
             "tools/net8.0/any/runtimes/win/lib/net8.0/System.Security.Cryptography.Pkcs.dll",

@@ -32,12 +32,12 @@ public sealed class CliContractTests
     [Fact]
     public void Help_documents_the_conservative_workflow_soundness_boundary()
     {
-        Assert.Contains("every publication-relevant element", CliParser.HelpText, StringComparison.Ordinal);
-        Assert.Contains("actions/checkout", CliParser.HelpText, StringComparison.Ordinal);
-        Assert.Contains("exhaustive safe-command allowlist", CliParser.HelpText, StringComparison.Ordinal);
-        Assert.Contains("Everything else", CliParser.HelpText, StringComparison.Ordinal);
-        Assert.Contains("Unallowlisted remote actions", CliParser.HelpText, StringComparison.Ordinal);
-        Assert.Contains("never proof of safety", CliParser.HelpText, StringComparison.Ordinal);
+        Assert.Contains("closed-world 0.1.0 release profile", CliParser.HelpText, StringComparison.Ordinal);
+        Assert.Contains("validated-release-artifacts", CliParser.HelpText, StringComparison.Ordinal);
+        Assert.Contains("NuGet/login@v1", CliParser.HelpText, StringComparison.Ordinal);
+        Assert.Contains("unknown or unsupported publication-relevant node", CliParser.HelpText, StringComparison.Ordinal);
+        Assert.Contains("error/exit 2", CliParser.HelpText, StringComparison.Ordinal);
+        Assert.Contains("never defaults to safe", CliParser.HelpText, StringComparison.Ordinal);
     }
 
     [Fact]

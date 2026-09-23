@@ -341,6 +341,7 @@ public sealed class PackageInspectionContractTests
             AddBytes(archive, "icon.png", new byte[] { 1 });
             AddBytes(archive, "tools/net8.0/any/KeelMatrix.NuGetReady.dll", new byte[] { 1 });
             AddBytes(archive, "tools/net8.0/any/KeelMatrix.Telemetry.dll", new byte[] { 1 });
+            AddBytes(archive, "tools/net8.0/any/YamlDotNet.dll", new byte[] { 1 });
             AddBytes(archive, "tools/net8.0/any/DotnetToolSettings.xml", new byte[] { 1 });
         }
         else
@@ -370,7 +371,7 @@ public sealed class PackageInspectionContractTests
                 <version>0.1.0</version>
                 {metadata}
                 {packageType}
-                <dependencies><group targetFramework="net8.0"><dependency id="KeelMatrix.Telemetry" version="[0.1.1]" exclude="Build,Analyzers" /><dependency id="NuGet.Packaging" version="[7.9.0]" /></group></dependencies>
+                <dependencies><group targetFramework="net8.0"><dependency id="KeelMatrix.Telemetry" version="[0.1.1]" exclude="Build,Analyzers" /><dependency id="NuGet.Packaging" version="[7.9.0]" /><dependency id="YamlDotNet" version="18.1.0" exclude="Build,Analyzers" /></group></dependencies>
               </metadata>
             </package>
             """;

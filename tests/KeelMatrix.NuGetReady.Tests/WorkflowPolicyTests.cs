@@ -5,25 +5,7 @@ public sealed class WorkflowPolicyTests
     [Fact]
     public void Valid_trusted_publishing_workflow_has_no_policy_findings()
     {
-        using var repository = WorkflowRepository.Create("release.yml", """
-            name: release
-            on:
-              push:
-                tags: ["v*.*.*"]
-            permissions:
-              contents: read
-            jobs:
-              publish:
-                permissions:
-                  id-token: write
-                  contents: read
-                env:
-                  KEELMATRIX_NO_TELEMETRY: '1'
-                steps:
-                  - run: dotnet nugetready check --artifacts artifacts/packages
-                  - uses: NuGet/login@v1
-                  - run: dotnet nuget push artifacts/KeelMatrix.NuGetReady.1.0.0.nupkg
-            """);
+        using var repository = WorkflowRepository.Create("release.yml", ReleaseWorkflow);
 
         var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
 
@@ -33,31 +15,7 @@ public sealed class WorkflowPolicyTests
     [Fact]
     public void Short_lived_trusted_publishing_credential_is_allowed()
     {
-        using var repository = WorkflowRepository.Create("release.yml", """
-            name: release
-            on:
-              push:
-                tags: ["v*.*.*"]
-            permissions:
-              contents: read
-            jobs:
-              publish:
-                permissions:
-                  id-token: write
-                  contents: read
-                env:
-                  KEELMATRIX_NO_TELEMETRY: '1'
-                steps:
-                  - run: dotnet nugetready check --artifacts artifacts/release
-                  - uses: NuGet/login@v1
-                    id: nuget-login
-                    with:
-                      user: dmitriyzen
-                  - shell: pwsh
-                    env:
-                      NUGET_TEMP_CREDENTIAL: ${{ steps.nuget-login.outputs[format('NUGET_{0}', 'API_KEY')] }}
-                    run: dotnet nuget push artifacts/KeelMatrix.NuGetReady.1.0.0.nupkg -k $env:NUGET_TEMP_CREDENTIAL
-            """);
+        using var repository = WorkflowRepository.Create("release.yml", ReleaseWorkflow);
 
         var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
 
@@ -65,56 +23,186 @@ public sealed class WorkflowPolicyTests
     }
 
     [Fact]
-    public void Authentication_before_validation_before_publication_is_allowed()
+    public void Unsupported_publication_relevant_mutations_never_remain_pass()
     {
-        using var repository = WorkflowRepository.Create("release.yml", """
-            name: release
-            on:
-              push:
-                tags: ["v*.*.*"]
-            permissions:
-              contents: read
-            jobs:
-              publish:
-                permissions:
-                  id-token: write
-                  contents: read
-                env:
-                  KEELMATRIX_NO_TELEMETRY: '1'
-                steps:
-                  - uses: NuGet/login@v1
-                  - run: dotnet nugetready check --artifacts artifacts/packages
-                  - run: dotnet nuget push artifacts/KeelMatrix.NuGetReady.1.0.0.nupkg
-            """);
+        var mutations = new Dictionary<string, string>
+        {
+            ["arbitrary executable step"] = Mutate(
+                ReleaseWorkflow,
+                "- id: nuget-login",
+                "- run: echo unexpected\n      - id: nuget-login"),
+            ["local composite action"] = Mutate(
+                ReleaseWorkflow,
+                "uses: actions/download-artifact@v4",
+                "uses: ./.github/actions/download"),
+            ["unknown remote action"] = Mutate(
+                ReleaseWorkflow,
+                "uses: NuGet/login@v1",
+                "uses: example/opaque-login@v1"),
+            ["conditional authentication"] = Mutate(
+                ReleaseWorkflow,
+                "- id: nuget-login\n        uses: NuGet/login@v1",
+                "- id: nuget-login\n        if: github.ref_type == 'tag'\n        uses: NuGet/login@v1"),
+            ["step permissions"] = Mutate(
+                ReleaseWorkflow,
+                "- id: nuget-login\n        uses: NuGet/login@v1",
+                "- id: nuget-login\n        permissions: {}\n        uses: NuGet/login@v1"),
+            ["command wrapper"] = Mutate(
+                ReleaseWorkflow,
+                "run: dotnet nuget push artifacts/release/KeelMatrix.NuGetReady.1.0.0.nupkg --source https://api.nuget.org/v3/index.json --api-key \"$env:NUGET_API_KEY\"",
+                "run: bash -c 'dotnet nuget push artifacts/release/KeelMatrix.NuGetReady.1.0.0.nupkg'"),
+            ["executable suffix variant"] = Mutate(
+                ReleaseWorkflow,
+                "run: dotnet nuget push artifacts/release/KeelMatrix.NuGetReady.1.0.0.nupkg --source https://api.nuget.org/v3/index.json --api-key \"$env:NUGET_API_KEY\"",
+                "run: dotnet.exe nuget push artifacts/release/KeelMatrix.NuGetReady.1.0.0.nupkg"),
+            ["leading-dot executable variant"] = Mutate(
+                ReleaseWorkflow,
+                "run: dotnet nuget push artifacts/release/KeelMatrix.NuGetReady.1.0.0.nupkg --source https://api.nuget.org/v3/index.json --api-key \"$env:NUGET_API_KEY\"",
+                "run: ./dotnet nuget push artifacts/release/KeelMatrix.NuGetReady.1.0.0.nupkg"),
+            ["dynamic invocation"] = Mutate(
+                ReleaseWorkflow,
+                "run: dotnet nuget push artifacts/release/KeelMatrix.NuGetReady.1.0.0.nupkg --source https://api.nuget.org/v3/index.json --api-key \"$env:NUGET_API_KEY\"",
+                "run: '& $env:PUBLISH_COMMAND artifacts/release/KeelMatrix.NuGetReady.1.0.0.nupkg'"),
+            ["process launcher"] = Mutate(
+                ReleaseWorkflow,
+                "run: dotnet nuget push artifacts/release/KeelMatrix.NuGetReady.1.0.0.nupkg --source https://api.nuget.org/v3/index.json --api-key \"$env:NUGET_API_KEY\"",
+                "run: Start-Process dotnet -ArgumentList 'nuget push artifacts/release/KeelMatrix.NuGetReady.1.0.0.nupkg'"),
+            ["generated script execution"] = Mutate(
+                ReleaseWorkflow,
+                "run: dotnet nuget push artifacts/release/KeelMatrix.NuGetReady.1.0.0.nupkg --source https://api.nuget.org/v3/index.json --api-key \"$env:NUGET_API_KEY\"",
+                "run: Set-Content generated.ps1 'dotnet nuget push artifacts/release/KeelMatrix.NuGetReady.1.0.0.nupkg'; ./generated.ps1"),
+            ["git alias publication"] = Mutate(
+                ReleaseWorkflow,
+                "run: dotnet nuget push artifacts/release/KeelMatrix.NuGetReady.1.0.0.nupkg --source https://api.nuget.org/v3/index.json --api-key \"$env:NUGET_API_KEY\"",
+                "run: git -c alias.ship='!dotnet nuget push artifacts/release/KeelMatrix.NuGetReady.1.0.0.nupkg' ship"),
+            ["custom MSBuild import"] = Mutate(
+                ReleaseWorkflow,
+                "run: dotnet nuget push artifacts/release/KeelMatrix.NuGetReady.1.0.0.nupkg --source https://api.nuget.org/v3/index.json --api-key \"$env:NUGET_API_KEY\"",
+                "run: dotnet build -p:CustomAfterMicrosoftCommonTargets=publish.targets"),
+            ["repository script"] = Mutate(
+                ReleaseWorkflow,
+                "run: dotnet nuget push artifacts/release/KeelMatrix.NuGetReady.1.0.0.nupkg --source https://api.nuget.org/v3/index.json --api-key \"$env:NUGET_API_KEY\"",
+                "run: ./scripts/publish.ps1"),
+            ["path replacement"] = Mutate(
+                ReleaseWorkflow,
+                "      DOTNET_CLI_TELEMETRY_OPTOUT: '1'\n    steps:\n      - uses: actions/download-artifact@v4",
+                "      DOTNET_CLI_TELEMETRY_OPTOUT: '1'\n      PATH: ./tools\n    steps:\n      - uses: actions/download-artifact@v4"),
+            ["build in credential job"] = Mutate(
+                ReleaseWorkflow,
+                "- id: nuget-login",
+                "- run: dotnet build -t:Publish\n      - id: nuget-login")
+        };
+
+        foreach (var mutation in mutations)
+        {
+            using var repository = WorkflowRepository.Create("release.yml", mutation.Value);
+
+            var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+            Assert.True(
+                findings.Any(finding => finding.IsError),
+                $"Mutation '{mutation.Key}' unexpectedly remained certifiable: {string.Join(" | ", findings.Select(finding => finding.Message))}");
+        }
+    }
+
+    [Theory]
+    [InlineData("validated-release-artifacts", "different-artifact")]
+    [InlineData("path: artifacts/release", "path: artifacts/unvalidated")]
+    [InlineData("needs: validate", "needs: missing-validation")]
+    public void Dynamic_or_mismatched_artifact_continuity_is_blocking(string original, string replacement)
+    {
+        using var repository = WorkflowRepository.Create("release.yml", Mutate(ReleaseWorkflow, original, replacement));
 
         var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
 
-        Assert.Empty(findings);
+        Assert.Contains(findings, finding => finding.IsError &&
+            (finding.Message.Contains("artifact", StringComparison.OrdinalIgnoreCase) ||
+             finding.Message.Contains("dependency", StringComparison.OrdinalIgnoreCase)));
+    }
+
+    [Fact]
+    public void Artifact_continuity_uses_the_active_configuration_not_an_unrelated_root_file()
+    {
+        using var repository = WorkflowRepository.Create("release.yml", ReleaseWorkflow);
+        var activeConfig = new NuGetReadyConfig
+        {
+            SchemaVersion = 1,
+            Packages =
+            [
+                new PackageExpectation
+                {
+                    Id = "Different.Package",
+                    Kind = "library",
+                    Version = "1.0.0",
+                    Artifacts = ["Different.Package.1.0.0.nupkg", "Different.Package.1.0.0.snupkg"]
+                }
+            ]
+        };
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName, activeConfig);
+
+        Assert.Contains(findings, finding => finding.Message.Contains("exact configured primary package", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void A_skipped_validation_dependency_path_is_blocking()
+    {
+        using var repository = WorkflowRepository.Create("release.yml", Mutate(
+            ReleaseWorkflow,
+            "  validate:\n    runs-on: ubuntu-latest",
+            "  validate:\n    if: false\n    runs-on: ubuntu-latest"));
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+        Assert.Contains(findings, finding => finding.IsError && finding.Message.Contains("validation", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void Yaml_aliases_and_merge_keys_on_the_publication_path_are_blocking()
+    {
+        using var repository = WorkflowRepository.Create("release.yml", Mutate(
+            ReleaseWorkflow,
+            "  publish:\n    needs: validate",
+            "  template: &publish-template\n    runs-on: ubuntu-latest\n  publish:\n    <<: *publish-template\n    needs: validate"));
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+        Assert.Contains(findings, finding => finding.IsError && finding.Message.Contains("unsupported", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void Duplicate_yaml_keys_on_the_publication_path_are_blocking()
+    {
+        using var repository = WorkflowRepository.Create("release.yml", Mutate(
+            ReleaseWorkflow,
+            "  publish:\n    needs: validate",
+            "  publish:\n    needs: validate\n    needs: validate"));
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+        Assert.Contains(findings, finding => finding.IsError && finding.Message.Contains("unsupported", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void Validation_inside_the_credential_bearing_job_is_rejected()
+    {
+        using var repository = WorkflowRepository.Create("release.yml", Mutate(
+            ReleaseWorkflow,
+            "- uses: actions/download-artifact@v4",
+            "- run: dotnet nugetready check --artifacts artifacts/release\n      - uses: actions/download-artifact@v4"));
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+        Assert.Contains(findings, finding => finding.IsError && finding.Message.Contains("credential-bearing", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]
     public void A_secret_api_key_in_a_supported_env_scope_is_blocking()
     {
-        using var repository = WorkflowRepository.Create("release.yml", """
-            name: release
-            on:
-              push:
-                tags: ["v*.*.*"]
-            permissions:
-              contents: read
-            jobs:
-              publish:
-                permissions:
-                  id-token: write
-                  contents: read
-                env:
-                  KEELMATRIX_NO_TELEMETRY: '1'
-                  NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
-                steps:
-                  - run: dotnet nugetready check --artifacts artifacts/packages
-                  - uses: NuGet/login@v1
-                  - run: dotnet nuget push artifacts/KeelMatrix.NuGetReady.1.0.0.nupkg -k $env:NUGET_API_KEY
-            """);
+        using var repository = WorkflowRepository.Create("release.yml", Mutate(
+            ReleaseWorkflow,
+            "DOTNET_CLI_TELEMETRY_OPTOUT: '1'\n    steps:",
+            "DOTNET_CLI_TELEMETRY_OPTOUT: '1'\n      LEGACY_KEY: ${{ secrets.NUGET_API_KEY }}\n    steps:"));
 
         var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
 
@@ -124,62 +212,31 @@ public sealed class WorkflowPolicyTests
     [Fact]
     public void Echoed_validation_text_does_not_prove_artifact_validation()
     {
-        using var repository = WorkflowRepository.Create("release.yml", """
-            name: release
-            on:
-              push:
-                tags: ["v*.*.*"]
-            permissions:
-              contents: read
-            jobs:
-              publish:
-                permissions:
-                  id-token: write
-                  contents: read
-                env:
-                  KEELMATRIX_NO_TELEMETRY: '1'
-                steps:
-                  - run: echo "dotnet nugetready check --artifacts artifacts/packages"
-                  - uses: NuGet/login@v1
-                  - run: dotnet nuget push artifacts/KeelMatrix.NuGetReady.1.0.0.nupkg
-            """);
+        using var repository = WorkflowRepository.Create("release.yml", Mutate(
+            ReleaseWorkflow,
+            "run: dotnet run --project src/KeelMatrix.NuGetReady/KeelMatrix.NuGetReady.csproj --configuration Release --no-build --no-restore -- check --config nugetready.json --artifacts artifacts/release --format json",
+            "run: echo dotnet nugetready check --artifacts artifacts/release"));
 
         var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
 
-        Assert.Contains(findings, finding => finding.Message.Contains("artifact validation", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(findings, finding => finding.IsError && finding.Message.Contains("validation", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]
     public void Disabled_validation_step_does_not_prove_artifact_validation()
     {
-        using var repository = WorkflowRepository.Create("release.yml", """
-            name: release
-            on:
-              push:
-                tags: ["v*.*.*"]
-            permissions:
-              contents: read
-            jobs:
-              publish:
-                permissions:
-                  id-token: write
-                  contents: read
-                env:
-                  KEELMATRIX_NO_TELEMETRY: '1'
-                steps:
-                  - if: false
-                    run: dotnet nugetready check --artifacts artifacts/packages
-                  - uses: NuGet/login@v1
-                  - run: dotnet nuget push artifacts/KeelMatrix.NuGetReady.1.0.0.nupkg
-            """);
+        using var repository = WorkflowRepository.Create("release.yml", Mutate(
+            ReleaseWorkflow,
+            "- name: Validate exact artifacts\n        shell: pwsh",
+            "- name: Validate exact artifacts\n        if: false\n        shell: pwsh"));
 
         var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
 
-        Assert.Contains(findings, finding => finding.Message.Contains("artifact validation", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(findings, finding => finding.IsError && finding.Message.Contains("validation", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]
-    public void Workflow_level_oidc_permission_is_inherited_by_a_job_without_permissions()
+    public void Workflow_level_oidc_permission_is_not_accepted_for_the_publish_job()
     {
         using var repository = WorkflowRepository.Create("release.yml", """
             name: release
@@ -201,7 +258,7 @@ public sealed class WorkflowPolicyTests
 
         var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
 
-        Assert.DoesNotContain(findings, finding => finding.Message.Contains("id-token", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(findings, finding => finding.Message.Contains("permissions", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]
@@ -232,27 +289,36 @@ public sealed class WorkflowPolicyTests
     }
 
     [Fact]
-    public void Authentication_after_publication_does_not_prove_the_publication_path()
+    public void Quoted_yaml_keys_do_not_hide_a_release_workflow()
     {
         using var repository = WorkflowRepository.Create("release.yml", """
-            name: release
-            on:
-              push:
-                tags: ["v*.*.*"]
-            permissions:
-              contents: read
-            jobs:
-              publish:
-                permissions:
-                  id-token: write
-                  contents: read
-                env:
-                  KEELMATRIX_NO_TELEMETRY: '1'
-                steps:
-                  - run: dotnet nugetready check --artifacts artifacts/packages
-                  - run: dotnet nuget push artifacts/KeelMatrix.NuGetReady.1.0.0.nupkg
-                  - uses: NuGet/login@v1
+            "name": "Release"
+            "on":
+              "push":
+                "tags": ["v*.*.*"]
+            "permissions": { "contents": "read" }
+            "jobs":
+              "publish":
+                "runs-on": "ubuntu-latest"
+                "steps":
+                  - "uses": "NuGet/login@v1"
+                  - "run": "dotnet nuget push artifacts/Example.1.0.0.nupkg"
             """);
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+        Assert.Contains(findings, finding => finding.Message.Contains("id-token", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void Authentication_after_publication_does_not_prove_the_publication_path()
+    {
+        const string login = "- id: nuget-login\n        uses: NuGet/login@v1\n        with:\n          user: dmitriyzen";
+        const string push = "- shell: pwsh\n        env:\n          NUGET_API_KEY: ${{ steps.nuget-login.outputs.NUGET_API_KEY }}\n        run: dotnet nuget push artifacts/release/KeelMatrix.NuGetReady.1.0.0.nupkg --source https://api.nuget.org/v3/index.json --api-key \"$env:NUGET_API_KEY\"";
+        using var repository = WorkflowRepository.Create("release.yml", Mutate(
+            ReleaseWorkflow,
+            $"{login}\n      {push}",
+            $"{push}\n      {login}"));
 
         var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
 
@@ -262,10 +328,10 @@ public sealed class WorkflowPolicyTests
     [Fact]
     public void Conditional_authentication_does_not_prove_an_executed_authentication_step()
     {
-        using var repository = WorkflowRepository.Create("release.yml", ReleaseWorkflow.Replace(
-            "- uses: NuGet/login@v1",
-            "- if: github.ref_type == 'tag'\n              uses: NuGet/login@v1",
-            StringComparison.Ordinal));
+        using var repository = WorkflowRepository.Create("release.yml", Mutate(
+            ReleaseWorkflow,
+            "- id: nuget-login\n        uses: NuGet/login@v1",
+            "- id: nuget-login\n        if: github.ref_type == 'tag'\n        uses: NuGet/login@v1"));
 
         var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
 
@@ -279,16 +345,16 @@ public sealed class WorkflowPolicyTests
 
         var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
 
-        Assert.Contains(findings, finding => finding.Message.Contains("versioned tag", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(findings, finding => finding.Message.Contains("version", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]
     public void An_additional_branch_trigger_requires_a_supported_tag_condition()
     {
-        using var repository = WorkflowRepository.Create("release.yml", ReleaseWorkflow.Replace(
+        using var repository = WorkflowRepository.Create("release.yml", Mutate(
+            ReleaseWorkflow,
             "tags: [\"v*.*.*\"]",
-            "branches: [\"main\"]\n            tags: [\"v*.*.*\"]",
-            StringComparison.Ordinal));
+            "branches: [\"main\"]\n    tags: [\"v*.*.*\"]"));
 
         var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
 
@@ -298,10 +364,10 @@ public sealed class WorkflowPolicyTests
     [Fact]
     public void Branches_ignore_also_indicates_a_branch_trigger_when_tags_are_configured()
     {
-        using var repository = WorkflowRepository.Create("release.yml", ReleaseWorkflow.Replace(
+        using var repository = WorkflowRepository.Create("release.yml", Mutate(
+            ReleaseWorkflow,
             "tags: [\"v*.*.*\"]",
-            "tags: [\"v*.*.*\"]\n            branches-ignore: [\"main\"]",
-            StringComparison.Ordinal));
+            "tags: [\"v*.*.*\"]\n    branches-ignore: [\"main\"]"));
 
         var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
 
@@ -311,28 +377,28 @@ public sealed class WorkflowPolicyTests
     [Fact]
     public void Tags_ignore_is_not_a_versioned_tag_gate()
     {
-        using var repository = WorkflowRepository.Create("release.yml", ReleaseWorkflow.Replace(
+        using var repository = WorkflowRepository.Create("release.yml", Mutate(
+            ReleaseWorkflow,
             "tags: [\"v*.*.*\"]",
-            "tags-ignore: [\"v0.*\"]",
-            StringComparison.Ordinal));
+            "tags-ignore: [\"v0.*\"]"));
 
         var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
 
-        Assert.Contains(findings, finding => finding.Message.Contains("versioned tag", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(findings, finding => finding.Message.Contains("version", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]
     public void Unsupported_job_condition_is_reported_as_unproven()
     {
         var workflow = ReleaseWorkflow.Replace("\r\n", "\n", StringComparison.Ordinal).Replace(
-            "publish:",
-            "publish:\n    if: needs.validate.result == 'success'",
+            "  publish:",
+            "  publish:\n    if: needs.validate.result == 'success'",
             StringComparison.Ordinal);
         using var repository = WorkflowRepository.Create("release.yml", workflow);
 
         var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
 
-        Assert.Contains(findings, finding => finding.IsWarning && finding.Message.Contains("unproven", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(findings, finding => finding.IsError && finding.Message.Contains("unproven", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]
@@ -350,7 +416,7 @@ public sealed class WorkflowPolicyTests
 
         var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
 
-        var finding = Assert.Single(findings, finding => finding.IsWarning && finding.Message.Contains("unproven", StringComparison.OrdinalIgnoreCase));
+        var finding = Assert.Single(findings, finding => finding.IsError && finding.Message.Contains("unproven", StringComparison.OrdinalIgnoreCase));
         Assert.Contains("reusable", finding.Message, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain(findings, finding => finding.Message.Contains("does not contain an executable package publication step", StringComparison.OrdinalIgnoreCase));
     }
@@ -791,7 +857,7 @@ public sealed class WorkflowPolicyTests
     }
 
     [Fact]
-    public void Scheduled_script_publication_is_a_warning_not_not_applicable()
+    public void Scheduled_script_publication_is_a_blocking_error_not_not_applicable()
     {
         using var corpus = PackedCorpus.Create();
         var package = corpus.Pack("Standard/Standard.csproj");
@@ -827,9 +893,9 @@ public sealed class WorkflowPolicyTests
             TimeSpan.FromMinutes(2),
             new ConsumerRehearsalOptions(PublicFeedPath: corpus.OutputPath));
 
-        Assert.Equal("warn", report.Status);
-        Assert.Equal(0, report.ExitCode);
-        Assert.Equal("warn", report.Checks.Single(check => check.Id == "workflow-policy").Status);
+        Assert.Equal("error", report.Status);
+        Assert.Equal(2, report.ExitCode);
+        Assert.Equal("error", report.Checks.Single(check => check.Id == "workflow-policy").Status);
         Assert.DoesNotContain(report.Failures, failure => failure.Message.Contains("not-applicable", StringComparison.OrdinalIgnoreCase));
     }
 
@@ -848,7 +914,7 @@ public sealed class WorkflowPolicyTests
 
         var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
 
-        Assert.Contains(findings, finding => finding.IsWarning && finding.Message.Contains("unproven", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(findings, finding => finding.IsError && finding.Message.Contains("unproven", StringComparison.OrdinalIgnoreCase));
         Assert.DoesNotContain(findings, finding => finding.Message.Contains("does not contain an executable package publication step", StringComparison.OrdinalIgnoreCase));
     }
 
@@ -1005,9 +1071,17 @@ public sealed class WorkflowPolicyTests
     {
         using var corpus = PackedCorpus.Create();
         var package = corpus.Pack("Standard/Standard.csproj");
-        using var repository = WorkflowRepository.Create("release.yml", ReleaseWorkflow.Replace(
+        var workflow = Mutate(
+            ReleaseWorkflow,
+            "KeelMatrix.NuGetReady.1.0.0.nupkg",
+            Path.GetFileName(package));
+        workflow = Mutate(
+            workflow,
+            "KeelMatrix.NuGetReady.1.0.0.snupkg",
+            Path.GetFileName(Path.ChangeExtension(package, ".snupkg")));
+        using var repository = WorkflowRepository.Create("release.yml", workflow.Replace(
             "id-token: write",
-            "contents: read",
+            "id-token: read",
             StringComparison.Ordinal));
 
         var report = CheckRunner.Run(
@@ -1061,13 +1135,13 @@ public sealed class WorkflowPolicyTests
 
         var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
 
-        var finding = Assert.Single(findings, finding => finding.IsWarning && finding.Message.Contains("unproven", StringComparison.OrdinalIgnoreCase));
+        var finding = Assert.Single(findings, finding => finding.IsError && finding.Message.Contains("unproven", StringComparison.OrdinalIgnoreCase));
         Assert.Contains("composite", finding.Message, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain(findings, finding => finding.Message.Contains("does not contain an executable package publication step", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]
-    public void Unsupported_reusable_workflow_is_a_warning_without_a_pass_or_blocking_exit()
+    public void Unsupported_reusable_workflow_is_a_blocking_error()
     {
         using var corpus = PackedCorpus.Create();
         var package = corpus.Pack("Standard/Standard.csproj");
@@ -1101,38 +1175,43 @@ public sealed class WorkflowPolicyTests
             TimeSpan.FromMinutes(2),
             new ConsumerRehearsalOptions(PublicFeedPath: corpus.OutputPath));
 
-        Assert.True(
-            report.Status == "warn",
-            $"status={report.Status}; exitCode={report.ExitCode}; failures={string.Join(" | ", report.Failures.Select(failure => failure.Message))}");
-        Assert.Equal(0, report.ExitCode);
-        Assert.Equal("warn", report.Checks.Single(check => check.Id == "workflow-policy").Status);
+        Assert.Equal("error", report.Status);
+        Assert.Equal(2, report.ExitCode);
+        Assert.Equal("error", report.Checks.Single(check => check.Id == "workflow-policy").Status);
+        Assert.Contains(report.Failures, failure => failure.IsError && failure.Message.Contains("unproven", StringComparison.OrdinalIgnoreCase));
         Assert.DoesNotContain(report.Failures, failure => failure.Message.Contains("does not contain an executable package publication step", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]
     public void Missing_oidc_permission_is_blocking()
     {
-        using var repository = WorkflowRepository.Create("release.yml", ReleaseWorkflow.Replace("id-token: write", "contents: read"));
+        using var repository = WorkflowRepository.Create("release.yml", Mutate(ReleaseWorkflow, "id-token: write", "id-token: read"));
 
         var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
 
-        Assert.Contains(findings, finding => finding.Message.Contains("id-token", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(findings, finding => finding.Message.Contains("id-token", StringComparison.OrdinalIgnoreCase) || finding.Message.Contains("permissions", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]
     public void Overbroad_oidc_permissions_are_blocking()
     {
-        using var repository = WorkflowRepository.Create("release.yml", ReleaseWorkflow.Replace("contents: read", "contents: write"));
+        using var repository = WorkflowRepository.Create("release.yml", Mutate(
+            ReleaseWorkflow,
+            "id-token: write\n      contents: read",
+            "id-token: write\n      contents: write"));
 
         var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
 
-        Assert.Contains(findings, finding => finding.Message.Contains("broader", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(findings, finding => finding.Message.Contains("permissions", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]
     public void Long_lived_nuget_api_key_architecture_is_blocking()
     {
-        using var repository = WorkflowRepository.Create("release.yml", ReleaseWorkflow + "\n          - run: dotnet nuget push --api-key ${{ secrets.NUGET_API_KEY }}\n");
+        using var repository = WorkflowRepository.Create("release.yml", Mutate(
+            ReleaseWorkflow,
+            "- shell: pwsh\n        env:\n          NUGET_API_KEY: ${{ steps.nuget-login.outputs.NUGET_API_KEY }}",
+            "- run: dotnet nuget push artifacts/release/KeelMatrix.NuGetReady.1.0.0.nupkg --api-key ${{ secrets.NUGET_API_KEY }}\n      - shell: pwsh\n        env:\n          NUGET_API_KEY: ${{ steps.nuget-login.outputs.NUGET_API_KEY }}"));
 
         var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
 
@@ -1143,11 +1222,16 @@ public sealed class WorkflowPolicyTests
     [InlineData("secrets['NUGET_API_KEY']")]
     [InlineData("secrets[\"NUGET_API_KEY\"]")]
     [InlineData("secrets[NUGET_API_KEY]")]
+    [InlineData("secrets.RELEASE_CREDENTIAL")]
+    [InlineData("secrets['PUBLISH_KEY']")]
     public void Bracket_secret_references_are_blocking(string secretReference)
     {
         using var repository = WorkflowRepository.Create(
             "release.yml",
-            ReleaseWorkflow + "\n          - run: dotnet nuget push --api-key ${{ " + secretReference + " }}\n");
+            Mutate(
+                ReleaseWorkflow,
+                "- shell: pwsh\n        env:\n          NUGET_API_KEY: ${{ steps.nuget-login.outputs.NUGET_API_KEY }}",
+                "- run: dotnet nuget push artifacts/release/KeelMatrix.NuGetReady.1.0.0.nupkg --api-key ${{ " + secretReference + " }}\n      - shell: pwsh\n        env:\n          NUGET_API_KEY: ${{ steps.nuget-login.outputs.NUGET_API_KEY }}"));
 
         var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
 
@@ -1155,15 +1239,16 @@ public sealed class WorkflowPolicyTests
     }
 
     [Fact]
-    public void Broad_package_wildcard_is_reported_as_a_warning()
+    public void Broad_package_wildcard_is_a_deterministic_failure()
     {
-        using var repository = WorkflowRepository.Create("release.yml", ReleaseWorkflow.Replace("artifacts/KeelMatrix.NuGetReady.1.0.0.nupkg", "artifacts/*.nupkg"));
+        using var repository = WorkflowRepository.Create("release.yml", Mutate(
+            ReleaseWorkflow,
+            "dotnet nuget push artifacts/release/KeelMatrix.NuGetReady.1.0.0.nupkg",
+            "dotnet nuget push artifacts/release/*.nupkg"));
 
         var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
 
-        var finding = Assert.Single(findings);
-        Assert.True(finding.IsWarning);
-        Assert.False(finding.IsError);
+        Assert.Contains(findings, finding => !finding.IsWarning && !finding.IsError && finding.Message.Contains("exact", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]
@@ -1196,7 +1281,7 @@ public sealed class WorkflowPolicyTests
     }
 
     [Fact]
-    public void Inline_write_all_is_rejected_but_contents_write_in_a_separate_release_job_is_allowed()
+    public void Write_all_and_an_additional_github_release_job_are_not_certified()
     {
         using var repository = WorkflowRepository.Create("release.yml", """
             name: release
@@ -1221,36 +1306,22 @@ public sealed class WorkflowPolicyTests
 
         var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
 
-        Assert.Contains(findings, finding => finding.Message.Contains("broader", StringComparison.OrdinalIgnoreCase));
-        Assert.DoesNotContain(findings, finding => finding.Message.Contains("contents", StringComparison.OrdinalIgnoreCase) && finding.Message.Contains("broader", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(findings, finding => finding.IsError || finding.Message.Contains("permissions", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]
     public void Artifact_validation_must_execute_before_publication()
     {
-        using var repository = WorkflowRepository.Create("release.yml", """
-            name: release
-            on:
-              push:
-                tags: ["v*.*.*"]
-            permissions:
-              contents: read
-            env:
-              KEELMATRIX_NO_TELEMETRY: '1'
-            jobs:
-              publish:
-                permissions:
-                  id-token: write
-                  contents: read
-                steps:
-                  - uses: NuGet/login@v1
-                  - run: dotnet nuget push artifacts/KeelMatrix.NuGetReady.1.0.0.nupkg
-                  - run: dotnet nugetready check --artifacts artifacts/packages
-            """);
+        const string validation = "- name: Validate exact artifacts\n        shell: pwsh\n        run: dotnet run --project src/KeelMatrix.NuGetReady/KeelMatrix.NuGetReady.csproj --configuration Release --no-build --no-restore -- check --config nugetready.json --artifacts artifacts/release --format json";
+        const string upload = "- name: Upload exact artifacts\n        uses: actions/upload-artifact@v4\n        with:\n          name: validated-release-artifacts\n          path: |\n            artifacts/release/KeelMatrix.NuGetReady.1.0.0.nupkg\n            artifacts/release/KeelMatrix.NuGetReady.1.0.0.snupkg\n          if-no-files-found: error";
+        using var repository = WorkflowRepository.Create("release.yml", Mutate(
+            ReleaseWorkflow,
+            $"{validation}\n      {upload}",
+            $"{upload}\n      {validation}"));
 
         var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
 
-        Assert.Contains(findings, finding => finding.Message.Contains("before publication", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(findings, finding => finding.IsError && finding.Message.Contains("validation", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]
@@ -1269,27 +1340,10 @@ public sealed class WorkflowPolicyTests
     [Fact]
     public void Job_telemetry_opt_out_overrides_workflow_opt_out_when_disabled()
     {
-        using var repository = WorkflowRepository.Create("release.yml", """
-            name: release
-            on:
-              push:
-                tags: ["v*.*.*"]
-            env:
-              KEELMATRIX_NO_TELEMETRY: '1'
-            permissions:
-              contents: read
-            jobs:
-              publish:
-                permissions:
-                  id-token: write
-                  contents: read
-                env:
-                  KEELMATRIX_NO_TELEMETRY: '0'
-                steps:
-                  - run: dotnet nugetready check --artifacts artifacts/packages
-                  - uses: NuGet/login@v1
-                  - run: dotnet nuget push artifacts/KeelMatrix.NuGetReady.1.0.0.nupkg
-            """);
+        using var repository = WorkflowRepository.Create("release.yml", Mutate(
+            ReleaseWorkflow,
+            "      contents: read\n    env:\n      KEELMATRIX_NO_TELEMETRY: '1'\n      DOTNET_CLI_TELEMETRY_OPTOUT: '1'",
+            "      contents: read\n    env:\n      KEELMATRIX_NO_TELEMETRY: '0'\n      DOTNET_CLI_TELEMETRY_OPTOUT: '0'"));
 
         var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
 
@@ -1299,27 +1353,11 @@ public sealed class WorkflowPolicyTests
     [Fact]
     public void An_opt_out_confined_to_an_unrelated_step_does_not_suppress_release_telemetry()
     {
-        using var repository = WorkflowRepository.Create("release.yml", """
-            name: release
-            on:
-              push:
-                tags: ["v*.*.*"]
-            permissions:
-              contents: read
-            jobs:
-              publish:
-                permissions:
-                  id-token: write
-                  contents: read
-                steps:
-                  - name: unrelated setup
-                    env:
-                      KEELMATRIX_NO_TELEMETRY: '1'
-                    run: echo setup
-                  - run: dotnet nugetready check --artifacts artifacts/packages
-                  - uses: NuGet/login@v1
-                  - run: dotnet nuget push artifacts/KeelMatrix.NuGetReady.1.0.0.nupkg
-            """);
+        var workflow = Mutate(
+            ReleaseWorkflow,
+            "    env:\n      KEELMATRIX_NO_TELEMETRY: '1'\n      DOTNET_CLI_TELEMETRY_OPTOUT: '1'\n    steps:\n      - uses: actions/download-artifact@v4",
+            "    steps:\n      - uses: actions/download-artifact@v4\n        env:\n          KEELMATRIX_NO_TELEMETRY: '1'\n          DOTNET_CLI_TELEMETRY_OPTOUT: '1'");
+        using var repository = WorkflowRepository.Create("release.yml", workflow);
 
         var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
 
@@ -1341,7 +1379,7 @@ public sealed class WorkflowPolicyTests
 
         var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
 
-        var finding = Assert.Single(findings, finding => finding.IsWarning && finding.Message.Contains("unproven", StringComparison.OrdinalIgnoreCase));
+        var finding = Assert.Single(findings, finding => finding.IsError && finding.Message.Contains("unproven", StringComparison.OrdinalIgnoreCase));
         Assert.Contains("reusable", finding.Message, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain(findings, finding => finding.Message.Contains("does not contain an executable package publication step", StringComparison.OrdinalIgnoreCase));
     }
@@ -1561,24 +1599,62 @@ public sealed class WorkflowPolicyTests
         permissions:
           contents: read
         jobs:
+          validate:
+            runs-on: ubuntu-latest
+            timeout-minutes: 30
+            env:
+              KEELMATRIX_NO_TELEMETRY: '1'
+              DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+            steps:
+              - name: Validate exact artifacts
+                shell: pwsh
+                run: dotnet run --project src/KeelMatrix.NuGetReady/KeelMatrix.NuGetReady.csproj --configuration Release --no-build --no-restore -- check --config nugetready.json --artifacts artifacts/release --format json
+              - name: Upload exact artifacts
+                uses: actions/upload-artifact@v4
+                with:
+                  name: validated-release-artifacts
+                  path: |
+                    artifacts/release/KeelMatrix.NuGetReady.1.0.0.nupkg
+                    artifacts/release/KeelMatrix.NuGetReady.1.0.0.snupkg
+                  if-no-files-found: error
           publish:
+            needs: validate
+            runs-on: ubuntu-latest
+            timeout-minutes: 10
             permissions:
               id-token: write
               contents: read
             env:
               KEELMATRIX_NO_TELEMETRY: '1'
+              DOTNET_CLI_TELEMETRY_OPTOUT: '1'
             steps:
-              - run: dotnet nugetready check --artifacts artifacts/packages
-              - uses: NuGet/login@v1
-              - run: dotnet nuget push artifacts/KeelMatrix.NuGetReady.1.0.0.nupkg
+              - uses: actions/download-artifact@v4
+                with:
+                  name: validated-release-artifacts
+                  path: artifacts/release
+              - id: nuget-login
+                uses: NuGet/login@v1
+                with:
+                  user: dmitriyzen
+              - shell: pwsh
+                env:
+                  NUGET_API_KEY: ${{ steps.nuget-login.outputs.NUGET_API_KEY }}
+                run: dotnet nuget push artifacts/release/KeelMatrix.NuGetReady.1.0.0.nupkg --source https://api.nuget.org/v3/index.json --api-key "$env:NUGET_API_KEY"
         """;
+
+    private static string Mutate(string workflow, string original, string replacement)
+    {
+        workflow = workflow.Replace("\r\n", "\n", StringComparison.Ordinal);
+        Assert.Contains(original, workflow, StringComparison.Ordinal);
+        return workflow.Replace(original, replacement, StringComparison.Ordinal);
+    }
 
     private static void AssertLimitedUnproven(WorkflowInspectionResult inspection)
     {
         Assert.True(
             inspection.Evaluated,
             $"EVALUATED={inspection.Evaluated}; FINDINGS={(inspection.Failures.Count == 0 ? "none" : string.Join(" | ", inspection.Failures.Select(failure => failure.Message)))}");
-        Assert.Contains(inspection.Failures, failure => failure.IsWarning && failure.Message.Contains("unproven", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(inspection.Failures, failure => failure.IsError && failure.Message.Contains("unproven", StringComparison.OrdinalIgnoreCase));
     }
 }
 
@@ -1596,6 +1672,24 @@ internal sealed class WorkflowRepository : IDisposable
         var root = Directory.CreateTempSubdirectory("nugetready-workflow-");
         var directory = Directory.CreateDirectory(Path.Combine(root.FullName, ".github", "workflows"));
         File.WriteAllText(Path.Combine(directory.FullName, fileName), content);
+        File.WriteAllText(Path.Combine(root.FullName, "nugetready.json"), """
+            {
+              "schemaVersion": 1,
+              "packages": [
+                {
+                  "id": "KeelMatrix.NuGetReady",
+                  "kind": "dotnetTool",
+                  "version": "1.0.0",
+                  "artifacts": [
+                    "KeelMatrix.NuGetReady.1.0.0.nupkg",
+                    "KeelMatrix.NuGetReady.1.0.0.snupkg"
+                  ],
+                  "command": "nugetready",
+                  "smoke": ["--help"]
+                }
+              ]
+            }
+            """);
         return new WorkflowRepository(root);
     }
 

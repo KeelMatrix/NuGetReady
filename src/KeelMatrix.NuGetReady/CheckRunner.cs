@@ -155,7 +155,7 @@ internal static class CheckRunner
 
         if (repositoryPath is not null && !archiveParseBlocked)
         {
-            var workflowInspection = WorkflowPolicyInspector.InspectDetailed(repositoryPath);
+            var workflowInspection = WorkflowPolicyInspector.InspectDetailed(repositoryPath, config);
             foreach (var failure in workflowInspection.Failures)
             {
                 failures["workflow-policy"].Add(failure);

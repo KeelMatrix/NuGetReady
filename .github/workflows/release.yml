@@ -4,26 +4,15 @@ on:
   push:
     tags:
       - 'v*.*.*'
-  workflow_dispatch:
-    inputs:
-      version:
-        description: Version to validate against the current repository state
-        required: true
-        type: string
+
 permissions:
   contents: read
 
-concurrency:
-  group: release-${{ github.ref }}
-  cancel-in-progress: false
-
 jobs:
   validate:
-    name: Validate release
+    name: Validate the exact release artifacts
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    outputs:
-      version: ${{ steps.release-version.outputs.version }}
     env:
       KEELMATRIX_NO_TELEMETRY: '1'
       DOTNET_CLI_TELEMETRY_OPTOUT: '1'
@@ -32,7 +21,7 @@ jobs:
       MSBUILDDISABLENODEREUSE: '1'
 
     steps:
-      - name: Check out source at the triggering ref
+      - name: Check out source at the triggering tag
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
@@ -43,42 +32,17 @@ jobs:
         with:
           global-json-file: global.json
 
-      - name: Restore from controlled sources
+      - name: Restore from controlled sources and audit dependencies
         shell: pwsh
         run: |
           dotnet restore KeelMatrix.NuGetReady.sln --configfile NuGet.config --nologo -p:NuGetAuditMode=all -p:NuGetAuditLevel=low -p:TreatWarningsAsErrors=true
           if ($LASTEXITCODE -ne 0) { throw "Dependency restore or NuGet audit failed." }
 
-      - name: Resolve and validate release version
-        id: release-version
+      - name: Validate the tag and repository release contract
         shell: pwsh
-        env:
-          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          $ErrorActionPreference = 'Stop'
-          if ($env:GITHUB_EVENT_NAME -eq 'push') {
-            if ($env:GITHUB_REF_NAME -notmatch '^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$') {
-              throw "The pushed ref is not a supported version tag: $env:GITHUB_REF_NAME"
-            }
-            $version = $env:GITHUB_REF_NAME.Substring(1)
-            $mode = 'Tag'
-          }
-          else {
-            $version = $env:INPUT_VERSION
-            if ([string]::IsNullOrWhiteSpace($version)) { throw "workflow_dispatch requires a version input." }
-            $mode = 'PreRelease'
-          }
-
-          if ($mode -eq 'Tag') {
-            & pwsh -NoProfile -NonInteractive -File scripts/validate-release-contract.ps1 `
-              -RepositoryRoot $env:GITHUB_WORKSPACE -Mode Tag -ExpectedVersion $version -TagVersion $env:GITHUB_REF_NAME
-          }
-          else {
-            & pwsh -NoProfile -NonInteractive -File scripts/validate-release-contract.ps1 `
-              -RepositoryRoot $env:GITHUB_WORKSPACE -Mode PreRelease -ExpectedVersion $version
-          }
+          pwsh -NoProfile -NonInteractive -File scripts/validate-release-contract.ps1 -RepositoryRoot $env:GITHUB_WORKSPACE -Mode Tag -ExpectedVersion 0.1.0 -TagVersion $env:GITHUB_REF_NAME
           if ($LASTEXITCODE -ne 0) { throw "Release contract validation failed." }
-          "version=$version" >> $env:GITHUB_OUTPUT
 
       - name: Verify format
         shell: pwsh
@@ -100,8 +64,6 @@ jobs:
 
       - name: Pack the exact release artifacts
         shell: pwsh
-        env:
-          RELEASE_VERSION: ${{ steps.release-version.outputs.version }}
         run: |
           $ErrorActionPreference = 'Stop'
           $output = Join-Path $env:GITHUB_WORKSPACE 'artifacts/release'
@@ -111,8 +73,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Release package creation failed." }
 
           $expected = @(
-            "KeelMatrix.NuGetReady.$env:RELEASE_VERSION.nupkg",
-            "KeelMatrix.NuGetReady.$env:RELEASE_VERSION.snupkg"
+            'KeelMatrix.NuGetReady.0.1.0.nupkg',
+            'KeelMatrix.NuGetReady.0.1.0.snupkg'
           )
           $actual = @(Get-ChildItem -LiteralPath $output -File | ForEach-Object { $_.Name })
           $difference = Compare-Object ($expected | Sort-Object) ($actual | Sort-Object)
@@ -122,34 +84,25 @@ jobs:
 
       - name: Inspect the exact package archives
         shell: pwsh
-        env:
-          RELEASE_VERSION: ${{ steps.release-version.outputs.version }}
         run: |
-          $output = Join-Path $env:GITHUB_WORKSPACE 'artifacts/release'
-          pwsh -NoProfile -File scripts/inspect-package.ps1 `
-            -PackagePath (Join-Path $output "KeelMatrix.NuGetReady.$env:RELEASE_VERSION.nupkg") `
-            -SymbolsPackagePath (Join-Path $output "KeelMatrix.NuGetReady.$env:RELEASE_VERSION.snupkg") `
-            -ExpectedVersion $env:RELEASE_VERSION
+          pwsh -NoProfile -File scripts/inspect-package.ps1 -PackagePath artifacts/release/KeelMatrix.NuGetReady.0.1.0.nupkg -SymbolsPackagePath artifacts/release/KeelMatrix.NuGetReady.0.1.0.snupkg -ExpectedVersion 0.1.0
           if ($LASTEXITCODE -ne 0) { throw "Package archive inspection failed." }
 
-      - name: Rehearse the built package
+      - name: Validate the exact package set with NuGetReady
         shell: pwsh
-        run: |
-          dotnet run --project src/KeelMatrix.NuGetReady/KeelMatrix.NuGetReady.csproj --configuration Release --no-build --no-restore -- check --config nugetready.json --artifacts artifacts/release --format json
-          if ($LASTEXITCODE -ne 0) { throw "Built package rehearsal failed." }
+        run: dotnet run --project src/KeelMatrix.NuGetReady/KeelMatrix.NuGetReady.csproj --configuration Release --no-build --no-restore -- check --config nugetready.json --artifacts artifacts/release --format json
 
       - name: Upload only the validated release artifacts
         uses: actions/upload-artifact@v4
         with:
           name: validated-release-artifacts
-          if-no-files-found: error
           path: |
-            artifacts/release/KeelMatrix.NuGetReady.${{ steps.release-version.outputs.version }}.nupkg
-            artifacts/release/KeelMatrix.NuGetReady.${{ steps.release-version.outputs.version }}.snupkg
+            artifacts/release/KeelMatrix.NuGetReady.0.1.0.nupkg
+            artifacts/release/KeelMatrix.NuGetReady.0.1.0.snupkg
+          if-no-files-found: error
 
   publish:
-    name: Publish release
-    if: github.event_name == 'push'
+    name: Publish the exact validated package
     needs: validate
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -164,17 +117,6 @@ jobs:
       MSBUILDDISABLENODEREUSE: '1'
 
     steps:
-      - name: Check out source at the triggering ref
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-          ref: ${{ github.ref }}
-
-      - name: Set up .NET SDK
-        uses: actions/setup-dotnet@v5
-        with:
-          global-json-file: global.json
-
       - name: Download the validated release artifacts
         uses: actions/download-artifact@v4
         with:
@@ -187,12 +129,8 @@ jobs:
         with:
           user: dmitriyzen
 
-      - name: Publish the exact validated package and adjacent symbols once
+      - name: Publish the exact validated package
         shell: pwsh
         env:
-          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
-          NUGET_TEMP_CREDENTIAL: ${{ steps.nuget-login.outputs[format('NUGET_{0}', 'API_KEY')] }}
-        run: |
-          $package = "artifacts/release/KeelMatrix.NuGetReady.$env:RELEASE_VERSION.nupkg"
-          dotnet nuget push $package -k $env:NUGET_TEMP_CREDENTIAL --source https://api.nuget.org/v3/index.json
-          if ($LASTEXITCODE -ne 0) { throw "NuGet package publication failed." }
+          NUGET_API_KEY: ${{ steps.nuget-login.outputs.NUGET_API_KEY }}
+        run: dotnet nuget push artifacts/release/KeelMatrix.NuGetReady.0.1.0.nupkg --source https://api.nuget.org/v3/index.json --api-key "$env:NUGET_API_KEY"

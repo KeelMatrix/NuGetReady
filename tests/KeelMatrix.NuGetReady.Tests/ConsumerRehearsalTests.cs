@@ -445,7 +445,7 @@ public sealed class ConsumerRehearsalTests
         var report = CheckRunner.Run(
             config,
             artifactsPath.FullName,
-            corpus.RepositoryRoot,
+            corpus.Root.FullName,
             TimeSpan.FromMinutes(2),
             new ConsumerRehearsalOptions(ProcessRunner: WarningOnlyBadImage));
 
@@ -698,7 +698,7 @@ public sealed class ConsumerRehearsalTests
                 var report = CheckRunner.Run(
                     Config(expectations.ToArray()),
                     caseRoot.FullName,
-                    corpus.RepositoryRoot,
+                    corpus.Root.FullName,
                     TimeSpan.FromMinutes(2),
                     new ConsumerRehearsalOptions(PublicFeedPath: publicFeed.FullName));
 

@@ -26,8 +26,8 @@ public sealed class ReleaseWorkflowContractTests
         Assert.Single(pushLines);
         Assert.DoesNotContain("--skip-duplicate", workflow, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain(".snupkg", pushLines[0], StringComparison.OrdinalIgnoreCase);
-        Assert.Contains("$package = \"artifacts/release/KeelMatrix.NuGetReady.$env:RELEASE_VERSION.nupkg\"", workflow, StringComparison.Ordinal);
-        Assert.Contains("$package", pushLines[0], StringComparison.Ordinal);
+        Assert.Contains("dotnet nuget push artifacts/release/KeelMatrix.NuGetReady.0.1.0.nupkg", pushLines[0], StringComparison.Ordinal);
+        Assert.Contains("--api-key \"$env:NUGET_API_KEY\"", pushLines[0], StringComparison.Ordinal);
         Assert.DoesNotMatch(new Regex("dotnet\\s+nuget\\s+push[^\\r\\n]*\\.snupkg", RegexOptions.IgnoreCase), workflow);
     }
 

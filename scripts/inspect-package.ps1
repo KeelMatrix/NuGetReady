@@ -64,11 +64,15 @@ function Assert-NuspecContract {
     Assert-Contract ($groups.Count -eq 1 -and $groups[0].targetFramework -eq "net8.0") "Expected one net8.0 dependency group."
     $dependencies = @($groups[0].SelectNodes("n:dependency", $namespace))
     $dependencyIds = @($dependencies | ForEach-Object { $_.id } | Sort-Object)
-    Assert-Contract (($dependencyIds -join ",") -eq "KeelMatrix.Telemetry,NuGet.Packaging") "Unexpected dependency set: $($dependencyIds -join ', ')."
+    Assert-Contract (($dependencyIds -join ",") -eq "KeelMatrix.Telemetry,NuGet.Packaging,YamlDotNet") "Unexpected dependency set: $($dependencyIds -join ', ')."
     $telemetry = $dependencies | Where-Object { $_.id -eq "KeelMatrix.Telemetry" } | Select-Object -First 1
     Assert-Contract ($null -ne $telemetry) "KeelMatrix.Telemetry dependency is missing."
     Assert-Contract ($telemetry.version -eq "[0.1.1]") "KeelMatrix.Telemetry must be pinned to [0.1.1]."
     Assert-Contract ($telemetry.exclude -eq "Build,Analyzers") "KeelMatrix.Telemetry dependency exclusions are incorrect."
+    $yaml = $dependencies | Where-Object { $_.id -eq "YamlDotNet" } | Select-Object -First 1
+    Assert-Contract ($null -ne $yaml) "YamlDotNet dependency is missing."
+    Assert-Contract ($yaml.version -eq "18.1.0") "YamlDotNet must use version 18.1.0."
+    Assert-Contract ($yaml.exclude -eq "Build,Analyzers") "YamlDotNet dependency exclusions are incorrect."
 }
 
 function Inspect-Archive {
@@ -87,6 +91,7 @@ function Inspect-Archive {
                 "icon.png",
                 "tools/net8.0/any/KeelMatrix.NuGetReady.dll",
                 "tools/net8.0/any/KeelMatrix.Telemetry.dll",
+                "tools/net8.0/any/YamlDotNet.dll",
                 "tools/net8.0/any/DotnetToolSettings.xml")) {
                 Assert-Contract ($entries -contains $required) "Required package entry is missing: $required"
             }
@@ -112,6 +117,7 @@ function Inspect-Archive {
                 "tools/net8.0/any/NuGet.Versioning.dll",
                 "tools/net8.0/any/System.Security.Cryptography.Pkcs.dll",
                 "tools/net8.0/any/System.Security.Cryptography.ProtectedData.dll",
+                "tools/net8.0/any/YamlDotNet.dll",
                 "tools/net8.0/any/runtimes/win/lib/net8.0/System.Security.Cryptography.Pkcs.dll"
             )
         }

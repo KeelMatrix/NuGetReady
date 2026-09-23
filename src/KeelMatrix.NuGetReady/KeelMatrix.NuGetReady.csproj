@@ -30,6 +30,7 @@
 
   <ItemGroup>
     <PackageReference Include="NuGet.Packaging" />
+    <PackageReference Include="YamlDotNet" />
     <PackageReference Include="KeelMatrix.Telemetry" />
     <None Include="README.md" Pack="true" PackagePath="README.md" />
     <None Include="..\..\icon.png" Pack="true" PackagePath="icon.png" Link="icon.png" Visible="false" />
