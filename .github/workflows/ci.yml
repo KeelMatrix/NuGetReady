@@ -209,6 +209,7 @@ jobs:
             $PSNativeCommandUseErrorActionPreference = $nativePreference
           }
           if ($negativeExit -eq 0) { throw "A published-looking substitute satisfied the exact local package mapping." }
+          $global:LASTEXITCODE = 0
 
       - name: Verify cached substitution is rejected
         shell: pwsh
