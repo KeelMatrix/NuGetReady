@@ -730,11 +730,14 @@ internal static class WorkflowPolicyInspector
     private sealed record CommandAnalysis(
         IReadOnlyList<ScriptReference> ScriptReferences,
         IReadOnlyList<string> InnerCommands,
-        bool IsUnresolved)
+        bool IsUnresolved,
+        bool IsSafeCommand)
     {
-        public static CommandAnalysis Empty { get; } = new(Array.Empty<ScriptReference>(), Array.Empty<string>(), false);
+        public static CommandAnalysis Empty { get; } = new(Array.Empty<ScriptReference>(), Array.Empty<string>(), false, false);
 
-        public static CommandAnalysis Unresolved { get; } = new(Array.Empty<ScriptReference>(), Array.Empty<string>(), true);
+        public static CommandAnalysis Unresolved { get; } = new(Array.Empty<ScriptReference>(), Array.Empty<string>(), true, false);
+
+        public static CommandAnalysis Safe { get; } = new(Array.Empty<ScriptReference>(), Array.Empty<string>(), false, true);
     }
 
     private sealed record ScriptReference(string Path, bool RelativeToCurrentScript);
@@ -744,6 +747,8 @@ internal static class WorkflowPolicyInspector
         public HashSet<string> ActiveScripts { get; } = new(StringComparer.OrdinalIgnoreCase);
 
         public Dictionary<string, IndirectPublicationPath> ScriptResults { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+        public HashSet<string> SafePowerShellFunctions { get; } = new(StringComparer.OrdinalIgnoreCase);
 
         public HashSet<string> ActiveComposites { get; } = new(StringComparer.OrdinalIgnoreCase);
 
@@ -1022,6 +1027,7 @@ internal static class WorkflowPolicyInspector
 
         var result = IndirectPublicationPath.ProvenNonPublishing;
         var inspected = false;
+        var safePowerShellFunctions = FindSafePowerShellFunctions(content, context.SafePowerShellFunctions);
         foreach (var rawLine in SplitCommandSegments(content))
         {
             var line = rawLine.Trim();
@@ -1030,11 +1036,14 @@ internal static class WorkflowPolicyInspector
                 continue;
             }
 
-            var analysis = AnalyzeCommandLine(line);
-            if (analysis.IsUnresolved)
+            var analysis = AnalyzeCommandLine(line, safePowerShellFunctions);
+            if (analysis.IsSafeCommand || analysis.IsUnresolved)
             {
                 inspected = true;
-                result = IndirectPublicationPath.Unknown;
+                if (analysis.IsUnresolved)
+                {
+                    result = IndirectPublicationPath.Unknown;
+                }
             }
 
             foreach (var innerCommand in analysis.InnerCommands)
@@ -1070,7 +1079,17 @@ internal static class WorkflowPolicyInspector
                 {
                     result = scriptResult;
                 }
+
+                if (scriptResult == IndirectPublicationPath.ProvenNonPublishing)
+                {
+                    safePowerShellFunctions = FindSafePowerShellFunctions(content, context.SafePowerShellFunctions);
+                }
             }
+        }
+
+        if (result == IndirectPublicationPath.ProvenNonPublishing)
+        {
+            context.SafePowerShellFunctions.UnionWith(safePowerShellFunctions);
         }
 
         return inspected ? result : null;
@@ -1110,12 +1129,26 @@ internal static class WorkflowPolicyInspector
                 quote = character;
                 segment.Append(character);
             }
+            else if (character == '`' && index + 1 < content.Length && content[index + 1] is '\r' or '\n')
+            {
+                if (content[index + 1] == '\r' && index + 2 < content.Length && content[index + 2] == '\n')
+                {
+                    index += 2;
+                }
+                else
+                {
+                    index++;
+                }
+
+                segment.Append(' ');
+            }
             else if (character is '\r' or '\n' or ';')
             {
                 Flush();
             }
             else if ((character == '&' && index + 1 < content.Length && content[index + 1] == '&') ||
-                     (character == '|' && index + 1 < content.Length && content[index + 1] == '|'))
+                     (character == '|' && index + 1 < content.Length && content[index + 1] == '|') ||
+                     character == '|')
             {
                 Flush();
                 index++;
@@ -1130,7 +1163,7 @@ internal static class WorkflowPolicyInspector
         return segments;
     }
 
-    private static CommandAnalysis AnalyzeCommandLine(string line)
+    private static CommandAnalysis AnalyzeCommandLine(string line, HashSet<string>? safePowerShellFunctions = null)
     {
         var tokens = TokenizeCommandLine(line);
         if (tokens.Length == 0)
@@ -1160,7 +1193,7 @@ internal static class WorkflowPolicyInspector
                     var innerCommand = string.Join(' ', tokens.Skip(index + 1));
                     return IsDerivedPathToken(innerCommand)
                         ? CommandAnalysis.Unresolved
-                        : new CommandAnalysis(Array.Empty<ScriptReference>(), new[] { innerCommand }, false);
+                        : new CommandAnalysis(Array.Empty<ScriptReference>(), new[] { innerCommand }, false, false);
                 }
 
                 if (IsEncodedCommandOption(token))
@@ -1179,7 +1212,7 @@ internal static class WorkflowPolicyInspector
                     var reference = tokens[index + 1];
                     return reference.StartsWith('-')
                         ? CommandAnalysis.Unresolved
-                        : new CommandAnalysis(new[] { new ScriptReference(reference, false) }, Array.Empty<string>(), false);
+                         : new CommandAnalysis(new[] { new ScriptReference(reference, false) }, Array.Empty<string>(), false, false);
                 }
 
                 if (IsDerivedPathToken(token))
@@ -1189,20 +1222,28 @@ internal static class WorkflowPolicyInspector
 
                 if (!token.StartsWith('-') && !token.StartsWith('/'))
                 {
-                    return new CommandAnalysis(new[] { new ScriptReference(token, false) }, Array.Empty<string>(), false);
+                    return new CommandAnalysis(new[] { new ScriptReference(token, false) }, Array.Empty<string>(), false, false);
                 }
             }
 
             return CommandAnalysis.Empty;
         }
 
-        if (IsDerivedPathToken(command))
-        {
-            return CommandAnalysis.Empty;
-        }
-
         if (command.Equals(".", StringComparison.Ordinal))
         {
+            var sourcedScript = Regex.Match(
+                line,
+                @"^\s*\.\s*\(\s*Join-Path\s+\$PSScriptRoot\s+[""'](?<path>[^""']+)[""']\s*\)",
+                RegexOptions.IgnoreCase);
+            if (sourcedScript.Success)
+            {
+                return new CommandAnalysis(
+                    new[] { new ScriptReference(sourcedScript.Groups["path"].Value, RelativeToCurrentScript: true) },
+                    Array.Empty<string>(),
+                    false,
+                    false);
+            }
+
             var relativeScript = tokens
                 .Skip(commandIndex + 1)
                 .FirstOrDefault(token => IsScriptPathToken(token));
@@ -1212,9 +1253,22 @@ internal static class WorkflowPolicyInspector
                 return new CommandAnalysis(
                     new[] { new ScriptReference(relativeScript, RelativeToCurrentScript: true) },
                     Array.Empty<string>(),
+                    false,
                     false);
             }
 
+            return CommandAnalysis.Unresolved;
+        }
+
+        if (IsSafeCommand(command, tokens, commandIndex) ||
+            safePowerShellFunctions?.Contains(command) == true ||
+            IsSafePowerShellStatement(line, safePowerShellFunctions))
+        {
+            return CommandAnalysis.Safe;
+        }
+
+        if (IsDerivedPathToken(command))
+        {
             return CommandAnalysis.Unresolved;
         }
 
@@ -1226,15 +1280,312 @@ internal static class WorkflowPolicyInspector
                 return CommandAnalysis.Unresolved;
             }
 
-            if (IsScriptPathToken(argument))
-            {
-                return new CommandAnalysis(new[] { new ScriptReference(argument, false) }, Array.Empty<string>(), false);
-            }
         }
 
         return IsScriptPathToken(command)
-            ? new CommandAnalysis(new[] { new ScriptReference(command, false) }, Array.Empty<string>(), false)
-            : CommandAnalysis.Empty;
+            ? new CommandAnalysis(new[] { new ScriptReference(command, false) }, Array.Empty<string>(), false, false)
+            : CommandAnalysis.Unresolved;
+    }
+
+    private static HashSet<string> FindSafePowerShellFunctions(
+        string content,
+        HashSet<string>? inheritedSafePowerShellFunctions = null)
+    {
+        var definitions = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (Match match in Regex.Matches(
+                     content,
+                     @"(?im)^\s*function\s+(?<name>[A-Za-z_][A-Za-z0-9-]*)\b[^\r\n{]*\{"))
+        {
+            var bodyStart = match.Index + match.Length;
+            var depth = 1;
+            var bodyEnd = bodyStart;
+            for (; bodyEnd < content.Length && depth > 0; bodyEnd++)
+            {
+                if (content[bodyEnd] == '{')
+                {
+                    depth++;
+                }
+                else if (content[bodyEnd] == '}')
+                {
+                    depth--;
+                }
+            }
+
+            if (depth == 0)
+            {
+                definitions[match.Groups["name"].Value] = content[bodyStart..(bodyEnd - 1)];
+            }
+        }
+
+        var safe = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (inheritedSafePowerShellFunctions is not null)
+        {
+            safe.UnionWith(inheritedSafePowerShellFunctions);
+        }
+        var changed = true;
+        while (changed)
+        {
+            changed = false;
+            foreach (var definition in definitions)
+            {
+                if (safe.Contains(definition.Key) ||
+                    ContainsExecutablePublicationCommand(definition.Value) ||
+                    ContainsExecutableReleasePublicationCommand(definition.Value))
+                {
+                    continue;
+                }
+
+                var proven = true;
+                foreach (var rawLine in SplitCommandSegments(definition.Value))
+                {
+                    var line = rawLine.Trim();
+                    if (line.Length == 0 || line.StartsWith('#') || IsOutputOnlyCommand(line))
+                    {
+                        continue;
+                    }
+
+                    var analysis = AnalyzeCommandLine(line, safe);
+                    if (analysis.IsUnresolved)
+                    {
+                        proven = false;
+                        break;
+                    }
+                }
+
+                if (proven)
+                {
+                    safe.Add(definition.Key);
+                    changed = true;
+                }
+            }
+        }
+
+        return safe;
+    }
+
+    private static bool IsSafePowerShellStatement(string line, HashSet<string>? safePowerShellFunctions)
+    {
+        if (Regex.IsMatch(line, @"^\s*[""']", RegexOptions.IgnoreCase))
+        {
+            return true;
+        }
+
+        if (Regex.IsMatch(line, @"^\s*@\{", RegexOptions.IgnoreCase))
+        {
+            return !Regex.IsMatch(
+                line,
+                @"(?i)\b(?:dotnet\s+nuget(?:\.exe)?\s+push|nuget(?:\.exe)?\s+push|gh\s+release\s+create|(?:curl|wget|Invoke-WebRequest|Invoke-RestMethod|Start-Process))\b");
+        }
+
+        if (Regex.IsMatch(
+                line,
+                @"(?i)\b(?:dotnet\s+nuget(?:\.exe)?\s+push|nuget(?:\.exe)?\s+push|gh\s+release\s+create|(?:curl|wget|Invoke-WebRequest|Invoke-RestMethod|Start-Process))\b"))
+        {
+            return false;
+        }
+
+        if (Regex.IsMatch(line, @"^\s*\$[A-Za-z_][A-Za-z0-9_:.-]*(?:\[[^\]]+\])?\s*(?:\+=|-=|=)\s*", RegexOptions.IgnoreCase))
+        {
+            foreach (Match match in Regex.Matches(
+                         line,
+                         @"(?:\$\(\s*|=\s*\(\s*|\]\s*\(\s*)(?<command>[A-Za-z_][A-Za-z0-9-]*)\b",
+                         RegexOptions.IgnoreCase))
+            {
+                if (!IsSafeCommand(match.Groups["command"].Value, new[] { match.Groups["command"].Value }, 0) &&
+                    safePowerShellFunctions?.Contains(match.Groups["command"].Value) != true)
+                {
+                    return false;
+                }
+            }
+
+            return !line.Contains("$({", StringComparison.Ordinal) &&
+                   !line.Contains("& ", StringComparison.Ordinal) &&
+                   !Regex.IsMatch(line, @"(?i)\b(?:System\.Diagnostics\.Process|Invoke-Expression|Invoke-Command|Start-Job|Start-ThreadJob)\b|::Start\s*\(|\.(?:Start|Invoke|Execute|Publish|Push|Run)\s*\(");
+        }
+
+        if (Regex.IsMatch(line, @"^\s*[A-Za-z_][A-Za-z0-9_-]*\s*=\s*", RegexOptions.IgnoreCase))
+        {
+            return true;
+        }
+
+        if (Regex.IsMatch(line, @"^\s*(?:Select-Object|Sort-Object)\b", RegexOptions.IgnoreCase))
+        {
+            return true;
+        }
+
+        if (Regex.IsMatch(line, @"^\s*\$[A-Za-z_][A-Za-z0-9_]*\s*(?:-lt|-le|-gt|-ge|-eq|-ne|\+\+|--|,|\)|\})", RegexOptions.IgnoreCase) ||
+            Regex.IsMatch(line, @"^\s*\(\s*\$", RegexOptions.IgnoreCase) ||
+            Regex.IsMatch(line, @"^\s*\$[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9-]*\s*\(", RegexOptions.IgnoreCase))
+        {
+            return !Regex.IsMatch(line, @"(?i)\.(?:Start|Invoke|Execute|Publish|Push|Run)\s*\(");
+        }
+
+        var structuralStatement = Regex.IsMatch(
+            line,
+            @"^\s*(?:\[.*\]|Set-StrictMode\b|param\b|function\b|if\b|elseif\b|else\b|foreach\b|for\b|while\b|switch\b|case\b|default\b|try\b|catch\b|finally\b|begin\b|process\b|end\b|throw\b|return\b|continue\b|break\b|\{|\})",
+            RegexOptions.IgnoreCase);
+        if (!structuralStatement)
+        {
+            return false;
+        }
+
+        foreach (var body in FindInlineBraceBodies(line))
+        {
+            foreach (var segment in SplitCommandSegments(body))
+            {
+                var nested = segment.Trim();
+                if (nested.Length == 0 || nested.StartsWith('#') || IsOutputOnlyCommand(nested))
+                {
+                    continue;
+                }
+
+                if (AnalyzeCommandLine(nested, safePowerShellFunctions).IsUnresolved)
+                {
+                    return false;
+                }
+            }
+        }
+
+        return true;
+    }
+
+    private static List<string> FindInlineBraceBodies(string line)
+    {
+        var bodies = new List<string>();
+        var quote = '\0';
+        var depth = 0;
+        var bodyStart = -1;
+        for (var index = 0; index < line.Length; index++)
+        {
+            var character = line[index];
+            if (quote != '\0')
+            {
+                if (character == '`' && index + 1 < line.Length)
+                {
+                    index++;
+                }
+                else if (character == quote)
+                {
+                    quote = '\0';
+                }
+
+                continue;
+            }
+
+            if (character is '\'' or '"')
+            {
+                quote = character;
+            }
+            else if (character == '{')
+            {
+                if (depth++ == 0)
+                {
+                    bodyStart = index + 1;
+                }
+            }
+            else if (character == '}' && depth > 0 && --depth == 0)
+            {
+                bodies.Add(line[bodyStart..index]);
+                bodyStart = -1;
+            }
+        }
+
+        return bodies;
+    }
+
+    private static bool IsSafeCommand(string command, string[] tokens, int commandIndex)
+    {
+        var normalizedCommand = command.TrimStart('&');
+        if (normalizedCommand.Equals("dotnet", StringComparison.OrdinalIgnoreCase) ||
+            normalizedCommand.Equals("dotnet.exe", StringComparison.OrdinalIgnoreCase))
+        {
+            if (commandIndex + 1 >= tokens.Length)
+            {
+                return false;
+            }
+
+            var subcommand = tokens[commandIndex + 1];
+            return subcommand.Equals("restore", StringComparison.OrdinalIgnoreCase) ||
+                   subcommand.Equals("build", StringComparison.OrdinalIgnoreCase) ||
+                   subcommand.Equals("test", StringComparison.OrdinalIgnoreCase) ||
+                   subcommand.Equals("pack", StringComparison.OrdinalIgnoreCase) ||
+                   subcommand.Equals("format", StringComparison.OrdinalIgnoreCase) ||
+                   subcommand.Equals("list", StringComparison.OrdinalIgnoreCase) ||
+                   subcommand.Equals("tool", StringComparison.OrdinalIgnoreCase) ||
+                   subcommand.Equals("nugetready", StringComparison.OrdinalIgnoreCase) ||
+                   (subcommand.Equals("run", StringComparison.OrdinalIgnoreCase) && IsNuGetReadyCheckInvocation(tokens, commandIndex));
+        }
+
+        if (normalizedCommand.Equals("nugetready", StringComparison.OrdinalIgnoreCase) ||
+            normalizedCommand.Equals("nugetready.exe", StringComparison.OrdinalIgnoreCase))
+        {
+            return commandIndex + 1 < tokens.Length &&
+                   tokens[commandIndex + 1].Equals("check", StringComparison.OrdinalIgnoreCase);
+        }
+
+        return normalizedCommand.Equals("git", StringComparison.OrdinalIgnoreCase) ||
+               normalizedCommand.Equals("git.exe", StringComparison.OrdinalIgnoreCase) ||
+               normalizedCommand.Equals("echo", StringComparison.OrdinalIgnoreCase) ||
+               normalizedCommand.Equals("printf", StringComparison.OrdinalIgnoreCase) ||
+               normalizedCommand.Equals("cat", StringComparison.OrdinalIgnoreCase) ||
+               normalizedCommand.Equals("cp", StringComparison.OrdinalIgnoreCase) ||
+               normalizedCommand.Equals("copy", StringComparison.OrdinalIgnoreCase) ||
+               normalizedCommand.Equals("mkdir", StringComparison.OrdinalIgnoreCase) ||
+               normalizedCommand.Equals("md", StringComparison.OrdinalIgnoreCase) ||
+               normalizedCommand.Equals("mv", StringComparison.OrdinalIgnoreCase) ||
+               normalizedCommand.Equals("move", StringComparison.OrdinalIgnoreCase) ||
+               normalizedCommand.Equals("rm", StringComparison.OrdinalIgnoreCase) ||
+               normalizedCommand.Equals("del", StringComparison.OrdinalIgnoreCase) ||
+               normalizedCommand.Equals("rmdir", StringComparison.OrdinalIgnoreCase) ||
+               normalizedCommand.Equals("touch", StringComparison.OrdinalIgnoreCase) ||
+               normalizedCommand.Equals("pwd", StringComparison.OrdinalIgnoreCase) ||
+               normalizedCommand.Equals("test", StringComparison.OrdinalIgnoreCase) ||
+               normalizedCommand.Equals("Get-ChildItem", StringComparison.OrdinalIgnoreCase) ||
+               normalizedCommand.Equals("Get-Content", StringComparison.OrdinalIgnoreCase) ||
+               normalizedCommand.Equals("Get-Item", StringComparison.OrdinalIgnoreCase) ||
+               normalizedCommand.Equals("Join-Path", StringComparison.OrdinalIgnoreCase) ||
+               normalizedCommand.Equals("Resolve-Path", StringComparison.OrdinalIgnoreCase) ||
+               normalizedCommand.Equals("Set-Content", StringComparison.OrdinalIgnoreCase) ||
+               normalizedCommand.Equals("Test-Path", StringComparison.OrdinalIgnoreCase) ||
+               normalizedCommand.Equals("New-Item", StringComparison.OrdinalIgnoreCase) ||
+               normalizedCommand.Equals("Remove-Item", StringComparison.OrdinalIgnoreCase) ||
+               normalizedCommand.Equals("Copy-Item", StringComparison.OrdinalIgnoreCase) ||
+               normalizedCommand.Equals("Move-Item", StringComparison.OrdinalIgnoreCase) ||
+               normalizedCommand.Equals("Get-Location", StringComparison.OrdinalIgnoreCase) ||
+               normalizedCommand.Equals("Push-Location", StringComparison.OrdinalIgnoreCase) ||
+               normalizedCommand.Equals("Pop-Location", StringComparison.OrdinalIgnoreCase) ||
+               normalizedCommand.Equals("ConvertFrom-Json", StringComparison.OrdinalIgnoreCase) ||
+               normalizedCommand.Equals("ConvertTo-Json", StringComparison.OrdinalIgnoreCase) ||
+               normalizedCommand.Equals("Write-Host", StringComparison.OrdinalIgnoreCase) ||
+               normalizedCommand.Equals("Write-Output", StringComparison.OrdinalIgnoreCase) ||
+               normalizedCommand.Equals("Select-String", StringComparison.OrdinalIgnoreCase) ||
+               normalizedCommand.Equals("Compare-Object", StringComparison.OrdinalIgnoreCase) ||
+               normalizedCommand.Equals("ForEach-Object", StringComparison.OrdinalIgnoreCase) ||
+               normalizedCommand.Equals("Where-Object", StringComparison.OrdinalIgnoreCase) ||
+               normalizedCommand.Equals("Sort-Object", StringComparison.OrdinalIgnoreCase) ||
+               normalizedCommand.Equals("Out-Null", StringComparison.OrdinalIgnoreCase) ||
+               normalizedCommand.Equals("Split-Path", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsNuGetReadyCheckInvocation(string[] tokens, int commandIndex)
+    {
+        var hasNuGetReadyProject = false;
+        var hasCheckCommand = false;
+        for (var index = commandIndex + 2; index < tokens.Length; index++)
+        {
+            if (tokens[index].Contains("KeelMatrix.NuGetReady", StringComparison.OrdinalIgnoreCase) &&
+                tokens[index].EndsWith(".csproj", StringComparison.OrdinalIgnoreCase))
+            {
+                hasNuGetReadyProject = true;
+            }
+
+            if (tokens[index].Equals("check", StringComparison.OrdinalIgnoreCase))
+            {
+                hasCheckCommand = true;
+            }
+        }
+
+        return hasNuGetReadyProject && hasCheckCommand;
     }
 
     private static bool IsCommandWrapperOption(string token)

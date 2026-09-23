@@ -34,6 +34,8 @@ public sealed class CliContractTests
     {
         Assert.Contains("every publication-relevant element", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("actions/checkout", CliParser.HelpText, StringComparison.Ordinal);
+        Assert.Contains("exhaustive safe-command allowlist", CliParser.HelpText, StringComparison.Ordinal);
+        Assert.Contains("Everything else", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("Unallowlisted remote actions", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("never proof of safety", CliParser.HelpText, StringComparison.Ordinal);
     }

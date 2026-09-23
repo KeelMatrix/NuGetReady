@@ -1365,6 +1365,194 @@ public sealed class WorkflowPolicyTests
         }
     }
 
+    [Theory]
+    [InlineData("dotnet restore")]
+    [InlineData("dotnet build")]
+    [InlineData("dotnet test")]
+    [InlineData("dotnet pack")]
+    [InlineData("dotnet format")]
+    [InlineData("dotnet list package")]
+    [InlineData("dotnet tool list")]
+    [InlineData("nugetready check --config nugetready.json --artifacts artifacts --format json")]
+    [InlineData("git status --short")]
+    [InlineData("echo ready")]
+    [InlineData("printf 'ready\\n'")]
+    [InlineData("mkdir -p artifacts")]
+    public void Safe_command_allowlist_keeps_ordinary_ci_quiet(string command)
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", $"""
+            name: continuous integration
+            on:
+              pull_request:
+            jobs:
+              build:
+                steps:
+                  - run: {command}
+            """);
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        Assert.False(inspection.Evaluated);
+        Assert.Empty(inspection.Failures);
+    }
+
+    [Fact]
+    public void Opaque_task_runner_with_a_real_make_target_is_limited_unproven()
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", """
+            name: continuous integration
+            on:
+              push:
+                branches: [main]
+            jobs:
+              build:
+                steps:
+                  - run: make publish
+            """);
+        repository.WriteFile("Makefile", "publish:\n\tdotnet nuget push artifacts/package.nupkg\n");
+
+        AssertLimitedUnproven(WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName));
+    }
+
+    [Fact]
+    public void Alias_definition_and_invocation_are_limited_unproven()
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", """
+            name: continuous integration
+            on:
+              push:
+                branches: [main]
+            jobs:
+              build:
+                steps:
+                  - run: |
+                      alias ship='dotnet nuget push artifacts/package.nupkg'
+                      ship
+            """);
+
+        AssertLimitedUnproven(WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName));
+    }
+
+    [Fact]
+    public void Msbuild_publish_target_is_limited_unproven()
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", """
+            name: continuous integration
+            on:
+              push:
+                branches: [main]
+            jobs:
+              build:
+                steps:
+                  - run: dotnet msbuild publish.csproj -t:Publish
+            """);
+        repository.WriteFile("publish.csproj", "<Project />");
+
+        AssertLimitedUnproven(WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName));
+    }
+
+    [Fact]
+    public void Container_build_indirection_is_limited_unproven()
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", """
+            name: continuous integration
+            on:
+              push:
+                branches: [main]
+            jobs:
+              build:
+                steps:
+                  - run: docker build -f Dockerfile .
+            """);
+        repository.WriteFile("Dockerfile", "FROM mcr.microsoft.com/dotnet/sdk:8.0\nRUN dotnet nuget push artifacts/package.nupkg\n");
+
+        AssertLimitedUnproven(WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName));
+    }
+
+    [Fact]
+    public void Shell_function_definition_and_invocation_are_limited_unproven()
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", """
+            name: continuous integration
+            on:
+              push:
+                branches: [main]
+            jobs:
+              build:
+                steps:
+                  - run: |
+                      ship() { dotnet nuget push artifacts/package.nupkg; }
+                      ship
+            """);
+
+        AssertLimitedUnproven(WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName));
+    }
+
+    [Fact]
+    public void Generated_configuration_that_is_later_invoked_is_limited_unproven()
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", """
+            name: continuous integration
+            on:
+              push:
+                branches: [main]
+            jobs:
+              build:
+                steps:
+                  - run: |
+                      printf 'publish: dotnet nuget push artifacts/package.nupkg\n' > generated.config
+                      config-runner generated.config
+            """);
+        repository.WriteFile("generated.config", "publish: dotnet nuget push artifacts/package.nupkg\n");
+
+        AssertLimitedUnproven(WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName));
+    }
+
+    [Fact]
+    public void Composite_action_invoking_a_task_runner_is_limited_unproven()
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", """
+            name: continuous integration
+            on:
+              push:
+                branches: [main]
+            jobs:
+              build:
+                steps:
+                  - uses: ./.github/actions/publish
+            """);
+        repository.WriteFile(".github/actions/publish/action.yml", """
+            name: publish
+            description: Publish the package
+            runs:
+              using: composite
+              steps:
+                - shell: bash
+                  run: make publish
+            """);
+        repository.WriteFile("Makefile", "publish:\n\tdotnet nuget push artifacts/package.nupkg\n");
+
+        AssertLimitedUnproven(WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName));
+    }
+
+    [Fact]
+    public void Inline_control_block_cannot_hide_an_opaque_runner()
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", """
+            name: continuous integration
+            on:
+              push:
+                branches: [main]
+            jobs:
+              build:
+                steps:
+                  - run: if ($true) { make publish }
+            """);
+        repository.WriteFile("Makefile", "publish:\n\tdotnet nuget push artifacts/package.nupkg\n");
+
+        AssertLimitedUnproven(WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName));
+    }
+
     private const string ReleaseWorkflow = """
         name: release
         on:

@@ -104,7 +104,7 @@ jobs:
           foreach ($fixture in $fixtures) {
             $project = Join-Path $fixtureRoot $fixture.Project
             $arguments = @(
-              'pack', $project,
+              $project,
               '--configuration', 'Release',
               '--output', $corpus,
               '--include-symbols',
@@ -116,7 +116,7 @@ jobs:
               '-p:UseSharedCompilation=false'
             )
             if ($fixture.LocalSource) { $arguments += @('--source', $corpus) }
-            & dotnet @arguments
+            dotnet pack @arguments
             if ($LASTEXITCODE -ne 0) { throw "Fixture pack failed: $($fixture.Id)." }
 
             $package = Get-ChildItem $corpus -Filter "$($fixture.Id).1.0.0.nupkg" -File | Select-Object -First 1
@@ -171,30 +171,8 @@ jobs:
           New-Item $feed, $cache, $httpCache, $cliHome, $toolPath, $publicSubstitute, $negativeLocal -ItemType Directory -Force | Out-Null
           Copy-Item (Join-Path $root 'artifacts/packages/KeelMatrix.NuGetReady.0.1.0.nupkg') $feed
 
-          $config = Join-Path $runRoot 'NuGet.config'
-          @"
-          <?xml version="1.0" encoding="utf-8"?>
-          <configuration>
-            <packageSources>
-              <clear />
-              <add key="local" value="$($feed.Replace('&', '&amp;'))" />
-              <add key="public" value="https://api.nuget.org/v3/index.json" />
-            </packageSources>
-            <packageSourceMapping>
-              <clear />
-              <packageSource key="local"><package pattern="KeelMatrix.NuGetReady" /></packageSource>
-              <packageSource key="public">
-                <package pattern="KeelMatrix.Telemetry" />
-                <package pattern="NuGet.*" />
-                <package pattern="Microsoft.*" />
-                <package pattern="System.*" />
-                <package pattern="runtime.*" />
-                <package pattern="NETStandard.Library" />
-                <package pattern="NETCore.App.*" />
-              </packageSource>
-            </packageSourceMapping>
-          </configuration>
-          "@ | Set-Content $config -Encoding utf8
+          $config = Join-Path $root '.github/nugetready-ci.config'
+          $env:NUGETREADY_FEED = $feed
 
           $env:NUGET_PACKAGES = $cache
           $env:NUGET_HTTP_CACHE_PATH = $httpCache
@@ -208,35 +186,21 @@ jobs:
           if (-not (Test-Path $tool)) { throw "The isolated tool executable was not created." }
           $corpusConfig = Join-Path $root 'artifacts/corpus/nugetready.json'
           $corpus = Join-Path $root 'artifacts/corpus'
-          & $tool check --config $corpusConfig --artifacts $corpus --format json
+          $env:PATH = "$toolPath$([IO.Path]::PathSeparator)$env:PATH"
+          nugetready check --config $corpusConfig --artifacts $corpus --format json
           if ($LASTEXITCODE -ne 0) { throw "The installed tool failed the end-to-end corpus rehearsal." }
 
           # A copy in a published-looking source must not satisfy the exact local mapping.
           Copy-Item (Join-Path $root 'artifacts/packages/KeelMatrix.NuGetReady.0.1.0.nupkg') $publicSubstitute
-          $negativeConfig = Join-Path $runRoot 'negative.config'
-          @"
-          <?xml version="1.0" encoding="utf-8"?>
-          <configuration>
-            <packageSources>
-              <clear />
-              <add key="local" value="$($negativeLocal.Replace('&', '&amp;'))" />
-              <add key="published" value="$($publicSubstitute.Replace('&', '&amp;'))" />
-            </packageSources>
-            <packageSourceMapping>
-              <clear />
-              <packageSource key="local"><package pattern="KeelMatrix.NuGetReady" /></packageSource>
-              <packageSource key="published"><package pattern="NuGet.*" /></packageSource>
-            </packageSourceMapping>
-          </configuration>
-          "@ | Set-Content $negativeConfig -Encoding utf8
+          $negativeConfig = Join-Path $root '.github/nugetready-ci-negative.config'
+          $env:NUGETREADY_NEGATIVE_LOCAL = $negativeLocal
+          $env:NUGETREADY_PUBLIC_SUBSTITUTE = $publicSubstitute
           $negativeToolPath = Join-Path $runRoot 'negative-tool'
           New-Item $negativeToolPath -ItemType Directory -Force | Out-Null
-          $negativeResult = Start-Process -FilePath 'dotnet' -ArgumentList @(
-            'tool', 'install', 'KeelMatrix.NuGetReady', '--version', '0.1.0',
-            '--tool-path', $negativeToolPath, '--configfile', $negativeConfig,
-            '--no-cache', '--verbosity', 'quiet'
-          ) -NoNewWindow -Wait -PassThru
-          $negativeExit = $negativeResult.ExitCode
+          dotnet tool install KeelMatrix.NuGetReady --version 0.1.0 `
+            --tool-path $negativeToolPath --configfile $negativeConfig `
+            --no-cache --verbosity quiet
+          $negativeExit = $LASTEXITCODE
           if ($negativeExit -eq 0) { throw "A published-looking substitute satisfied the exact local package mapping." }
 
       - name: Verify cached substitution is rejected
