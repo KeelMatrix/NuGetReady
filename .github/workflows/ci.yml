@@ -197,10 +197,17 @@ jobs:
           $env:NUGETREADY_PUBLIC_SUBSTITUTE = $publicSubstitute
           $negativeToolPath = Join-Path $runRoot 'negative-tool'
           New-Item $negativeToolPath -ItemType Directory -Force | Out-Null
-          dotnet tool install KeelMatrix.NuGetReady --version 0.1.0 `
-            --tool-path $negativeToolPath --configfile $negativeConfig `
-            --no-cache --verbosity quiet
-          $negativeExit = $LASTEXITCODE
+          $nativePreference = $PSNativeCommandUseErrorActionPreference
+          $PSNativeCommandUseErrorActionPreference = $false
+          try {
+            dotnet tool install KeelMatrix.NuGetReady --version 0.1.0 `
+              --tool-path $negativeToolPath --configfile $negativeConfig `
+              --no-cache --verbosity quiet
+            $negativeExit = $LASTEXITCODE
+          }
+          finally {
+            $PSNativeCommandUseErrorActionPreference = $nativePreference
+          }
           if ($negativeExit -eq 0) { throw "A published-looking substitute satisfied the exact local package mapping." }
 
       - name: Verify cached substitution is rejected
