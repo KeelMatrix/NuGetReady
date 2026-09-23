@@ -172,6 +172,7 @@ jobs:
           New-Item $feed, $cache, $httpCache, $cliHome, $toolPath, $corpus, $publicSubstitute, $negativeLocal -ItemType Directory -Force | Out-Null
           Copy-Item (Join-Path $root 'artifacts/packages/KeelMatrix.NuGetReady.0.1.0.nupkg') $feed
           Copy-Item -Path (Join-Path $root 'artifacts/corpus/*.nupkg') -Destination $corpus
+          Copy-Item -Path (Join-Path $root 'artifacts/corpus/*.snupkg') -Destination $corpus
           Copy-Item -LiteralPath (Join-Path $root 'artifacts/corpus/nugetready.json') -Destination $corpus
 
           $config = Join-Path $root '.github/nugetready-ci.config'

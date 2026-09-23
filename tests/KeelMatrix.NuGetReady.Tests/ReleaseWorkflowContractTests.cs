@@ -40,6 +40,7 @@ public sealed class ReleaseWorkflowContractTests
 
         Assert.Contains("$corpus = Join-Path $runRoot 'corpus'", workflow, StringComparison.Ordinal);
         Assert.Contains("Copy-Item -Path (Join-Path $root 'artifacts/corpus/*.nupkg') -Destination $corpus", workflow, StringComparison.Ordinal);
+        Assert.Contains("Copy-Item -Path (Join-Path $root 'artifacts/corpus/*.snupkg') -Destination $corpus", workflow, StringComparison.Ordinal);
         Assert.Contains("Copy-Item -LiteralPath (Join-Path $root 'artifacts/corpus/nugetready.json') -Destination $corpus", workflow, StringComparison.Ordinal);
         Assert.DoesNotContain("$corpusConfig = Join-Path $root 'artifacts/corpus/nugetready.json'", workflow, StringComparison.Ordinal);
     }
