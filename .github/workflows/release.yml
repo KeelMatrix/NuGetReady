@@ -21,11 +21,11 @@ jobs:
       MSBUILDDISABLENODEREUSE: '1'
 
     steps:
-      - name: Check out source at the triggering tag
+      - name: Check out source at the triggering commit
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
-          ref: ${{ github.ref }}
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Set up .NET SDK
@@ -76,17 +76,10 @@ jobs:
       NUGET_PACKAGES: /tmp/nugetready-packages
 
     steps:
-      - name: Check out source at the triggering tag
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-          ref: ${{ github.ref }}
-          persist-credentials: false
-
       - name: Set up .NET SDK
         uses: actions/setup-dotnet@v5
         with:
-          global-json-file: global.json
+          dotnet-version: '8.0.425'
 
       - name: Download the immutable release artifacts
         uses: actions/download-artifact@v4
@@ -120,6 +113,13 @@ jobs:
       - name: Install the candidate NuGetReady tool from its exclusive source mapping
         shell: pwsh
         run: dotnet tool install KeelMatrix.NuGetReady --version 0.1.0 --tool-path /tmp/nugetready-tool --configfile /tmp/nugetready-tool.config --no-cache --verbosity minimal
+
+      - name: Check out source at the triggering commit
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
       - name: Validate the exact package set with NuGetReady
         shell: pwsh

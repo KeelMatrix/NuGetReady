@@ -1,4 +1,5 @@
 using System.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Xml;
 using System.Xml.Linq;
@@ -15,6 +16,7 @@ internal static class WorkflowPolicyInspector
     private const int MaxIndirectPathDepth = 8;
     private const long MaxIndirectPathBytes = 2 * 1024 * 1024;
     private const string SupportedToolVersion = "0.1.0";
+    private const string SupportedSdkVersion = "8.0.425";
     private const string ArtifactIdentity = "validated-release-artifacts";
     private const string ImmutableValidationArtifactDirectory = "/tmp/nugetready-artifacts";
     private const string InstalledToolDirectory = "/tmp/nugetready-tool";
@@ -519,6 +521,12 @@ internal static class WorkflowPolicyInspector
             failures.Add(Unsupported("The supported validation profile requires NuGet.config to contain only the canonical NuGet.org v3 source."));
         }
 
+        if (!HasSupportedGlobalJson(repositoryPath))
+        {
+            failures.Add(Unsupported(
+                "The repository global.json SDK resolver is unsupported/unproven; the supported profile requires only version 8.0.425, rollForward latestPatch, and allowPrerelease false."));
+        }
+
         if (!HasExactProducerSequence(producerJob.Steps, expectedArtifacts))
         {
             failures.Add(Unsupported("The artifact-producer job must use the exact ordered closed command profile: checkout, SDK setup, restore, format, build, test, pack, and immediate exact artifact upload."));
@@ -575,7 +583,7 @@ internal static class WorkflowPolicyInspector
 
         if (!HasExactValidationSequence(validationJob.Steps, useCandidateToolArtifactSource))
         {
-            failures.Add(Unsupported("The fresh-runner validation job must use the exact ordered closed command profile: checkout, SDK setup, immutable artifact download, source-exclusive pinned tool acquisition, and installed NuGetReady check as the final step."));
+            failures.Add(Unsupported("The fresh-runner validation job must use the exact ordered closed command profile: literal SDK setup, immutable artifact download, source-exclusive pinned tool acquisition before checkout, exact triggering-commit checkout, and installed NuGetReady check as the final step."));
         }
     }
 
@@ -743,7 +751,7 @@ internal static class WorkflowPolicyInspector
     {
         return steps.Count == 8 &&
                IsExactCheckoutStep(steps[0]) &&
-               IsExactSetupDotNetStep(steps[1]) &&
+               IsExactProducerSetupDotNetStep(steps[1]) &&
                TryMatchRestoreStep(steps[2], out var solutionPath) &&
                IsExactFormatStep(steps[3], solutionPath) &&
                IsExactBuildStep(steps[4], solutionPath) &&
@@ -757,20 +765,21 @@ internal static class WorkflowPolicyInspector
         bool useCandidateToolArtifactSource)
     {
         if (steps.Count < 5 ||
-            !IsExactCheckoutStep(steps[0]) ||
-            !IsExactSetupDotNetStep(steps[1]) ||
-            !IsExactDownloadStep(steps[2], ImmutableValidationArtifactDirectory))
+            !IsExactValidationSetupDotNetStep(steps[0]) ||
+            !IsExactDownloadStep(steps[1], ImmutableValidationArtifactDirectory))
         {
             return false;
         }
 
         return useCandidateToolArtifactSource
             ? steps.Count == 6 &&
-              IsExactCandidateToolSourceConfigurationStep(steps[3]) &&
-              IsExactToolInstallStep(steps[4], useCandidateToolArtifactSource: true) &&
+              IsExactCandidateToolSourceConfigurationStep(steps[2]) &&
+              IsExactToolInstallStep(steps[3], useCandidateToolArtifactSource: true) &&
+              IsExactCheckoutStep(steps[4]) &&
               IsExactProfileValidationStep(steps[5])
             : steps.Count == 5 &&
-              IsExactToolInstallStep(steps[3], useCandidateToolArtifactSource: false) &&
+              IsExactToolInstallStep(steps[2], useCandidateToolArtifactSource: false) &&
+              IsExactCheckoutStep(steps[3]) &&
               IsExactProfileValidationStep(steps[4]);
     }
 
@@ -781,15 +790,22 @@ internal static class WorkflowPolicyInspector
                HasExactInputs(
                    step.With,
                    ("fetch-depth", "0"),
-                   ("ref", "${{ github.ref }}"),
+                   ("ref", "${{ github.sha }}"),
                    ("persist-credentials", "false"));
     }
 
-    private static bool IsExactSetupDotNetStep(WorkflowStep step)
+    private static bool IsExactProducerSetupDotNetStep(WorkflowStep step)
     {
         return UsesExactly(step, "actions/setup-dotnet@v5") &&
                IsSimpleActionStep(step, allowId: false) &&
                HasExactInputs(step.With, ("global-json-file", "global.json"));
+    }
+
+    private static bool IsExactValidationSetupDotNetStep(WorkflowStep step)
+    {
+        return UsesExactly(step, "actions/setup-dotnet@v5") &&
+               IsSimpleActionStep(step, allowId: false) &&
+               HasExactInputs(step.With, ("dotnet-version", SupportedSdkVersion));
     }
 
     private static bool TryMatchRestoreStep(WorkflowStep step, out string solutionPath)
@@ -1039,6 +1055,52 @@ internal static class WorkflowPolicyInspector
             return false;
         }
         catch (ArgumentException)
+        {
+            return false;
+        }
+    }
+
+    private static bool HasSupportedGlobalJson(string repositoryPath)
+    {
+        try
+        {
+            var path = Path.Combine(repositoryPath, "global.json");
+            var file = new FileInfo(path);
+            if (!file.Exists || file.Length > 32 * 1024)
+            {
+                return false;
+            }
+
+            using var document = JsonDocument.Parse(File.ReadAllBytes(path));
+            var root = document.RootElement;
+            if (root.ValueKind != JsonValueKind.Object ||
+                root.EnumerateObject().Count() != 1 ||
+                !root.TryGetProperty("sdk", out var sdk) ||
+                sdk.ValueKind != JsonValueKind.Object ||
+                sdk.EnumerateObject().Count() != 3)
+            {
+                return false;
+            }
+
+            return sdk.TryGetProperty("version", out var version) &&
+                   version.ValueKind == JsonValueKind.String &&
+                   version.GetString() == SupportedSdkVersion &&
+                   sdk.TryGetProperty("rollForward", out var rollForward) &&
+                   rollForward.ValueKind == JsonValueKind.String &&
+                   rollForward.GetString() == "latestPatch" &&
+                   sdk.TryGetProperty("allowPrerelease", out var allowPrerelease) &&
+                   allowPrerelease.ValueKind is JsonValueKind.True or JsonValueKind.False &&
+                   !allowPrerelease.GetBoolean();
+        }
+        catch (IOException)
+        {
+            return false;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return false;
+        }
+        catch (JsonException)
         {
             return false;
         }

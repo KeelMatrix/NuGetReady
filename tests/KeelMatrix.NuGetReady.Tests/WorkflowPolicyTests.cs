@@ -90,7 +90,11 @@ public sealed class WorkflowPolicyTests
             ["build in credential job"] = Mutate(
                 ReleaseWorkflow,
                 "- id: nuget-login",
-                "- run: dotnet build -t:Publish\n      - id: nuget-login")
+                "- run: dotnet build -t:Publish\n      - id: nuget-login"),
+            ["mutable ref checkout"] = Mutate(
+                ReleaseWorkflow,
+                "ref: ${{ github.sha }}",
+                "ref: ${{ github.ref }}")
         };
 
         foreach (var mutation in mutations)
@@ -103,6 +107,29 @@ public sealed class WorkflowPolicyTests
                 findings.Any(finding => finding.IsError),
                 $"Mutation '{mutation.Key}' unexpectedly remained certifiable: {string.Join(" | ", findings.Select(finding => finding.Message))}");
         }
+    }
+
+    [Fact]
+    public void Unmodeled_global_json_sdk_resolver_property_is_blocking()
+    {
+        using var repository = WorkflowRepository.Create("release.yml", ReleaseWorkflow);
+        repository.WriteFile("global.json", """
+            {
+              "sdk": {
+                "version": "8.0.425",
+                "rollForward": "latestPatch",
+                "allowPrerelease": false,
+                "paths": [ ".repo-sdk" ]
+              }
+            }
+            """);
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+        Assert.Contains(findings, finding =>
+            finding.IsError &&
+            finding.Message.Contains("global.json", StringComparison.OrdinalIgnoreCase) &&
+            finding.Message.Contains("unproven", StringComparison.OrdinalIgnoreCase));
     }
 
     [Theory]
@@ -1313,11 +1340,12 @@ public sealed class WorkflowPolicyTests
     public void Artifact_validation_must_execute_before_publication()
     {
         const string install = $"- name: Install the pinned NuGetReady tool\n        shell: pwsh\n        run: {ToolInstallCommand}";
+        const string checkout = "- name: Check out source at the triggering commit\n        uses: actions/checkout@v6\n        with:\n          fetch-depth: 0\n          ref: ${{ github.sha }}\n          persist-credentials: false";
         const string validation = $"- name: Validate exact artifacts\n        shell: pwsh\n        run: {ValidationCommand}";
         using var repository = WorkflowRepository.Create("release.yml", Mutate(
             ReleaseWorkflow,
-            $"{install}\n      {validation}",
-            $"{validation}\n      {install}"));
+            $"{install}\n      {checkout}\n      {validation}",
+            $"{validation}\n      {checkout}\n      {install}"));
 
         var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
 
@@ -1726,11 +1754,11 @@ public sealed class WorkflowPolicyTests
               KEELMATRIX_NO_TELEMETRY: '1'
               DOTNET_CLI_TELEMETRY_OPTOUT: '1'
             steps:
-              - name: Check out source at the triggering tag
+              - name: Check out source at the triggering commit
                 uses: actions/checkout@v6
                 with:
                   fetch-depth: 0
-                  ref: ${{ github.ref }}
+                  ref: ${{ github.sha }}
                   persist-credentials: false
               - name: Set up .NET SDK
                 uses: actions/setup-dotnet@v5
@@ -1768,16 +1796,10 @@ public sealed class WorkflowPolicyTests
               DOTNET_CLI_TELEMETRY_OPTOUT: '1'
               NUGET_PACKAGES: /tmp/nugetready-packages
             steps:
-              - name: Check out source at the triggering tag
-                uses: actions/checkout@v6
-                with:
-                  fetch-depth: 0
-                  ref: ${{ github.ref }}
-                  persist-credentials: false
               - name: Set up .NET SDK
                 uses: actions/setup-dotnet@v5
                 with:
-                  global-json-file: global.json
+                  dotnet-version: '8.0.425'
               - name: Download immutable artifacts
                 uses: actions/download-artifact@v4
                 with:
@@ -1786,6 +1808,12 @@ public sealed class WorkflowPolicyTests
               - name: Install the pinned NuGetReady tool
                 shell: pwsh
                 run: dotnet tool install KeelMatrix.NuGetReady --version 0.1.0 --tool-path /tmp/nugetready-tool --source https://api.nuget.org/v3/index.json --no-cache --verbosity minimal
+              - name: Check out source at the triggering commit
+                uses: actions/checkout@v6
+                with:
+                  fetch-depth: 0
+                  ref: ${{ github.sha }}
+                  persist-credentials: false
               - name: Validate exact artifacts
                 shell: pwsh
                 run: /tmp/nugetready-tool/nugetready check --config nugetready.json --artifacts /tmp/nugetready-artifacts --format json
@@ -1869,6 +1897,15 @@ internal sealed class WorkflowRepository : IDisposable
                   "smoke": ["--help"]
                 }
               ]
+            }
+            """);
+        File.WriteAllText(Path.Combine(root.FullName, "global.json"), """
+            {
+              "sdk": {
+                "version": "8.0.425",
+                "rollForward": "latestPatch",
+                "allowPrerelease": false
+              }
             }
             """);
         return new WorkflowRepository(root);

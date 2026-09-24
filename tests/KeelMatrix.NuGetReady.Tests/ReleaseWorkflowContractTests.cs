@@ -39,6 +39,8 @@ public sealed class ReleaseWorkflowContractTests
         var workflow = File.ReadAllText(workflowPath);
 
         Assert.Contains("persist-credentials: false", workflow, StringComparison.Ordinal);
+        Assert.Equal(2, Regex.Matches(workflow, "ref: \\$\\{\\{ github\\.sha \\}\\}", RegexOptions.CultureInvariant).Count);
+        Assert.DoesNotContain("github.ref }}", workflow, StringComparison.Ordinal);
         Assert.Contains("produce:", workflow, StringComparison.Ordinal);
         Assert.Contains("validate:\n    name: Validate the immutable release artifacts\n    needs: produce", workflow, StringComparison.Ordinal);
         Assert.Contains("publish:\n    name: Publish the exact validated package\n    needs: validate", workflow, StringComparison.Ordinal);
@@ -48,6 +50,9 @@ public sealed class ReleaseWorkflowContractTests
         Assert.Contains("<package pattern=\"*\" />", workflow, StringComparison.Ordinal);
         Assert.Contains("dotnet tool install KeelMatrix.NuGetReady --version 0.1.0 --tool-path /tmp/nugetready-tool --configfile /tmp/nugetready-tool.config --no-cache --verbosity minimal", workflow, StringComparison.Ordinal);
         Assert.Contains("/tmp/nugetready-tool/nugetready check --config nugetready.json --artifacts /tmp/nugetready-artifacts --format json", workflow, StringComparison.Ordinal);
+        Assert.True(
+            workflow.IndexOf("dotnet tool install KeelMatrix.NuGetReady", StringComparison.Ordinal) <
+            workflow.LastIndexOf("uses: actions/checkout@v6", StringComparison.Ordinal));
         Assert.Single(Regex.Matches(workflow, "uses: actions/upload-artifact@v4", RegexOptions.CultureInvariant).Cast<Match>());
         Assert.Collection(
             Regex.Matches(workflow, "uses: actions/download-artifact@v4", RegexOptions.CultureInvariant).Cast<Match>(),
