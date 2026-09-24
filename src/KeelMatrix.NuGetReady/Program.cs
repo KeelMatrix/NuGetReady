@@ -21,9 +21,15 @@ internal static class NuGetReadyApplication
         try
         {
             options = CliParser.Parse(args);
-            var config = ConfigurationLoader.Load(options.ConfigPath);
-            var repositoryPath = RepositoryLocator.FindRoot(options.ConfigPath);
-            var report = CheckRunner.Run(config, options.ArtifactsPath, repositoryPath, options.Timeout);
+            var configPath = Path.GetFullPath(options.ConfigPath);
+            var config = ConfigurationLoader.Load(configPath);
+            var repositoryPath = RepositoryLocator.FindRoot(configPath);
+            var report = CheckRunner.Run(
+                config,
+                options.ArtifactsPath,
+                repositoryPath,
+                options.Timeout,
+                configPath: configPath);
             ReportWriter.Write(report, options.Format);
             TelemetryCoordinator.RecordIfTrustworthy(report, telemetry);
             return report.ExitCode;

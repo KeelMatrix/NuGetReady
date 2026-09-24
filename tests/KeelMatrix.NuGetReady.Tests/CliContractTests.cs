@@ -42,6 +42,8 @@ public sealed class CliContractTests
         Assert.Contains("fresh-runner validator", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("fixed runner-controlled", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("exact cross-platform casing", CliParser.HelpText, StringComparison.Ordinal);
+        Assert.Contains("exact repository-root nugetready.json", CliParser.HelpText, StringComparison.Ordinal);
+        Assert.Contains("effective publication capability", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("unknown or unsupported publication-relevant node", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("error/exit 2", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("never defaults to safe", CliParser.HelpText, StringComparison.Ordinal);

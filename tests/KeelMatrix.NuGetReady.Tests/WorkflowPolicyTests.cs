@@ -202,6 +202,40 @@ public sealed class WorkflowPolicyTests
     }
 
     [Fact]
+    public void Alternate_active_configuration_cannot_diverge_from_the_root_release_validator_config()
+    {
+        using var repository = WorkflowRepository.Create("release.yml", ReleaseWorkflow);
+        var rootConfigPath = Path.Combine(repository.Root.FullName, "nugetready.json");
+        var alternateConfigPath = Path.Combine(repository.Root.FullName, "review-config.json");
+        var originalConfig = File.ReadAllText(rootConfigPath);
+        repository.WriteFile("review-config.json", originalConfig);
+        repository.WriteFile("nugetready.json", originalConfig.Replace("1.0.0", "9.9.9", StringComparison.Ordinal));
+        var activeConfig = ConfigurationLoader.Load(alternateConfigPath);
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(
+            repository.Root.FullName,
+            activeConfig,
+            alternateConfigPath);
+
+        Assert.Contains(inspection.Failures, finding =>
+            finding.IsError &&
+            finding.Message.Contains("repository-root nugetready.json", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void Supplied_configuration_without_path_identity_cannot_certify_the_release_profile()
+    {
+        using var repository = WorkflowRepository.Create("release.yml", ReleaseWorkflow);
+        var activeConfig = ConfigurationLoader.Load(Path.Combine(repository.Root.FullName, "nugetready.json"));
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName, activeConfig);
+
+        Assert.Contains(inspection.Failures, finding =>
+            finding.IsError &&
+            finding.Message.Contains("path identity", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
     public void A_skipped_validation_dependency_path_is_blocking()
     {
         using var repository = WorkflowRepository.Create("release.yml", Mutate(
@@ -1140,26 +1174,30 @@ public sealed class WorkflowPolicyTests
             "id-token: write",
             "id-token: read",
             StringComparison.Ordinal));
+        var config = new NuGetReadyConfig
+        {
+            SchemaVersion = 1,
+            Packages =
+            [
+                new PackageExpectation
+                {
+                    Id = "Fixture.Standard",
+                    Kind = "library",
+                    Version = "1.0.0",
+                    Artifacts = [Path.GetFileName(package), Path.GetFileName(Path.ChangeExtension(package, ".snupkg"))]
+                }
+            ]
+        };
+        var configPath = Path.Combine(repository.Root.FullName, "nugetready.json");
+        repository.WriteFile("nugetready.json", System.Text.Json.JsonSerializer.Serialize(config));
 
         var report = CheckRunner.Run(
-            new NuGetReadyConfig
-            {
-                SchemaVersion = 1,
-                Packages =
-                [
-                    new PackageExpectation
-                    {
-                        Id = "Fixture.Standard",
-                        Kind = "library",
-                        Version = "1.0.0",
-                        Artifacts = [Path.GetFileName(package), Path.GetFileName(Path.ChangeExtension(package, ".snupkg"))]
-                    }
-                ]
-            },
+            config,
             corpus.OutputPath,
             repository.Root.FullName,
             TimeSpan.FromMinutes(2),
-            new ConsumerRehearsalOptions(PublicFeedPath: corpus.OutputPath));
+            new ConsumerRehearsalOptions(PublicFeedPath: corpus.OutputPath),
+            configPath);
 
         Assert.Equal("fail", report.Status);
         Assert.Equal(1, report.ExitCode);
@@ -1601,6 +1639,65 @@ public sealed class WorkflowPolicyTests
               build:
                 steps:
                   - run: {command}
+            """);
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        Assert.False(inspection.Evaluated);
+        Assert.Empty(inspection.Failures);
+    }
+
+    [Theory]
+    [InlineData("oidc", "dotnet build")]
+    [InlineData("oidc", "dotnet test")]
+    [InlineData("oidc", "dotnet tool list")]
+    [InlineData("secret", "dotnet build")]
+    [InlineData("secret", "dotnet test")]
+    [InlineData("secret", "dotnet tool list")]
+    [InlineData("dynamic-secret", "dotnet build")]
+    [InlineData("packages-write", "dotnet build")]
+    [InlineData("write-all", "dotnet test")]
+    public void Capability_bearing_workflows_cannot_bypass_closed_world_evaluation(
+        string capability,
+        string command)
+    {
+        var capabilityYaml = capability switch
+        {
+            "oidc" => "    permissions:\n      id-token: write",
+            "packages-write" => "    permissions:\n      packages: write",
+            "write-all" => "    permissions: write-all",
+            "dynamic-secret" => "    env:\n      PUBLISH_TOKEN: ${{ secrets[format('{0}', 'NUGET_API_KEY')] }}",
+            _ => "    env:\n      PUBLISH_TOKEN: ${{ secrets['NUGET_API_KEY'] }}"
+        };
+        using var repository = WorkflowRepository.Create("ci.yml", $$"""
+            name: continuous integration
+            on:
+              pull_request:
+            jobs:
+              build:
+                runs-on: ubuntu-latest
+            {{capabilityYaml}}
+                steps:
+                  - run: {{command}}
+            """);
+
+        AssertLimitedUnproven(WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName));
+    }
+
+    [Fact]
+    public void Explicit_empty_job_permissions_remove_inherited_oidc_capability()
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", """
+            name: continuous integration
+            on:
+              pull_request:
+            permissions:
+              id-token: write
+            jobs:
+              build:
+                permissions: {}
+                steps:
+                  - run: dotnet build
             """);
 
         var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);

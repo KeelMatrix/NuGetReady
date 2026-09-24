@@ -14,9 +14,10 @@ internal static class CheckRunner
         string artifactsPath,
         string repositoryPath,
         TimeSpan timeout,
-        ConsumerRehearsalOptions? rehearsalOptions = null)
+        ConsumerRehearsalOptions? rehearsalOptions = null,
+        string? configPath = null)
     {
-        return RunCore(config, artifactsPath, repositoryPath, timeout, rehearsalOptions);
+        return RunCore(config, artifactsPath, repositoryPath, timeout, rehearsalOptions, configPath);
     }
 
     private static ReadinessReport RunCore(
@@ -24,7 +25,8 @@ internal static class CheckRunner
         string artifactsPath,
         string? repositoryPath,
         TimeSpan? timeout,
-        ConsumerRehearsalOptions? rehearsalOptions = null)
+        ConsumerRehearsalOptions? rehearsalOptions = null,
+        string? configPath = null)
     {
         var failures = CheckContract.Order.ToDictionary(id => id, _ => new List<Failure>(), StringComparer.Ordinal);
         var checkStates = new Dictionary<string, string>(StringComparer.Ordinal);
@@ -155,7 +157,7 @@ internal static class CheckRunner
 
         if (repositoryPath is not null && !archiveParseBlocked)
         {
-            var workflowInspection = WorkflowPolicyInspector.InspectDetailed(repositoryPath, config);
+            var workflowInspection = WorkflowPolicyInspector.InspectDetailed(repositoryPath, config, configPath);
             foreach (var failure in workflowInspection.Failures)
             {
                 failures["workflow-policy"].Add(failure);

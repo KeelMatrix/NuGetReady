@@ -66,12 +66,18 @@ internal static class WorkflowPolicyInspector
         "-p:UseSharedCompilation=false"
     };
 
-    public static IReadOnlyList<Failure> Inspect(string repositoryPath, NuGetReadyConfig? config = null)
+    public static IReadOnlyList<Failure> Inspect(
+        string repositoryPath,
+        NuGetReadyConfig? config = null,
+        string? configPath = null)
     {
-        return InspectDetailed(repositoryPath, config).Failures;
+        return InspectDetailed(repositoryPath, config, configPath).Failures;
     }
 
-    public static WorkflowInspectionResult InspectDetailed(string repositoryPath, NuGetReadyConfig? config = null)
+    public static WorkflowInspectionResult InspectDetailed(
+        string repositoryPath,
+        NuGetReadyConfig? config = null,
+        string? configPath = null)
     {
         var workflowDirectoryStatus = GetExactRepositoryPath(
             repositoryPath,
@@ -155,7 +161,7 @@ internal static class WorkflowPolicyInspector
             }
 
             evaluated = true;
-            InspectWorkflow(repositoryPath, path, workflow, config, failures);
+            InspectWorkflow(repositoryPath, path, workflow, config, configPath, failures);
         }
 
         return new WorkflowInspectionResult(failures.OrderBy(failure => failure.Message, StringComparer.Ordinal).ToArray(), evaluated);
@@ -166,6 +172,7 @@ internal static class WorkflowPolicyInspector
         if (workflow.HasPublicationShapedTrigger ||
             workflow.HasPublicationInput ||
             workflow.HasUninspectableStructure ||
+            HasPublicationCapability(workflow) ||
             workflow.Jobs.Any(job => IsDirectPublicationJob(job) ||
                                      job.Steps.Any(IsPublicationRelevantStep) ||
                                      job.Steps.Any(step => HasIndirectPublicationPath(repositoryPath, step))))
@@ -328,6 +335,7 @@ internal static class WorkflowPolicyInspector
         string path,
         WorkflowDocument workflow,
         NuGetReadyConfig? config,
+        string? configPath,
         List<Failure> failures)
     {
         var indirectPathContext = new IndirectInspectionContext();
@@ -335,18 +343,20 @@ internal static class WorkflowPolicyInspector
         var publishingJobs = workflow.Jobs.Where(job => job.Steps.Any(IsPublishStep)).ToArray();
         var hasPublicationRelevantStep = workflow.Jobs.Any(job => job.Steps.Any(IsPublicationRelevantStep));
         var hasReleaseVocabulary = HasReleasePublicationSignal(Path.GetFileNameWithoutExtension(path)) ||
-                                    HasReleasePublicationSignal(workflow.Name) ||
-                                    workflow.Jobs.Any(job =>
-                                        !IsExplicitlyDisabled(job.Condition) &&
-                                         (HasReleasePublicationSignal(job.Id) ||
-                                          HasReleasePublicationSignal(job.Name) ||
-                                          HasReleasePublicationSignal(job.Uses)));
+                                   HasReleasePublicationSignal(workflow.Name) ||
+                                   workflow.Jobs.Any(job =>
+                                       !IsExplicitlyDisabled(job.Condition) &&
+                                       (HasReleasePublicationSignal(job.Id) ||
+                                        HasReleasePublicationSignal(job.Name) ||
+                                        HasReleasePublicationSignal(job.Uses)));
+        var hasPublicationCapability = HasPublicationCapability(workflow);
         var limitedUnprovenShape = workflow.HasPublicationShapedTrigger ||
-            workflow.HasPublicationInput ||
-            workflow.HasUninspectableStructure ||
-                                    workflow.Jobs.Any(job => job.HasUninspectableStructure ||
+                                   workflow.HasPublicationInput ||
+                                   workflow.HasUninspectableStructure ||
+                                   (hasPublicationCapability && publishingJobs.Length == 0) ||
+                                   workflow.Jobs.Any(job => job.HasUninspectableStructure ||
                                                             job.Steps.Any(step => step.HasUninspectableStructure)) ||
-                                    (publishingJobs.Length == 0 && (hasReleaseVocabulary || hasPublicationRelevantStep));
+                                   (publishingJobs.Length == 0 && (hasReleaseVocabulary || hasPublicationRelevantStep));
         if (limitedUnprovenShape && !unsupportedPublicationPath)
         {
             failures.Add(Unsupported(
@@ -369,7 +379,7 @@ internal static class WorkflowPolicyInspector
             return;
         }
 
-        InspectSupportedReleaseProfile(repositoryPath, workflow, publishingJobs[0], config, failures);
+        InspectSupportedReleaseProfile(repositoryPath, workflow, publishingJobs[0], config, configPath, failures);
     }
 
     private static void InspectSupportedReleaseProfile(
@@ -377,6 +387,7 @@ internal static class WorkflowPolicyInspector
         WorkflowDocument workflow,
         WorkflowJob publishJob,
         NuGetReadyConfig? config,
+        string? configPath,
         List<Failure> failures)
     {
         if (!workflow.HasVersionedTagTrigger || workflow.HasUnsupportedTagPattern)
@@ -412,6 +423,7 @@ internal static class WorkflowPolicyInspector
         if (!TryLoadExpectedArtifacts(
                 repositoryPath,
                 config,
+                configPath,
                 failures,
                 out var expectedArtifacts,
                 out var primaryArtifact,
@@ -699,6 +711,7 @@ internal static class WorkflowPolicyInspector
     private static bool TryLoadExpectedArtifacts(
         string repositoryPath,
         NuGetReadyConfig? suppliedConfig,
+        string? suppliedConfigPath,
         List<Failure> failures,
         out IReadOnlyList<string> artifacts,
         out string primaryArtifact,
@@ -712,6 +725,19 @@ internal static class WorkflowPolicyInspector
             if (GetExactRepositoryPath(repositoryPath, "nugetready.json", expectDirectory: false, out var configPath) != RepositoryPathStatus.Exact)
             {
                 failures.Add(Unsupported("The supported release profile requires nugetready.json to exist with exact cross-platform casing."));
+                return false;
+            }
+
+            if (suppliedConfig is not null && suppliedConfigPath is null)
+            {
+                failures.Add(Unsupported(
+                    "The active configuration path identity is unavailable, so equivalence with the repository-root nugetready.json used by the release validator is unsupported/unproven."));
+            }
+            else if (suppliedConfigPath is not null &&
+                !string.Equals(Path.GetFullPath(suppliedConfigPath), configPath, StringComparison.Ordinal))
+            {
+                failures.Add(Unsupported(
+                    "The supported release profile requires the active configuration to be the exact repository-root nugetready.json used by the release validator; an alternate configuration is unsupported/unproven."));
                 return false;
             }
 
@@ -1737,13 +1763,71 @@ internal static class WorkflowPolicyInspector
     {
         return run is not null && Regex.IsMatch(
             run,
-            @"\bsecrets\s*(?:\.\s*[A-Za-z_][A-Za-z0-9_-]*|\[\s*(?:'[^']+'|""[^""]+""|[A-Za-z_][A-Za-z0-9_-]*)\s*\])",
+            @"\bsecrets\s*(?:\.|\[)",
             RegexOptions.IgnoreCase);
     }
 
     private static bool ContainsLongLivedCredential(IReadOnlyDictionary<string, string> environment)
     {
         return environment.Any(pair => ContainsLongLivedCredential(pair.Value));
+    }
+
+    private static bool HasPublicationCapability(WorkflowDocument workflow)
+    {
+        foreach (var job in workflow.Jobs.Where(job => !IsExplicitlyDisabled(job.Condition)))
+        {
+            var activeSteps = job.Steps.Where(step => !IsExplicitlyDisabled(step.Condition)).ToArray();
+            if (activeSteps.Length == 0 && string.IsNullOrWhiteSpace(job.Uses))
+            {
+                continue;
+            }
+
+            var effectivePermissions = job.PermissionsSpecified ? job.Permissions : workflow.Permissions;
+            if (HasPublicationCapability(effectivePermissions))
+            {
+                return true;
+            }
+
+            if (!string.IsNullOrWhiteSpace(job.Uses) &&
+                ContainsLongLivedCredential(MergeEnvironment(workflow.Environment, job.Environment)))
+            {
+                return true;
+            }
+
+            foreach (var step in activeSteps)
+            {
+                if (ContainsLongLivedCredential(step.Run) ||
+                    ContainsLongLivedCredential(step.With) ||
+                    ContainsLongLivedCredential(MergeEnvironment(workflow.Environment, job.Environment, step.Environment)))
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private static bool HasPublicationCapability(Dictionary<string, string> permissions)
+    {
+        return IsWritePermission(permissions, "id-token") ||
+               IsWriteAll(permissions) ||
+               HasOverbroadPublicationPermission(permissions);
+    }
+
+    private static Dictionary<string, string> MergeEnvironment(
+        params IReadOnlyDictionary<string, string>[] scopes)
+    {
+        var effective = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var scope in scopes)
+        {
+            foreach (var pair in scope)
+            {
+                effective[pair.Key] = pair.Value;
+            }
+        }
+
+        return effective;
     }
 
     private static bool ContainsPackageWildcard(string? run)
@@ -1765,7 +1849,10 @@ internal static class WorkflowPolicyInspector
     {
         return permissions.Any(permission =>
             (permission.Key.Equals("contents", StringComparison.OrdinalIgnoreCase) ||
-             permission.Key is "actions" or "packages" or "pull-requests" or "issues") &&
+             permission.Key.Equals("actions", StringComparison.OrdinalIgnoreCase) ||
+             permission.Key.Equals("packages", StringComparison.OrdinalIgnoreCase) ||
+             permission.Key.Equals("pull-requests", StringComparison.OrdinalIgnoreCase) ||
+             permission.Key.Equals("issues", StringComparison.OrdinalIgnoreCase)) &&
             permission.Value.Equals("write", StringComparison.OrdinalIgnoreCase));
     }
 
