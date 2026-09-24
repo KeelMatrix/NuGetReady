@@ -12,6 +12,10 @@ internal sealed record WorkflowInspectionResult(IReadOnlyList<Failure> Failures,
 
 internal static class WorkflowPolicyInspector
 {
+    private readonly record struct ExpressionReferenceAnalysis(
+        bool HasCredentialReference,
+        bool HasMalformedFraming);
+
     private const int MaxWorkflowBytes = 512 * 1024;
     private const int MaxIndirectPathDepth = 8;
     private const long MaxIndirectPathBytes = 2 * 1024 * 1024;
@@ -200,6 +204,7 @@ internal static class WorkflowPolicyInspector
     private static bool LooksLikeReleaseWorkflow(string repositoryPath, string path, WorkflowDocument workflow)
     {
         return BuildPublicationBoundary(repositoryPath, workflow).Count > 0 ||
+               workflow.HasMalformedExpressionFraming ||
                (workflow.HasUninspectableControlStructure &&
                 (HasReleasePublicationSignal(Path.GetFileNameWithoutExtension(path)) ||
                  HasReleasePublicationSignal(workflow.Name)));
@@ -330,14 +335,20 @@ internal static class WorkflowPolicyInspector
                                        (HasReleasePublicationSignal(job.Id) ||
                                         HasReleasePublicationSignal(job.Name) ||
                                         HasReleasePublicationSignal(job.Uses)));
-        var limitedUnprovenShape = workflow.HasPublicationShapedTrigger ||
+        var limitedUnprovenShape = workflow.HasMalformedExpressionFraming ||
+                                   workflow.HasPublicationShapedTrigger ||
                                    workflow.HasPublicationInput ||
                                    workflow.HasUninspectableControlStructure ||
                                    (publicationBoundary.Count > 0 && publishingJobs.Length == 0) ||
                                    publicationBoundary.Any(job => job.HasUninspectableStructure ||
                                                                   job.Steps.Any(step => step.HasUninspectableStructure)) ||
                                    (publishingJobs.Length == 0 && (hasReleaseVocabulary || hasPublicationRelevantStep));
-        if (limitedUnprovenShape && !unsupportedPublicationPath)
+        if (workflow.HasMalformedExpressionFraming)
+        {
+            failures.Add(Unsupported(
+                "Workflow contains malformed/incomplete expression framing, so publication policy is unsupported/unproven."));
+        }
+        else if (limitedUnprovenShape && !unsupportedPublicationPath)
         {
             failures.Add(Unsupported(
                 "Workflow publication policy is unsupported/unproven because a publication-relevant YAML node is outside the supported release profile."));
@@ -1787,40 +1798,47 @@ internal static class WorkflowPolicyInspector
 
     private static bool ContainsLongLivedCredential(string? value)
     {
-        return value is not null && ContainsCredentialExpressionReference(value);
+        if (value is null)
+        {
+            return false;
+        }
+
+        var analysis = AnalyzeExpressionReferences(value);
+        return analysis.HasCredentialReference || analysis.HasMalformedFraming;
     }
 
-    private static bool ContainsCredentialExpressionReference(string value)
+    private static ExpressionReferenceAnalysis AnalyzeExpressionReferences(string value)
     {
         var searchIndex = 0;
+        var hasCredentialReference = false;
         while (searchIndex < value.Length)
         {
             var expressionStart = value.IndexOf("${{", searchIndex, StringComparison.Ordinal);
             if (expressionStart < 0)
             {
-                return false;
+                return new ExpressionReferenceAnalysis(hasCredentialReference, false);
             }
 
             var expressionEnd = FindExpressionEnd(value, expressionStart + 3);
             if (expressionEnd < 0)
             {
-                return false;
+                return new ExpressionReferenceAnalysis(hasCredentialReference, true);
             }
 
             if (ContainsCredentialExpressionReference(value.AsSpan(expressionStart + 3, expressionEnd - expressionStart - 3)))
             {
-                return true;
+                hasCredentialReference = true;
             }
 
             searchIndex = expressionEnd + 2;
         }
 
-        return false;
+        return new ExpressionReferenceAnalysis(hasCredentialReference, false);
     }
 
     private static int FindExpressionEnd(string value, int searchIndex)
     {
-        while (searchIndex < value.Length - 1)
+        while (searchIndex < value.Length)
         {
             if (value[searchIndex] is '\'' or '"')
             {
@@ -1828,7 +1846,17 @@ internal static class WorkflowPolicyInspector
                 continue;
             }
 
-            if (value[searchIndex] == '}' && value[searchIndex + 1] == '}')
+            if (searchIndex + 2 < value.Length &&
+                value[searchIndex] == '$' &&
+                value[searchIndex + 1] == '{' &&
+                value[searchIndex + 2] == '{')
+            {
+                return -1;
+            }
+
+            if (searchIndex + 1 < value.Length &&
+                value[searchIndex] == '}' &&
+                value[searchIndex + 1] == '}')
             {
                 return searchIndex;
             }
@@ -3121,6 +3149,7 @@ internal static class WorkflowPolicyInspector
         public string? Name { get; set; }
         public bool HasPublicationShapedTrigger { get; set; }
         public bool HasPublicationInput { get; set; }
+        public bool HasMalformedExpressionFraming { get; set; }
         public bool HasUninspectableStructure { get; set; }
         public bool HasUninspectableControlStructure { get; set; }
         public bool HasUninspectableCredentialBinding { get; set; }
@@ -3231,6 +3260,7 @@ internal static class WorkflowPolicyInspector
             }
 
             workflow.HasUninspectableStructure = unsupported;
+            workflow.HasMalformedExpressionFraming = ContainsMalformedExpressionFraming(root);
             foreach (var pair in root.Children)
             {
                 if (!TryScalar(pair.Key, out var key))
@@ -3769,6 +3799,18 @@ internal static class WorkflowPolicyInspector
 
             node = null!;
             return false;
+        }
+
+        private static bool ContainsMalformedExpressionFraming(YamlNode node)
+        {
+            return node switch
+            {
+                YamlScalarNode scalar => scalar.Value is not null &&
+                                         AnalyzeExpressionReferences(scalar.Value).HasMalformedFraming,
+                YamlSequenceNode sequence => sequence.Children.Any(ContainsMalformedExpressionFraming),
+                YamlMappingNode mapping => mapping.Children.Values.Any(ContainsMalformedExpressionFraming),
+                _ => false
+            };
         }
 
         private static bool TryGetScalar(YamlMappingNode mapping, string name, out string value)

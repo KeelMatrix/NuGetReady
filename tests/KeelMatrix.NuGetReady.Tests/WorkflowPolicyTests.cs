@@ -1151,6 +1151,9 @@ public sealed class WorkflowPolicyTests
     [InlineData("note", "documentation-secrets-reference")]
     [InlineData("note", "NUGET_API_KEY")]
     [InlineData("note", "vars.NUGET_API_KEY")]
+    [InlineData("note", "${{ vars['ARTIFACT.PATH'] }}")]
+    [InlineData("note", "${{ vars.ApiKeyPath }}")]
+    [InlineData("note", "${{ vars['Nuget.Api.Key.Path'] }}")]
     public void Safe_credential_boundary_probes_preserve_a_valid_release_result(
         string bindingName,
         string bindingValue)
@@ -1300,6 +1303,302 @@ public sealed class WorkflowPolicyTests
             """);
 
         AssertLimitedUnproven(WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName));
+    }
+
+    [Theory]
+    [InlineData("${{ vars.NUGET_API_KEY")]
+    [InlineData("${{ vars.NUGET_API_KEY }")]
+    [InlineData("${{ vars['NUGET_API_KEY] }}")]
+    [InlineData("${{ vars['NUGET_API_KEY'")]
+    [InlineData("${{ vars[inputs.member_name]")]
+    [InlineData("${{ inputs.ApiKey")]
+    [InlineData("${{ env.ApiKey")]
+    [InlineData("${{ secrets.ApiKey")]
+    [InlineData("${{ vars['ARTIFACT.PATH']")]
+    [InlineData("${{ ${{ vars.NUGET_API_KEY }}")]
+    [InlineData("${{${{ vars.NUGET_API_KEY }}}}")]
+    [InlineData("${{ vars.SAFE_VALUE }}-${{ inputs.ApiKey")]
+    public void Malformed_expression_framing_is_unsupported_unproven(string value)
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", $$"""
+            name: continuous integration
+            on:
+              push:
+                branches: [main]
+            permissions:
+              contents: read
+            jobs:
+              build:
+                runs-on: ubuntu-latest
+                steps:
+                  - name: Read-only action
+                    uses: actions/checkout@v6
+                    with:
+                      note: >-
+                        {{value}}
+            """);
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        AssertLimitedUnproven(inspection);
+        Assert.Contains(
+            inspection.Failures,
+            failure => failure.IsError &&
+                       failure.Message.Contains("malformed/incomplete expression framing", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Theory]
+    [InlineData("workflow-env")]
+    [InlineData("job-env")]
+    [InlineData("step-env")]
+    [InlineData("action-with")]
+    [InlineData("reusable-with")]
+    [InlineData("reusable-secrets")]
+    [InlineData("step-run")]
+    [InlineData("step-condition")]
+    public void Malformed_expression_framing_is_blocking_across_evaluated_scalar_surfaces(string surface)
+    {
+        const string malformedExpression = "${{ vars.ARTIFACT_PATH";
+        var workflow = surface switch
+        {
+            "workflow-env" => $$"""
+                name: continuous integration
+                on: push
+                permissions:
+                  contents: read
+                env:
+                  PROBE: '{{malformedExpression}}'
+                jobs:
+                  build:
+                    runs-on: ubuntu-latest
+                    steps:
+                      - uses: actions/checkout@v6
+                """,
+            "job-env" => $$"""
+                name: continuous integration
+                on: push
+                permissions:
+                  contents: read
+                jobs:
+                  build:
+                    runs-on: ubuntu-latest
+                    env:
+                      PROBE: '{{malformedExpression}}'
+                    steps:
+                      - uses: actions/checkout@v6
+                """,
+            "step-env" => $$"""
+                name: continuous integration
+                on: push
+                permissions:
+                  contents: read
+                jobs:
+                  build:
+                    runs-on: ubuntu-latest
+                    steps:
+                      - uses: actions/checkout@v6
+                        env:
+                          PROBE: '{{malformedExpression}}'
+                """,
+            "action-with" => $$"""
+                name: continuous integration
+                on: push
+                permissions:
+                  contents: read
+                jobs:
+                  build:
+                    runs-on: ubuntu-latest
+                    steps:
+                      - uses: actions/checkout@v6
+                        with:
+                          note: '{{malformedExpression}}'
+                """,
+            "reusable-with" => $$"""
+                name: continuous integration
+                on: push
+                permissions:
+                  contents: read
+                jobs:
+                  build:
+                    uses: owner/repository/.github/workflows/reusable.yml@v1
+                    with:
+                      note: '{{malformedExpression}}'
+                """,
+            "reusable-secrets" => $$"""
+                name: continuous integration
+                on: push
+                permissions:
+                  contents: read
+                jobs:
+                  build:
+                    uses: owner/repository/.github/workflows/reusable.yml@v1
+                    secrets:
+                      PROBE: '{{malformedExpression}}'
+                """,
+            "step-run" => $$"""
+                name: continuous integration
+                on: push
+                permissions:
+                  contents: read
+                jobs:
+                  build:
+                    runs-on: ubuntu-latest
+                    steps:
+                      - run: echo '{{malformedExpression}}'
+                """,
+            _ => $$"""
+                name: continuous integration
+                on: push
+                permissions:
+                  contents: read
+                jobs:
+                  build:
+                    runs-on: ubuntu-latest
+                    steps:
+                      - if: '{{malformedExpression}}'
+                        uses: actions/checkout@v6
+                """
+        };
+        using var repository = WorkflowRepository.Create("ci.yml", workflow);
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        AssertLimitedUnproven(inspection);
+        Assert.Contains(
+            inspection.Failures,
+            failure => failure.IsError &&
+                       failure.Message.Contains("malformed/incomplete expression framing", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Theory]
+    [InlineData("ordinary-literal")]
+    [InlineData("${{ vars['ARTIFACT.PATH'] }}")]
+    [InlineData("${{ vars.ApiKeyPath }}")]
+    [InlineData("${{ vars['Nuget.Api.Key.Path'] }}")]
+    [InlineData("${{ format('${{') }}")]
+    public void Complete_noncredential_expressions_and_literals_stay_outside_release_policy(string value)
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", $$"""
+            name: continuous integration
+            on:
+              push:
+                branches: [main]
+            permissions:
+              contents: read
+            jobs:
+              build:
+                runs-on: ubuntu-latest
+                steps:
+                  - uses: actions/checkout@v6
+                    with:
+                      note: {{value}}
+            """);
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        Assert.False(inspection.Evaluated);
+        Assert.Empty(inspection.Failures);
+    }
+
+    [Fact]
+    public void Malformed_expression_framing_family_blocks_an_otherwise_valid_release_rehearsal()
+    {
+        using var corpus = PackedCorpus.Create();
+        var package = corpus.Pack("Standard/Standard.csproj");
+        var symbolPackage = Path.ChangeExtension(package, ".snupkg");
+        var config = new NuGetReadyConfig
+        {
+            SchemaVersion = 1,
+            Packages =
+            [
+                new PackageExpectation
+                {
+                    Id = "Fixture.Standard",
+                    Kind = "library",
+                    Version = "1.0.0",
+                    Artifacts = [Path.GetFileName(package), Path.GetFileName(symbolPackage)]
+                }
+            ]
+        };
+        var releaseWorkflow = Mutate(
+            ReleaseWorkflow,
+            "KeelMatrix.NuGetReady.1.0.0.nupkg",
+            Path.GetFileName(package));
+        releaseWorkflow = Mutate(
+            releaseWorkflow,
+            "KeelMatrix.NuGetReady.1.0.0.snupkg",
+            Path.GetFileName(symbolPackage));
+        var cases = new[]
+        {
+            (Name: "selector_unclosed_expression", Value: "${{ vars.NUGET_API_KEY"),
+            (Name: "single_closing_brace", Value: "${{ vars.NUGET_API_KEY }"),
+            (Name: "unterminated_quoted_member", Value: "${{ vars['NUGET_API_KEY] }}"),
+            (Name: "incomplete_bracket_selector", Value: "${{ vars['NUGET_API_KEY'"),
+            (Name: "incomplete_dynamic_selector", Value: "${{ vars[inputs.member_name]"),
+            (Name: "inputs_root", Value: "${{ inputs.ApiKey"),
+            (Name: "env_root", Value: "${{ env.ApiKey"),
+            (Name: "secrets_root", Value: "${{ secrets.ApiKey"),
+            (Name: "static_nonbounded_member", Value: "${{ vars['ARTIFACT.PATH']"),
+            (Name: "nested_opener", Value: "${{ ${{ vars.NUGET_API_KEY }}"),
+            (Name: "doubled_opener", Value: "${{${{ vars.NUGET_API_KEY }}}}"),
+            (Name: "complete_then_unclosed", Value: "${{ vars.SAFE_VALUE }}-${{ inputs.ApiKey")
+        };
+
+        foreach (var testCase in cases)
+        {
+            var ciWorkflow = testCase.Name == "selector_unclosed_expression"
+                ? """
+                    name: CI Probe
+                    on:
+                      push:
+                        branches: [main]
+                    permissions:
+                      contents: read
+                    jobs:
+                      build:
+                        runs-on: ubuntu-latest
+                        steps:
+                          - name: Read-only action
+                            uses: actions/checkout@v6
+                            env:
+                              PROBE: '${{ vars.NUGET_API_KEY'
+                    """
+                : $$"""
+                    name: CI Probe
+                    on:
+                      push:
+                        branches: [main]
+                    permissions:
+                      contents: read
+                    jobs:
+                      build:
+                        runs-on: ubuntu-latest
+                        steps:
+                          - name: Read-only action
+                            uses: actions/checkout@v6
+                            env:
+                              PROBE: >-
+                                {{testCase.Value}}
+                    """;
+            using var repository = WorkflowRepository.Create("release.yml", releaseWorkflow);
+            repository.WriteWorkflow("ci.yml", ciWorkflow);
+            var configPath = Path.Combine(repository.Root.FullName, "nugetready.json");
+            repository.WriteFile("nugetready.json", System.Text.Json.JsonSerializer.Serialize(config));
+
+            var report = CheckRunner.Run(
+                config,
+                corpus.OutputPath,
+                repository.Root.FullName,
+                TimeSpan.FromMinutes(2),
+                new ConsumerRehearsalOptions(PublicFeedPath: corpus.OutputPath),
+                configPath);
+            var workflowPolicyStatus = report.Checks.Single(check => check.Id == "workflow-policy").Status;
+
+            Console.WriteLine($"case={testCase.Name} overall={report.Status}; workflow-policy={workflowPolicyStatus}; exit={report.ExitCode}");
+            Assert.True(
+                report.Status == "error" && workflowPolicyStatus == "error" && report.ExitCode == 2,
+                $"case={testCase.Name} overall={report.Status}; workflow-policy={workflowPolicyStatus}; exit={report.ExitCode}; failures={string.Join(" | ", report.Failures.Select(failure => failure.Message))}");
+        }
     }
 
     [Theory]

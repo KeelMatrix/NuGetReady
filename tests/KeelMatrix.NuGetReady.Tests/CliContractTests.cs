@@ -53,6 +53,8 @@ public sealed class CliContractTests
         Assert.Contains("compared case-insensitively by exact equality", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("vars.*, inputs.*, and env.*", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("not a complete static member name is unresolvable", CliParser.HelpText, StringComparison.Ordinal);
+        Assert.Contains("Malformed/incomplete expression framing is unsupported/unproven", CliParser.HelpText, StringComparison.Ordinal);
+        Assert.Contains("regardless of the referenced context or member name", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("before each active step is evaluated", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("literal paths or prose containing the word secrets do not imply the context", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("without a recognized credential binding stays outside", CliParser.HelpText, StringComparison.Ordinal);
