@@ -522,12 +522,14 @@ public sealed class WorkflowPolicyTests
                 branches: ["main"]
             jobs:
               build:
+                permissions: {}
                 uses: ./.github/workflows/reusable-build.yml
             """);
         repository.WriteWorkflow("reusable-build.yml", """
             name: reusable build
             on:
               workflow_call:
+            permissions: {}
             jobs:
               build:
                 steps:
@@ -658,6 +660,7 @@ public sealed class WorkflowPolicyTests
             name: continuous integration
             on:
               pull_request:
+            permissions: {}
             jobs:
               build:
                 steps:
@@ -679,6 +682,7 @@ public sealed class WorkflowPolicyTests
             on:
               push:
                 branches: [main]
+            permissions: {}
             jobs:
               build:
                 steps:
@@ -749,6 +753,7 @@ public sealed class WorkflowPolicyTests
             name: continuous integration
             on:
               pull_request:
+            permissions: {}
             jobs:
               build:
                 steps:
@@ -845,6 +850,7 @@ public sealed class WorkflowPolicyTests
             on:
               push:
                 branches: [main]
+            permissions: {}
             jobs:
               build:
                 steps:
@@ -1631,14 +1637,15 @@ public sealed class WorkflowPolicyTests
     [InlineData("mkdir -p artifacts")]
     public void Safe_command_allowlist_keeps_ordinary_ci_quiet(string command)
     {
-        using var repository = WorkflowRepository.Create("ci.yml", $"""
+        using var repository = WorkflowRepository.Create("ci.yml", $$"""
             name: continuous integration
             on:
               pull_request:
+            permissions: {}
             jobs:
               build:
                 steps:
-                  - run: {command}
+                  - run: {{command}}
             """);
 
         var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
@@ -1655,6 +1662,8 @@ public sealed class WorkflowPolicyTests
     [InlineData("secret", "dotnet test")]
     [InlineData("secret", "dotnet tool list")]
     [InlineData("dynamic-secret", "dotnet build")]
+    [InlineData("whole-secret-context", "dotnet build")]
+    [InlineData("nested-whole-secret-context", "dotnet build")]
     [InlineData("packages-write", "dotnet build")]
     [InlineData("write-all", "dotnet test")]
     public void Capability_bearing_workflows_cannot_bypass_closed_world_evaluation(
@@ -1667,12 +1676,15 @@ public sealed class WorkflowPolicyTests
             "packages-write" => "    permissions:\n      packages: write",
             "write-all" => "    permissions: write-all",
             "dynamic-secret" => "    env:\n      PUBLISH_TOKEN: ${{ secrets[format('{0}', 'NUGET_API_KEY')] }}",
+            "whole-secret-context" => "    env:\n      ALL_SECRETS: ${{ toJSON(secrets) }}",
+            "nested-whole-secret-context" => "    env:\n      PUBLISH_TOKEN: ${{ fromJSON(toJSON(secrets))['NUGET_API_KEY'] }}",
             _ => "    env:\n      PUBLISH_TOKEN: ${{ secrets['NUGET_API_KEY'] }}"
         };
         using var repository = WorkflowRepository.Create("ci.yml", $$"""
             name: continuous integration
             on:
               pull_request:
+            permissions: {}
             jobs:
               build:
                 runs-on: ubuntu-latest
@@ -1682,6 +1694,66 @@ public sealed class WorkflowPolicyTests
             """);
 
         AssertLimitedUnproven(WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName));
+    }
+
+    [Fact]
+    public void Omitted_permissions_with_github_token_are_limited_unproven()
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", """
+            name: continuous integration
+            on:
+              pull_request:
+            jobs:
+              build:
+                runs-on: ubuntu-latest
+                env:
+                  GH_TOKEN: ${{ github.token }}
+                steps:
+                  - run: dotnet build
+            """);
+
+        AssertLimitedUnproven(WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName));
+    }
+
+    [Fact]
+    public void Executable_job_with_omitted_permissions_is_limited_unproven()
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", """
+            name: continuous integration
+            on:
+              pull_request:
+            jobs:
+              build:
+                runs-on: ubuntu-latest
+                steps:
+                  - run: dotnet build
+            """);
+
+        AssertLimitedUnproven(WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName));
+    }
+
+    [Fact]
+    public void Explicit_read_only_permissions_keep_github_token_ci_quiet()
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", """
+            name: continuous integration
+            on:
+              pull_request:
+            permissions:
+              contents: read
+            jobs:
+              build:
+                runs-on: ubuntu-latest
+                env:
+                  GH_TOKEN: ${{ github.token }}
+                steps:
+                  - run: dotnet build
+            """);
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        Assert.False(inspection.Evaluated);
+        Assert.Empty(inspection.Failures);
     }
 
     [Fact]

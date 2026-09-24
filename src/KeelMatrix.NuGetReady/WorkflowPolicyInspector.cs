@@ -405,7 +405,11 @@ internal static class WorkflowPolicyInspector
             failures.Add(Unsupported("The supported release profile permits only an on.push.tags version-tag trigger; additional triggers are unproven."));
         }
 
-        if (!HasExactPermissions(workflow.Permissions, ("contents", "read")))
+        if (!workflow.PermissionsSpecified)
+        {
+            failures.Add(Unsupported("The release workflow omits permissions, so its effective GitHub token scope depends on external defaults and is unsupported/unproven."));
+        }
+        else if (!HasExactPermissions(workflow.Permissions, ("contents", "read")))
         {
             failures.Add(new Failure("workflow-policy", "The supported release profile requires workflow permissions to be exactly contents: read."));
         }
@@ -1763,7 +1767,7 @@ internal static class WorkflowPolicyInspector
     {
         return run is not null && Regex.IsMatch(
             run,
-            @"\bsecrets\s*(?:\.|\[)",
+            @"\bsecrets\b",
             RegexOptions.IgnoreCase);
     }
 
@@ -1780,6 +1784,11 @@ internal static class WorkflowPolicyInspector
             if (activeSteps.Length == 0 && string.IsNullOrWhiteSpace(job.Uses))
             {
                 continue;
+            }
+
+            if (!job.PermissionsSpecified && !workflow.PermissionsSpecified)
+            {
+                return true;
             }
 
             var effectivePermissions = job.PermissionsSpecified ? job.Permissions : workflow.Permissions;
