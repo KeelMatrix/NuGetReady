@@ -32,16 +32,49 @@ public sealed class ReleaseWorkflowContractTests
     }
 
     [Fact]
-    public void Release_workflow_uses_the_pinned_installed_cli_profile()
+    public void Release_workflow_isolates_production_validation_and_publication()
     {
         var root = FindRepositoryRoot();
         var workflowPath = Path.Combine(root, ".github", "workflows", "release.yml");
         var workflow = File.ReadAllText(workflowPath);
 
         Assert.Contains("persist-credentials: false", workflow, StringComparison.Ordinal);
-        Assert.Contains("dotnet tool install KeelMatrix.NuGetReady --version 0.1.0 --tool-path .nugetready --configfile NuGet.config --add-source artifacts/release --no-cache --verbosity minimal", workflow, StringComparison.Ordinal);
-        Assert.Contains("./.nugetready/nugetready check --config nugetready.json --artifacts artifacts/release --format json", workflow, StringComparison.Ordinal);
+        Assert.Contains("produce:", workflow, StringComparison.Ordinal);
+        Assert.Contains("validate:\n    name: Validate the immutable release artifacts\n    needs: produce", workflow, StringComparison.Ordinal);
+        Assert.Contains("publish:\n    name: Publish the exact validated package\n    needs: validate", workflow, StringComparison.Ordinal);
+        Assert.Contains("<add key=\"candidate\" value=\"/tmp/nugetready-artifacts\" />", workflow, StringComparison.Ordinal);
+        Assert.Contains("<package pattern=\"KeelMatrix.NuGetReady\" />", workflow, StringComparison.Ordinal);
+        Assert.Contains("<packageSource key=\"nuget.org\">", workflow, StringComparison.Ordinal);
+        Assert.Contains("<package pattern=\"*\" />", workflow, StringComparison.Ordinal);
+        Assert.Contains("dotnet tool install KeelMatrix.NuGetReady --version 0.1.0 --tool-path /tmp/nugetready-tool --configfile /tmp/nugetready-tool.config --no-cache --verbosity minimal", workflow, StringComparison.Ordinal);
+        Assert.Contains("/tmp/nugetready-tool/nugetready check --config nugetready.json --artifacts /tmp/nugetready-artifacts --format json", workflow, StringComparison.Ordinal);
+        Assert.Single(Regex.Matches(workflow, "uses: actions/upload-artifact@v4", RegexOptions.CultureInvariant).Cast<Match>());
+        Assert.Collection(
+            Regex.Matches(workflow, "uses: actions/download-artifact@v4", RegexOptions.CultureInvariant).Cast<Match>(),
+            _ => { },
+            _ => { });
         Assert.DoesNotContain("dotnet run --project", workflow, StringComparison.Ordinal);
+        Assert.DoesNotContain("--add-source", workflow, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("<package pattern=\"KeelMatrix.NuGetReady\" />", "<package pattern=\"*\" />")]
+    [InlineData("<add key=\"candidate\" value=\"/tmp/nugetready-artifacts\" />", "<add key=\"candidate\" value=\"https://packages.example.invalid/v3/index.json\" />")]
+    [InlineData("--configfile /tmp/nugetready-tool.config", "--add-source /tmp/nugetready-artifacts")]
+    public void Candidate_tool_source_mapping_is_exact_or_blocking(string original, string replacement)
+    {
+        var root = FindRepositoryRoot();
+        var workflow = File.ReadAllText(Path.Combine(root, ".github", "workflows", "release.yml"));
+        Assert.Contains(original, workflow, StringComparison.Ordinal);
+
+        using var repository = WorkflowRepository.Create(
+            "release.yml",
+            workflow.Replace(original, replacement, StringComparison.Ordinal));
+        repository.WriteFile("nugetready.json", File.ReadAllText(Path.Combine(root, "nugetready.json")));
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+        Assert.Contains(findings, finding => finding.IsError && finding.Message.Contains("source-exclusive", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]

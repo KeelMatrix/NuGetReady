@@ -15,7 +15,33 @@ internal static class WorkflowPolicyInspector
     private const int MaxIndirectPathDepth = 8;
     private const long MaxIndirectPathBytes = 2 * 1024 * 1024;
     private const string SupportedToolVersion = "0.1.0";
-    private const string InstalledValidationCommand = "./.nugetready/nugetready check --config nugetready.json --artifacts artifacts/release --format json";
+    private const string ArtifactIdentity = "validated-release-artifacts";
+    private const string ImmutableValidationArtifactDirectory = "/tmp/nugetready-artifacts";
+    private const string InstalledToolDirectory = "/tmp/nugetready-tool";
+    private const string CandidateToolConfigPath = "/tmp/nugetready-tool.config";
+    private const string NuGetOrgSource = "https://api.nuget.org/v3/index.json";
+    private const string InstalledValidationCommand = "/tmp/nugetready-tool/nugetready check --config nugetready.json --artifacts /tmp/nugetready-artifacts --format json";
+    private const string CandidateToolSourceConfigurationCommand = """
+        @'
+        <?xml version="1.0" encoding="utf-8"?>
+        <configuration>
+          <packageSources>
+            <clear />
+            <add key="candidate" value="/tmp/nugetready-artifacts" />
+            <add key="nuget.org" value="https://api.nuget.org/v3/index.json" protocolVersion="3" />
+          </packageSources>
+          <packageSourceMapping>
+            <clear />
+            <packageSource key="candidate">
+              <package pattern="KeelMatrix.NuGetReady" />
+            </packageSource>
+            <packageSource key="nuget.org">
+              <package pattern="*" />
+            </packageSource>
+          </packageSourceMapping>
+        </configuration>
+        '@ | Set-Content -LiteralPath /tmp/nugetready-tool.config -Encoding utf8NoBOM
+        """;
     private static readonly string[] InstalledValidationTokens = TokenizeCommandLine(InstalledValidationCommand);
     private static readonly string[] ExactPackArguments =
     {
@@ -347,7 +373,13 @@ internal static class WorkflowPolicyInspector
             failures.Add(Unsupported("The supported release profile does not permit workflow-level environment variables."));
         }
 
-        if (!TryLoadExpectedArtifacts(repositoryPath, config, failures, out var expectedArtifacts, out var primaryArtifact))
+        if (!TryLoadExpectedArtifacts(
+                repositoryPath,
+                config,
+                failures,
+                out var expectedArtifacts,
+                out var primaryArtifact,
+                out var useCandidateToolArtifactSource))
         {
             return;
         }
@@ -396,12 +428,26 @@ internal static class WorkflowPolicyInspector
             return;
         }
 
-        if (workflow.Jobs.Count != 2 || workflow.Jobs.Any(job => job != publishJob && job != validationJob))
+        if (validationJob.DependsOn.Count != 1)
         {
-            failures.Add(Unsupported("The 0.1.0 supported release profile contains exactly one validation job and one NuGet publish job; additional jobs are unproven."));
+            failures.Add(Unsupported("The validation job must have exactly one required artifact-producer dependency."));
+            return;
         }
 
-        InspectValidationJob(repositoryPath, workflow, validationJob, expectedArtifacts, failures);
+        var producerJob = workflow.Jobs.SingleOrDefault(candidate => validationJob.DependsOn.Contains(candidate.Id));
+        if (producerJob is null)
+        {
+            failures.Add(Unsupported("The validation job artifact-producer dependency could not be resolved."));
+            return;
+        }
+
+        if (workflow.Jobs.Count != 3 || workflow.Jobs.Any(job => job != publishJob && job != validationJob && job != producerJob))
+        {
+            failures.Add(Unsupported("The 0.1.0 supported release profile contains exactly one artifact-producer job, one fresh-runner validation job, and one NuGet publish job; additional jobs are unproven."));
+        }
+
+        InspectProducerJob(repositoryPath, workflow, producerJob, expectedArtifacts, failures);
+        InspectValidationJob(workflow, validationJob, producerJob, useCandidateToolArtifactSource, failures);
         InspectCredentialBearingJob(publishJob, primaryArtifact, failures);
 
         if (ContainsLongLivedCredential(workflow.Environment) ||
@@ -413,17 +459,77 @@ internal static class WorkflowPolicyInspector
             failures.Add(new Failure("workflow-policy", "Release workflow contains a long-lived NuGet API-key publication path."));
         }
 
-        if (!HasTelemetrySuppression(workflow, validationJob) || !HasTelemetrySuppression(workflow, publishJob))
+        if (!HasTelemetrySuppression(workflow, producerJob) ||
+            !HasTelemetrySuppression(workflow, validationJob) ||
+            !HasTelemetrySuppression(workflow, publishJob))
         {
-            failures.Add(new Failure("workflow-policy", "Release workflow does not suppress product and CLI telemetry for validation and publication execution."));
+            failures.Add(new Failure("workflow-policy", "Release workflow does not suppress product and CLI telemetry for artifact production, validation, and publication execution."));
+        }
+    }
+
+    private static void InspectProducerJob(
+        string repositoryPath,
+        WorkflowDocument workflow,
+        WorkflowJob producerJob,
+        IReadOnlyList<string> expectedArtifacts,
+        List<Failure> failures)
+    {
+        if (!IsDefinitelyEnabled(producerJob.Condition) || !string.IsNullOrWhiteSpace(producerJob.Uses))
+        {
+            failures.Add(Unsupported("The artifact producer must be an unconditional local job."));
+        }
+
+        if (producerJob.DependsOn.Count != 0 || !string.Equals(producerJob.RunsOn, "ubuntu-latest", StringComparison.Ordinal))
+        {
+            failures.Add(Unsupported("The artifact producer must be a root job on the literal ubuntu-latest runner."));
+        }
+
+        if (!string.Equals(producerJob.TimeoutMinutes, "30", StringComparison.Ordinal))
+        {
+            failures.Add(Unsupported("The supported artifact-producer timeout-minutes value must be the literal 30."));
+        }
+
+        if (!HasSupportedJobEnvironment(producerJob.Environment))
+        {
+            failures.Add(Unsupported("The artifact-producer environment contains a credential, command-resolution, or unsupported variable or value."));
+        }
+
+        if (producerJob.HasUninspectableStructure ||
+            producerJob.PresentKeys.Any(key => key is not ("name" or "runs-on" or "timeout-minutes" or "permissions" or "env" or "steps")))
+        {
+            failures.Add(Unsupported("The artifact-producer job contains an unknown or unsupported job node."));
+        }
+
+        var effectivePermissions = producerJob.PermissionsSpecified ? producerJob.Permissions : workflow.Permissions;
+        if (IsWritePermission(effectivePermissions, "id-token") || IsWriteAll(effectivePermissions) || HasOverbroadPublicationPermission(effectivePermissions))
+        {
+            failures.Add(new Failure("workflow-policy", "The artifact-producer job must not receive an OIDC token or repository write capability."));
+        }
+
+        if (ContainsLongLivedCredential(producerJob.Environment) ||
+            producerJob.Steps.Any(step => ContainsLongLivedCredential(step.Run) ||
+                                             ContainsLongLivedCredential(step.Environment) ||
+                                             ContainsLongLivedCredential(step.With)))
+        {
+            failures.Add(new Failure("workflow-policy", "The artifact-producer job must not receive a long-lived NuGet publishing credential."));
+        }
+
+        if (!HasSupportedNuGetConfiguration(repositoryPath))
+        {
+            failures.Add(Unsupported("The supported validation profile requires NuGet.config to contain only the canonical NuGet.org v3 source."));
+        }
+
+        if (!HasExactProducerSequence(producerJob.Steps, expectedArtifacts))
+        {
+            failures.Add(Unsupported("The artifact-producer job must use the exact ordered closed command profile: checkout, SDK setup, restore, format, build, test, pack, and immediate exact artifact upload."));
         }
     }
 
     private static void InspectValidationJob(
-        string repositoryPath,
         WorkflowDocument workflow,
         WorkflowJob validationJob,
-        IReadOnlyList<string> expectedArtifacts,
+        WorkflowJob producerJob,
+        bool useCandidateToolArtifactSource,
         List<Failure> failures)
     {
         if (!IsDefinitelyEnabled(validationJob.Condition) || !string.IsNullOrWhiteSpace(validationJob.Uses))
@@ -431,24 +537,24 @@ internal static class WorkflowPolicyInspector
             failures.Add(Unsupported("The validation dependency must be an unconditional local job."));
         }
 
-        if (validationJob.DependsOn.Count != 0 || !string.Equals(validationJob.RunsOn, "ubuntu-latest", StringComparison.Ordinal))
+        if (validationJob.DependsOn.Count != 1 || !validationJob.DependsOn.Contains(producerJob.Id) ||
+            !string.Equals(validationJob.RunsOn, "ubuntu-latest", StringComparison.Ordinal))
         {
-            failures.Add(Unsupported("The validation job must be a root job on the literal ubuntu-latest runner."));
+            failures.Add(Unsupported("The validation job must run on a fresh literal ubuntu-latest runner after exactly the artifact producer."));
         }
 
-        if (!string.Equals(validationJob.TimeoutMinutes, "30", StringComparison.Ordinal))
+        if (!string.Equals(validationJob.TimeoutMinutes, "10", StringComparison.Ordinal))
         {
-            failures.Add(Unsupported("The supported validation job timeout-minutes value must be the literal 30."));
+            failures.Add(Unsupported("The supported validation job timeout-minutes value must be the literal 10."));
         }
 
-
-        if (!HasSupportedJobEnvironment(validationJob.Environment))
+        if (!HasSupportedValidationEnvironment(validationJob.Environment))
         {
             failures.Add(Unsupported("The validation job environment contains a credential, command-resolution, or unsupported variable or value."));
         }
 
         if (validationJob.HasUninspectableStructure ||
-            validationJob.PresentKeys.Any(key => key is not ("name" or "runs-on" or "timeout-minutes" or "permissions" or "env" or "steps")))
+            validationJob.PresentKeys.Any(key => key is not ("name" or "runs-on" or "timeout-minutes" or "needs" or "permissions" or "env" or "steps")))
         {
             failures.Add(Unsupported("The validation job contains an unknown or unsupported job node."));
         }
@@ -467,14 +573,9 @@ internal static class WorkflowPolicyInspector
             failures.Add(new Failure("workflow-policy", "The validation job must not receive a long-lived NuGet publishing credential."));
         }
 
-        if (!HasSupportedNuGetConfiguration(repositoryPath))
+        if (!HasExactValidationSequence(validationJob.Steps, useCandidateToolArtifactSource))
         {
-            failures.Add(Unsupported("The supported validation profile requires NuGet.config to contain only the canonical NuGet.org v3 source."));
-        }
-
-        if (!HasExactValidationSequence(validationJob.Steps, expectedArtifacts))
-        {
-            failures.Add(Unsupported("The validation job must use the exact ordered closed command profile: checkout, SDK setup, restore, format, build, test, pack, pinned tool-path install, installed NuGetReady check, and exact artifact upload."));
+            failures.Add(Unsupported("The fresh-runner validation job must use the exact ordered closed command profile: checkout, SDK setup, immutable artifact download, source-exclusive pinned tool acquisition, and installed NuGetReady check as the final step."));
         }
     }
 
@@ -499,7 +600,7 @@ internal static class WorkflowPolicyInspector
 
         var download = steps[0];
         if (!UsesExactly(download, "actions/download-artifact@v4") || !IsSimpleActionStep(download, allowId: false) ||
-            !HasExactInputs(download.With, ("name", "validated-release-artifacts"), ("path", "artifacts/release")))
+            !HasExactInputs(download.With, ("name", ArtifactIdentity), ("path", "artifacts/release")))
         {
             failures.Add(Unsupported("The first publish step must download the exact validated artifact identity to artifacts/release."));
         }
@@ -552,10 +653,12 @@ internal static class WorkflowPolicyInspector
         NuGetReadyConfig? suppliedConfig,
         List<Failure> failures,
         out IReadOnlyList<string> artifacts,
-        out string primaryArtifact)
+        out string primaryArtifact,
+        out bool useCandidateToolArtifactSource)
     {
         artifacts = Array.Empty<string>();
         primaryArtifact = string.Empty;
+        useCandidateToolArtifactSource = false;
         try
         {
             var config = suppliedConfig ?? ConfigurationLoader.Load(Path.Combine(repositoryPath, "nugetready.json"));
@@ -566,9 +669,14 @@ internal static class WorkflowPolicyInspector
                 return false;
             }
 
-            artifacts = packages[0].Artifacts!.OrderBy(value => value, StringComparer.Ordinal).ToArray();
+            var package = packages[0];
+            artifacts = package.Artifacts!.OrderBy(value => value, StringComparer.Ordinal).ToArray();
             primaryArtifact = artifacts.Single(value => value.EndsWith(".nupkg", StringComparison.OrdinalIgnoreCase) &&
-                                                         !value.EndsWith(".snupkg", StringComparison.OrdinalIgnoreCase));
+                                                          !value.EndsWith(".snupkg", StringComparison.OrdinalIgnoreCase));
+            useCandidateToolArtifactSource = string.Equals(package.Id, "KeelMatrix.NuGetReady", StringComparison.OrdinalIgnoreCase) &&
+                                             string.Equals(package.Kind, "dotnetTool", StringComparison.OrdinalIgnoreCase) &&
+                                             string.Equals(package.Version, SupportedToolVersion, StringComparison.Ordinal) &&
+                                             string.Equals(primaryArtifact, $"KeelMatrix.NuGetReady.{SupportedToolVersion}.nupkg", StringComparison.OrdinalIgnoreCase);
             return true;
         }
         catch (NuGetReadyInputException)
@@ -607,13 +715,21 @@ internal static class WorkflowPolicyInspector
             ["DOTNET_CLI_TELEMETRY_OPTOUT"] = "1",
             ["DOTNET_NOLOGO"] = "1",
             ["NUGET_XMLDOC_MODE"] = "skip",
-            ["MSBUILDDISABLENODEREUSE"] = "1"
+            ["MSBUILDDISABLENODEREUSE"] = "1",
+            ["NUGET_PACKAGES"] = "/tmp/nugetready-packages"
         };
-        return environment.Count is >= 2 and <= 5 &&
+        return environment.Count is >= 2 and <= 6 &&
                environment.All(pair => allowed.TryGetValue(pair.Key, out var value) &&
                                        string.Equals(pair.Value, value, StringComparison.OrdinalIgnoreCase)) &&
                IsEnabled(environment, "KEELMATRIX_NO_TELEMETRY") &&
                IsEnabled(environment, "DOTNET_CLI_TELEMETRY_OPTOUT");
+    }
+
+    private static bool HasSupportedValidationEnvironment(Dictionary<string, string> environment)
+    {
+        return HasSupportedJobEnvironment(environment) &&
+               environment.TryGetValue("NUGET_PACKAGES", out var value) &&
+               string.Equals(value, "/tmp/nugetready-packages", StringComparison.Ordinal);
     }
 
     private static bool UsesExactly(WorkflowStep step, string action)
@@ -621,26 +737,41 @@ internal static class WorkflowPolicyInspector
         return string.Equals(step.Uses, action, StringComparison.Ordinal);
     }
 
-    private static bool HasExactValidationSequence(
+    private static bool HasExactProducerSequence(
         IReadOnlyList<WorkflowStep> steps,
         IReadOnlyList<string> expectedArtifacts)
     {
-        if (steps.Count != 10 ||
+        return steps.Count == 8 &&
+               IsExactCheckoutStep(steps[0]) &&
+               IsExactSetupDotNetStep(steps[1]) &&
+               TryMatchRestoreStep(steps[2], out var solutionPath) &&
+               IsExactFormatStep(steps[3], solutionPath) &&
+               IsExactBuildStep(steps[4], solutionPath) &&
+               IsExactTestStep(steps[5], solutionPath) &&
+               IsExactPackStep(steps[6]) &&
+               IsExactUploadStep(steps[7], expectedArtifacts);
+    }
+
+    private static bool HasExactValidationSequence(
+        IReadOnlyList<WorkflowStep> steps,
+        bool useCandidateToolArtifactSource)
+    {
+        if (steps.Count < 5 ||
             !IsExactCheckoutStep(steps[0]) ||
             !IsExactSetupDotNetStep(steps[1]) ||
-            !TryMatchRestoreStep(steps[2], out var solutionPath) ||
-            !IsExactFormatStep(steps[3], solutionPath) ||
-            !IsExactBuildStep(steps[4], solutionPath) ||
-            !IsExactTestStep(steps[5], solutionPath) ||
-            !IsExactPackStep(steps[6]) ||
-            !IsExactToolInstallStep(steps[7]) ||
-            !IsExactProfileValidationStep(steps[8]) ||
-            !IsExactUploadStep(steps[9], expectedArtifacts))
+            !IsExactDownloadStep(steps[2], ImmutableValidationArtifactDirectory))
         {
             return false;
         }
 
-        return true;
+        return useCandidateToolArtifactSource
+            ? steps.Count == 6 &&
+              IsExactCandidateToolSourceConfigurationStep(steps[3]) &&
+              IsExactToolInstallStep(steps[4], useCandidateToolArtifactSource: true) &&
+              IsExactProfileValidationStep(steps[5])
+            : steps.Count == 5 &&
+              IsExactToolInstallStep(steps[3], useCandidateToolArtifactSource: false) &&
+              IsExactProfileValidationStep(steps[4]);
     }
 
     private static bool IsExactCheckoutStep(WorkflowStep step)
@@ -718,13 +849,36 @@ internal static class WorkflowPolicyInspector
         return tokens.Skip(3).SequenceEqual(ExactPackArguments, StringComparer.Ordinal);
     }
 
-    private static bool IsExactToolInstallStep(WorkflowStep step)
+    private static bool IsExactToolInstallStep(WorkflowStep step, bool useCandidateToolArtifactSource)
     {
-        return HasExactDirectCommand(
-            step,
-            "dotnet", "tool", "install", "KeelMatrix.NuGetReady", "--version", SupportedToolVersion,
-            "--tool-path", ".nugetready", "--configfile", "NuGet.config", "--add-source", "artifacts/release",
-            "--no-cache", "--verbosity", "minimal");
+        return useCandidateToolArtifactSource
+            ? HasExactDirectCommand(
+                step,
+                "dotnet", "tool", "install", "KeelMatrix.NuGetReady", "--version", SupportedToolVersion,
+                "--tool-path", InstalledToolDirectory, "--configfile", CandidateToolConfigPath,
+                "--no-cache", "--verbosity", "minimal")
+            : HasExactDirectCommand(
+                step,
+                "dotnet", "tool", "install", "KeelMatrix.NuGetReady", "--version", SupportedToolVersion,
+                "--tool-path", InstalledToolDirectory, "--source", NuGetOrgSource,
+                "--no-cache", "--verbosity", "minimal");
+    }
+
+    private static bool IsExactCandidateToolSourceConfigurationStep(WorkflowStep step)
+    {
+        return IsDefinitelyEnabled(step.Condition) &&
+               !step.HasUninspectableStructure &&
+               string.Equals(step.Shell, "pwsh", StringComparison.Ordinal) &&
+               string.Equals(step.Run?.Trim(), CandidateToolSourceConfigurationCommand, StringComparison.Ordinal) &&
+               step.Environment.Count == 0 &&
+               step.PresentKeys.All(key => key is "name" or "shell" or "run");
+    }
+
+    private static bool IsExactDownloadStep(WorkflowStep step, string path)
+    {
+        return UsesExactly(step, "actions/download-artifact@v4") &&
+               IsSimpleActionStep(step, allowId: false) &&
+               HasExactInputs(step.With, ("name", ArtifactIdentity), ("path", path));
     }
 
     private static bool IsExactUploadStep(WorkflowStep step, IReadOnlyList<string> expectedArtifacts)
@@ -733,7 +887,7 @@ internal static class WorkflowPolicyInspector
                IsSimpleActionStep(step, allowId: false) &&
                HasExactInputs(
                    step.With,
-                   ("name", "validated-release-artifacts"),
+                    ("name", ArtifactIdentity),
                    ("path", JoinArtifactPaths(expectedArtifacts)),
                    ("if-no-files-found", "error"));
     }
@@ -961,6 +1115,11 @@ internal static class WorkflowPolicyInspector
         if (depth > MaxIndirectPathDepth)
         {
             return IndirectPublicationPath.Unknown;
+        }
+
+        if (IsExactProfileValidationStep(step) || IsExactCandidateToolSourceConfigurationStep(step))
+        {
+            return IndirectPublicationPath.ProvenNonPublishing;
         }
 
         string repositoryRoot;

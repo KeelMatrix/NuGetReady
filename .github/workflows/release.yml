@@ -9,8 +9,8 @@ permissions:
   contents: read
 
 jobs:
-  validate:
-    name: Validate the exact release artifacts
+  produce:
+    name: Produce the exact release artifacts
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -53,15 +53,7 @@ jobs:
         shell: pwsh
         run: dotnet pack src/KeelMatrix.NuGetReady/KeelMatrix.NuGetReady.csproj --configuration Release --no-build --no-restore --include-symbols -p:SymbolPackageFormat=snupkg -p:ImportDirectoryBuildTargets=false -p:ImportDirectoryTargets=false --output artifacts/release --nologo -p:UseSharedCompilation=false
 
-      - name: Install the pinned NuGetReady tool
-        shell: pwsh
-        run: dotnet tool install KeelMatrix.NuGetReady --version 0.1.0 --tool-path .nugetready --configfile NuGet.config --add-source artifacts/release --no-cache --verbosity minimal
-
-      - name: Validate the exact package set with NuGetReady
-        shell: pwsh
-        run: ./.nugetready/nugetready check --config nugetready.json --artifacts artifacts/release --format json
-
-      - name: Upload only the validated release artifacts
+      - name: Upload only the exact release artifacts
         uses: actions/upload-artifact@v4
         with:
           name: validated-release-artifacts
@@ -69,6 +61,69 @@ jobs:
             artifacts/release/KeelMatrix.NuGetReady.0.1.0.nupkg
             artifacts/release/KeelMatrix.NuGetReady.0.1.0.snupkg
           if-no-files-found: error
+
+  validate:
+    name: Validate the immutable release artifacts
+    needs: produce
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      KEELMATRIX_NO_TELEMETRY: '1'
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+      DOTNET_NOLOGO: '1'
+      NUGET_XMLDOC_MODE: skip
+      MSBUILDDISABLENODEREUSE: '1'
+      NUGET_PACKAGES: /tmp/nugetready-packages
+
+    steps:
+      - name: Check out source at the triggering tag
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.ref }}
+          persist-credentials: false
+
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          global-json-file: global.json
+
+      - name: Download the immutable release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: validated-release-artifacts
+          path: /tmp/nugetready-artifacts
+
+      - name: Configure source-exclusive candidate acquisition
+        shell: pwsh
+        run: |
+          @'
+          <?xml version="1.0" encoding="utf-8"?>
+          <configuration>
+            <packageSources>
+              <clear />
+              <add key="candidate" value="/tmp/nugetready-artifacts" />
+              <add key="nuget.org" value="https://api.nuget.org/v3/index.json" protocolVersion="3" />
+            </packageSources>
+            <packageSourceMapping>
+              <clear />
+              <packageSource key="candidate">
+                <package pattern="KeelMatrix.NuGetReady" />
+              </packageSource>
+              <packageSource key="nuget.org">
+                <package pattern="*" />
+              </packageSource>
+            </packageSourceMapping>
+          </configuration>
+          '@ | Set-Content -LiteralPath /tmp/nugetready-tool.config -Encoding utf8NoBOM
+
+      - name: Install the candidate NuGetReady tool from its exclusive source mapping
+        shell: pwsh
+        run: dotnet tool install KeelMatrix.NuGetReady --version 0.1.0 --tool-path /tmp/nugetready-tool --configfile /tmp/nugetready-tool.config --no-cache --verbosity minimal
+
+      - name: Validate the exact package set with NuGetReady
+        shell: pwsh
+        run: /tmp/nugetready-tool/nugetready check --config nugetready.json --artifacts /tmp/nugetready-artifacts --format json
 
   publish:
     name: Publish the exact validated package

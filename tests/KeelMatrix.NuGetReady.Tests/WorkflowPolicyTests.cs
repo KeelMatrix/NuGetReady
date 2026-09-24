@@ -149,8 +149,8 @@ public sealed class WorkflowPolicyTests
     {
         using var repository = WorkflowRepository.Create("release.yml", Mutate(
             ReleaseWorkflow,
-            "  validate:\n    runs-on: ubuntu-latest",
-            "  validate:\n    if: false\n    runs-on: ubuntu-latest"));
+            "  validate:\n    needs: produce\n    runs-on: ubuntu-latest",
+            "  validate:\n    needs: produce\n    if: false\n    runs-on: ubuntu-latest"));
 
         var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
 
@@ -1312,12 +1312,12 @@ public sealed class WorkflowPolicyTests
     [Fact]
     public void Artifact_validation_must_execute_before_publication()
     {
+        const string install = $"- name: Install the pinned NuGetReady tool\n        shell: pwsh\n        run: {ToolInstallCommand}";
         const string validation = $"- name: Validate exact artifacts\n        shell: pwsh\n        run: {ValidationCommand}";
-        const string upload = "- name: Upload exact artifacts\n        uses: actions/upload-artifact@v4\n        with:\n          name: validated-release-artifacts\n          path: |\n            artifacts/release/KeelMatrix.NuGetReady.1.0.0.nupkg\n            artifacts/release/KeelMatrix.NuGetReady.1.0.0.snupkg\n          if-no-files-found: error";
         using var repository = WorkflowRepository.Create("release.yml", Mutate(
             ReleaseWorkflow,
-            $"{validation}\n      {upload}",
-            $"{upload}\n      {validation}"));
+            $"{install}\n      {validation}",
+            $"{validation}\n      {install}"));
 
         var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
 
@@ -1354,7 +1354,7 @@ public sealed class WorkflowPolicyTests
 
         var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
 
-        Assert.Contains(findings, finding => finding.IsError && finding.Message.Contains("closed command profile", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(findings, finding => finding.IsError && finding.Message.Contains("validation", StringComparison.OrdinalIgnoreCase));
     }
 
     [Theory]
@@ -1365,7 +1365,7 @@ public sealed class WorkflowPolicyTests
         "dotnet build Example.sln --configuration Release --no-restore --nologo -p:UseSharedCompilation=false",
         "git -c alias.ship=!dotnet-nuget-push ship")]
     [InlineData(
-        "dotnet tool install KeelMatrix.NuGetReady --version 0.1.0 --tool-path .nugetready --configfile NuGet.config --add-source artifacts/release --no-cache --verbosity minimal",
+        ToolInstallCommand,
         "dotnet tool run arbitrary-tool")]
     [InlineData(
         "dotnet pack src/Example/Example.csproj --configuration Release --no-build --no-restore --include-symbols -p:SymbolPackageFormat=snupkg -p:ImportDirectoryBuildTargets=false -p:ImportDirectoryTargets=false --output artifacts/release --nologo -p:UseSharedCompilation=false",
@@ -1382,7 +1382,56 @@ public sealed class WorkflowPolicyTests
 
         var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
 
-        Assert.Contains(findings, finding => finding.IsError && finding.Message.Contains("closed command profile", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(findings, finding => finding.IsError && finding.Message.Contains("profile", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void Candidate_artifact_feed_cannot_replace_the_source_exclusive_published_tool()
+    {
+        using var repository = WorkflowRepository.Create("release.yml", Mutate(
+            ReleaseWorkflow,
+            "--source https://api.nuget.org/v3/index.json",
+            "--source /tmp/nugetready-artifacts"));
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+        Assert.Contains(findings, finding => finding.IsError && finding.Message.Contains("source-exclusive", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void A_second_tool_source_cannot_race_the_source_exclusive_acquisition()
+    {
+        using var repository = WorkflowRepository.Create("release.yml", Mutate(
+            ReleaseWorkflow,
+            "--source https://api.nuget.org/v3/index.json --no-cache",
+            "--source https://api.nuget.org/v3/index.json --add-source /tmp/nugetready-artifacts --no-cache"));
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+        Assert.Contains(findings, finding => finding.IsError && finding.Message.Contains("source-exclusive", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Theory]
+    [InlineData("GITHUB_PATH")]
+    [InlineData("GITHUB_ENV")]
+    public void Repository_controlled_runner_channels_cannot_share_a_job_with_validation(string channel)
+    {
+        const string upload = "- name: Upload exact artifacts\n        uses: actions/upload-artifact@v4";
+        using var repository = WorkflowRepository.Create("release.yml", Mutate(
+            ReleaseWorkflow,
+            upload,
+            $"- name: Install before the runner boundary\n        shell: pwsh\n        run: {ToolInstallCommand}\n      - name: Validate before the runner boundary\n        shell: pwsh\n        run: {ValidationCommand}\n      {upload}"));
+        repository.WriteFile("Directory.Build.targets", $"""
+            <Project>
+              <Target Name="PersistRunnerState" BeforeTargets="Build">
+                <WriteLinesToFile File="$({channel})" Lines="$(MSBuildThisFileDirectory)adversarial-bin" />
+              </Target>
+            </Project>
+            """);
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+        Assert.Contains(findings, finding => finding.IsError && finding.Message.Contains("artifact-producer", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]
@@ -1659,7 +1708,8 @@ public sealed class WorkflowPolicyTests
         AssertLimitedUnproven(WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName));
     }
 
-    private const string ValidationCommand = "./.nugetready/nugetready check --config nugetready.json --artifacts artifacts/release --format json";
+    private const string ToolInstallCommand = "dotnet tool install KeelMatrix.NuGetReady --version 0.1.0 --tool-path /tmp/nugetready-tool --source https://api.nuget.org/v3/index.json --no-cache --verbosity minimal";
+    private const string ValidationCommand = "/tmp/nugetready-tool/nugetready check --config nugetready.json --artifacts /tmp/nugetready-artifacts --format json";
 
     private const string ReleaseWorkflow = """
         name: release
@@ -1669,7 +1719,7 @@ public sealed class WorkflowPolicyTests
         permissions:
           contents: read
         jobs:
-          validate:
+          produce:
             runs-on: ubuntu-latest
             timeout-minutes: 30
             env:
@@ -1701,12 +1751,6 @@ public sealed class WorkflowPolicyTests
               - name: Pack the exact release artifacts
                 shell: pwsh
                 run: dotnet pack src/Example/Example.csproj --configuration Release --no-build --no-restore --include-symbols -p:SymbolPackageFormat=snupkg -p:ImportDirectoryBuildTargets=false -p:ImportDirectoryTargets=false --output artifacts/release --nologo -p:UseSharedCompilation=false
-              - name: Install the pinned NuGetReady tool
-                shell: pwsh
-                run: dotnet tool install KeelMatrix.NuGetReady --version 0.1.0 --tool-path .nugetready --configfile NuGet.config --add-source artifacts/release --no-cache --verbosity minimal
-              - name: Validate exact artifacts
-                shell: pwsh
-                run: ./.nugetready/nugetready check --config nugetready.json --artifacts artifacts/release --format json
               - name: Upload exact artifacts
                 uses: actions/upload-artifact@v4
                 with:
@@ -1715,6 +1759,36 @@ public sealed class WorkflowPolicyTests
                     artifacts/release/KeelMatrix.NuGetReady.1.0.0.nupkg
                     artifacts/release/KeelMatrix.NuGetReady.1.0.0.snupkg
                   if-no-files-found: error
+          validate:
+            needs: produce
+            runs-on: ubuntu-latest
+            timeout-minutes: 10
+            env:
+              KEELMATRIX_NO_TELEMETRY: '1'
+              DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+              NUGET_PACKAGES: /tmp/nugetready-packages
+            steps:
+              - name: Check out source at the triggering tag
+                uses: actions/checkout@v6
+                with:
+                  fetch-depth: 0
+                  ref: ${{ github.ref }}
+                  persist-credentials: false
+              - name: Set up .NET SDK
+                uses: actions/setup-dotnet@v5
+                with:
+                  global-json-file: global.json
+              - name: Download immutable artifacts
+                uses: actions/download-artifact@v4
+                with:
+                  name: validated-release-artifacts
+                  path: /tmp/nugetready-artifacts
+              - name: Install the pinned NuGetReady tool
+                shell: pwsh
+                run: dotnet tool install KeelMatrix.NuGetReady --version 0.1.0 --tool-path /tmp/nugetready-tool --source https://api.nuget.org/v3/index.json --no-cache --verbosity minimal
+              - name: Validate exact artifacts
+                shell: pwsh
+                run: /tmp/nugetready-tool/nugetready check --config nugetready.json --artifacts /tmp/nugetready-artifacts --format json
           publish:
             needs: validate
             runs-on: ubuntu-latest
