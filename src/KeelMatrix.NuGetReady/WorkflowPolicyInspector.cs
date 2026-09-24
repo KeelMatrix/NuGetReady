@@ -1889,12 +1889,34 @@ internal static class WorkflowPolicyInspector
                     memberIndex++;
                 }
 
-                if (memberIndex > memberStart && IsCredentialBindingName(expression[memberStart..memberIndex].ToString()))
+                if (memberIndex == memberStart)
+                {
+                    return true;
+                }
+
+                if (IsCredentialBindingName(expression[memberStart..memberIndex].ToString()))
+                {
+                    return true;
+                }
+
+                if (HasAdditionalMemberSelector(expression, memberIndex))
                 {
                     return true;
                 }
             }
-            else if (TryReadBracketMember(expression, memberIndex, out var member) && IsCredentialBindingName(member))
+            else if (memberIndex < expression.Length && expression[memberIndex] == '[')
+            {
+                if (!TryReadBracketMember(expression, memberIndex, out var member, out var memberEnd))
+                {
+                    return true;
+                }
+
+                if (IsCredentialBindingName(member) || HasAdditionalMemberSelector(expression, memberEnd))
+                {
+                    return true;
+                }
+            }
+            else
             {
                 return true;
             }
@@ -1923,9 +1945,20 @@ internal static class WorkflowPolicyInspector
         return false;
     }
 
-    private static bool TryReadBracketMember(ReadOnlySpan<char> expression, int index, out string member)
+    private static bool HasAdditionalMemberSelector(ReadOnlySpan<char> expression, int index)
+    {
+        SkipExpressionWhitespace(expression, ref index);
+        return index < expression.Length && expression[index] is '.' or '[';
+    }
+
+    private static bool TryReadBracketMember(
+        ReadOnlySpan<char> expression,
+        int index,
+        out string member,
+        out int memberEnd)
     {
         member = string.Empty;
+        memberEnd = index;
         SkipExpressionWhitespace(expression, ref index);
         if (index >= expression.Length || expression[index] != '[')
         {
@@ -1954,7 +1987,13 @@ internal static class WorkflowPolicyInspector
         member = expression[memberStart..index].ToString();
         index++;
         SkipExpressionWhitespace(expression, ref index);
-        return index < expression.Length && expression[index] == ']';
+        if (index >= expression.Length || expression[index] != ']')
+        {
+            return false;
+        }
+
+        memberEnd = index + 1;
+        return true;
     }
 
     private static int SkipExpressionString(ReadOnlySpan<char> expression, int index)
@@ -2010,10 +2049,16 @@ internal static class WorkflowPolicyInspector
 
     private static bool IsCredentialBindingName(string name)
     {
-        var token = name.Trim().Replace("-", string.Empty, StringComparison.Ordinal)
-            .Replace("_", string.Empty, StringComparison.Ordinal)
-            .ToUpperInvariant();
-        return CredentialBindingTokens.Contains(token);
+        var token = new StringBuilder(name.Length);
+        foreach (var character in name)
+        {
+            if (char.IsLetterOrDigit(character))
+            {
+                token.Append(char.ToUpperInvariant(character));
+            }
+        }
+
+        return CredentialBindingTokens.Contains(token.ToString());
     }
 
     private static bool HasPublicationCapability(WorkflowDocument workflow, WorkflowJob job)

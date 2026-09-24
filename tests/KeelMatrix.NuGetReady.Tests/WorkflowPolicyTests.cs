@@ -1007,6 +1007,143 @@ public sealed class WorkflowPolicyTests
         }
     }
 
+    [Fact]
+    public void Remaining_credential_boundary_probes_block_the_complete_readiness_result()
+    {
+        using var corpus = PackedCorpus.Create();
+        var package = corpus.Pack("Standard/Standard.csproj");
+        var symbolPackage = Path.ChangeExtension(package, ".snupkg");
+        var config = new NuGetReadyConfig
+        {
+            SchemaVersion = 1,
+            Packages =
+            [
+                new PackageExpectation
+                {
+                    Id = "Fixture.Standard",
+                    Kind = "library",
+                    Version = "1.0.0",
+                    Artifacts = [Path.GetFileName(package), Path.GetFileName(symbolPackage)]
+                }
+            ]
+        };
+        var releaseWorkflow = Mutate(
+            ReleaseWorkflow,
+            "KeelMatrix.NuGetReady.1.0.0.nupkg",
+            Path.GetFileName(package));
+        releaseWorkflow = Mutate(
+            releaseWorkflow,
+            "KeelMatrix.NuGetReady.1.0.0.snupkg",
+            Path.GetFileName(symbolPackage));
+        var probes = new[]
+        {
+            (Name: "dynamic member selector", Binding: "note", Value: "${{ vars[inputs.member_name] }}"),
+            (Name: "period-separated environment key", Binding: "Nuget.Api.Key", Value: "literal-credential")
+        };
+        var outcomes = new List<string>();
+
+        foreach (var probe in probes)
+        {
+            using var repository = WorkflowRepository.Create("release.yml", releaseWorkflow);
+            repository.WriteWorkflow("ci.yml", $$"""
+                name: continuous integration
+                on:
+                  pull_request:
+                permissions:
+                  contents: read
+                jobs:
+                  build:
+                    steps:
+                      - uses: owner/repository/action@v1
+                        env:
+                          {{probe.Binding}}: {{probe.Value}}
+                """);
+            var configPath = Path.Combine(repository.Root.FullName, "nugetready.json");
+            repository.WriteFile("nugetready.json", System.Text.Json.JsonSerializer.Serialize(config));
+
+            var report = CheckRunner.Run(
+                config,
+                corpus.OutputPath,
+                repository.Root.FullName,
+                TimeSpan.FromMinutes(2),
+                new ConsumerRehearsalOptions(PublicFeedPath: corpus.OutputPath),
+                configPath);
+            var workflowPolicyStatus = report.Checks.Single(check => check.Id == "workflow-policy").Status;
+
+            outcomes.Add($"{probe.Name}: overall={report.Status}; workflow-policy={workflowPolicyStatus}; exit={report.ExitCode}");
+        }
+
+        Console.WriteLine(string.Join(Environment.NewLine, outcomes));
+        Assert.True(
+            outcomes.All(outcome => outcome.Contains("overall=error; workflow-policy=error; exit=2", StringComparison.Ordinal)),
+            string.Join(Environment.NewLine, outcomes));
+    }
+
+    [Theory]
+    [InlineData("note", "${{ vars['ARTIFACT.PATH'] }}")]
+    [InlineData("ApiKeyPath", "artifacts/key.txt")]
+    [InlineData("Nuget.Api.Key.Path", "artifacts/key.txt")]
+    public void Credential_boundary_negative_controls_preserve_the_complete_readiness_result(
+        string bindingName,
+        string bindingValue)
+    {
+        using var corpus = PackedCorpus.Create();
+        var package = corpus.Pack("Standard/Standard.csproj");
+        var symbolPackage = Path.ChangeExtension(package, ".snupkg");
+        var config = new NuGetReadyConfig
+        {
+            SchemaVersion = 1,
+            Packages =
+            [
+                new PackageExpectation
+                {
+                    Id = "Fixture.Standard",
+                    Kind = "library",
+                    Version = "1.0.0",
+                    Artifacts = [Path.GetFileName(package), Path.GetFileName(symbolPackage)]
+                }
+            ]
+        };
+        var releaseWorkflow = Mutate(
+            ReleaseWorkflow,
+            "KeelMatrix.NuGetReady.1.0.0.nupkg",
+            Path.GetFileName(package));
+        releaseWorkflow = Mutate(
+            releaseWorkflow,
+            "KeelMatrix.NuGetReady.1.0.0.snupkg",
+            Path.GetFileName(symbolPackage));
+        using var repository = WorkflowRepository.Create("release.yml", releaseWorkflow);
+        repository.WriteWorkflow("ci.yml", $$"""
+            name: continuous integration
+            on:
+              pull_request:
+            permissions:
+              contents: read
+            jobs:
+              build:
+                steps:
+                  - uses: owner/repository/action@v1
+                    env:
+                      {{bindingName}}: {{bindingValue}}
+            """);
+        var configPath = Path.Combine(repository.Root.FullName, "nugetready.json");
+        repository.WriteFile("nugetready.json", System.Text.Json.JsonSerializer.Serialize(config));
+
+        var report = CheckRunner.Run(
+            config,
+            corpus.OutputPath,
+            repository.Root.FullName,
+            TimeSpan.FromMinutes(2),
+            new ConsumerRehearsalOptions(PublicFeedPath: corpus.OutputPath),
+            configPath);
+        var workflowPolicyStatus = report.Checks.Single(check => check.Id == "workflow-policy").Status;
+
+        Console.WriteLine($"{bindingName}={bindingValue}: overall={report.Status}; workflow-policy={workflowPolicyStatus}; exit={report.ExitCode}");
+        Assert.True(
+            report.Status == "pass" && workflowPolicyStatus == "pass" && report.ExitCode == 0,
+            $"overall={report.Status}; workflow-policy={workflowPolicyStatus}; exit={report.ExitCode}; failures={string.Join(" | ", report.Failures.Select(failure => failure.Message))}");
+    }
+
     [Theory]
     [InlineData("api-key-path", "artifacts/key.txt")]
     [InlineData("ApiKeyPath", "artifacts/key.txt")]
@@ -1077,6 +1214,9 @@ public sealed class WorkflowPolicyTests
     [InlineData("NUGET_API_KEY")]
     [InlineData("NuGetApiKey")]
     [InlineData("nugetapikey")]
+    [InlineData("nuget.api.key")]
+    [InlineData("NUGET API KEY")]
+    [InlineData("nuget/api-key")]
     [InlineData("API_KEY")]
     [InlineData("ApiKey")]
     [InlineData("api-key")]
@@ -1111,12 +1251,40 @@ public sealed class WorkflowPolicyTests
     [Theory]
     [InlineData("${{ vars.NUGET_API_KEY }}")]
     [InlineData("${{ vars.NuGetApiKey }}")]
+    [InlineData("${{ vars['Nuget.Api.Key'] }}")]
     [InlineData("${{ inputs.ApiKey }}")]
     [InlineData("${{ env.AccessToken }}")]
     [InlineData("prefix-${{ vars['api-key'] }}-suffix")]
     [InlineData("${{ inputs[\"ACCESS_TOKEN\"] }}")]
     [InlineData("${{ format('}}') || vars.ApiKey }}")]
     public void Credential_shaped_member_reference_enters_publication_policy(string value)
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", $$"""
+            name: continuous integration
+            on:
+              pull_request:
+            permissions: {}
+            jobs:
+              build:
+                steps:
+                  - uses: owner/repository/action@v1
+                    with:
+                      note: {{value}}
+            """);
+
+        AssertLimitedUnproven(WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName));
+    }
+
+    [Theory]
+    [InlineData("${{ vars[inputs.member_name] }}")]
+    [InlineData("${{ inputs[vars.member_name] }}")]
+    [InlineData("${{ env[inputs.member_name] }}")]
+    [InlineData("${{ vars[format('{0}', inputs.member_name)] }}")]
+    [InlineData("${{ vars }}")]
+    [InlineData("${{ inputs. }}")]
+    [InlineData("${{ env.SAFE_VALUE.other }}")]
+    [InlineData("${{ vars['SAFE_VALUE'][inputs.index] }}")]
+    public void Unresolvable_credential_member_selectors_enter_publication_policy(string value)
     {
         using var repository = WorkflowRepository.Create("ci.yml", $$"""
             name: continuous integration
@@ -1352,6 +1520,7 @@ public sealed class WorkflowPolicyTests
     [InlineData("${{ inputs.AccessTokenizer }}")]
     [InlineData("${{ env.CredentialHelper }}")]
     [InlineData("${{ vars['NuGetApiKeyFile'] }}")]
+    [InlineData("${{ vars['Nuget.Api.Key.Path'] }}")]
     [InlineData("${{ format('vars.NUGET_API_KEY') }}")]
     public void Credential_member_near_misses_keep_read_only_ci_outside_release_policy(string value)
     {
