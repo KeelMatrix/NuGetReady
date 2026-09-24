@@ -76,6 +76,20 @@ jobs:
       NUGET_PACKAGES: /tmp/nugetready-packages
 
     steps:
+      - name: Create the fixed validator SDK resolver
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path /tmp/nugetready-acquisition -Force | Out-Null
+          @'
+          {
+            "sdk": {
+              "version": "8.0.425",
+              "rollForward": "latestPatch",
+              "allowPrerelease": false
+            }
+          }
+          '@ | Set-Content -LiteralPath /tmp/nugetready-acquisition/global.json -Encoding utf8NoBOM
+
       - name: Set up .NET SDK
         uses: actions/setup-dotnet@v5
         with:
@@ -112,6 +126,7 @@ jobs:
 
       - name: Install the candidate NuGetReady tool from its exclusive source mapping
         shell: pwsh
+        working-directory: /tmp/nugetready-acquisition
         run: dotnet tool install KeelMatrix.NuGetReady --version 0.1.0 --tool-path /tmp/nugetready-tool --configfile /tmp/nugetready-tool.config --no-cache --verbosity minimal
 
       - name: Check out source at the triggering commit

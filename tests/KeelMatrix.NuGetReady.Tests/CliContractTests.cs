@@ -40,6 +40,8 @@ public sealed class CliContractTests
         Assert.Contains("exclusive source selection", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("maps only the tool ID", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("fresh-runner validator", CliParser.HelpText, StringComparison.Ordinal);
+        Assert.Contains("fixed runner-controlled", CliParser.HelpText, StringComparison.Ordinal);
+        Assert.Contains("exact cross-platform casing", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("unknown or unsupported publication-relevant node", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("error/exit 2", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("never defaults to safe", CliParser.HelpText, StringComparison.Ordinal);

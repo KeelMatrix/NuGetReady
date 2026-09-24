@@ -49,7 +49,13 @@ public sealed class ReleaseWorkflowContractTests
         Assert.Contains("<packageSource key=\"nuget.org\">", workflow, StringComparison.Ordinal);
         Assert.Contains("<package pattern=\"*\" />", workflow, StringComparison.Ordinal);
         Assert.Contains("dotnet tool install KeelMatrix.NuGetReady --version 0.1.0 --tool-path /tmp/nugetready-tool --configfile /tmp/nugetready-tool.config --no-cache --verbosity minimal", workflow, StringComparison.Ordinal);
+        Assert.Contains("New-Item -ItemType Directory -Path /tmp/nugetready-acquisition -Force | Out-Null", workflow, StringComparison.Ordinal);
+        Assert.Contains("Set-Content -LiteralPath /tmp/nugetready-acquisition/global.json -Encoding utf8NoBOM", workflow, StringComparison.Ordinal);
+        Assert.Contains("working-directory: /tmp/nugetready-acquisition", workflow, StringComparison.Ordinal);
         Assert.Contains("/tmp/nugetready-tool/nugetready check --config nugetready.json --artifacts /tmp/nugetready-artifacts --format json", workflow, StringComparison.Ordinal);
+        Assert.True(
+            workflow.IndexOf("Create the fixed validator SDK resolver", StringComparison.Ordinal) <
+            workflow.IndexOf("dotnet tool install KeelMatrix.NuGetReady", StringComparison.Ordinal));
         Assert.True(
             workflow.IndexOf("dotnet tool install KeelMatrix.NuGetReady", StringComparison.Ordinal) <
             workflow.LastIndexOf("uses: actions/checkout@v6", StringComparison.Ordinal));

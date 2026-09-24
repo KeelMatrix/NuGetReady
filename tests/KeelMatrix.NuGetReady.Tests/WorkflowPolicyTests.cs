@@ -91,6 +91,14 @@ public sealed class WorkflowPolicyTests
                 ReleaseWorkflow,
                 "- id: nuget-login",
                 "- run: dotnet build -t:Publish\n      - id: nuget-login"),
+            ["unmodeled acquisition resolver"] = Mutate(
+                ReleaseWorkflow,
+                "\"rollForward\": \"latestPatch\"",
+                "\"rollForward\": \"latestMajor\""),
+            ["acquisition outside fixed resolver directory"] = Mutate(
+                ReleaseWorkflow,
+                "working-directory: /tmp/nugetready-acquisition",
+                "working-directory: /tmp"),
             ["mutable ref checkout"] = Mutate(
                 ReleaseWorkflow,
                 "ref: ${{ github.sha }}",
@@ -130,6 +138,28 @@ public sealed class WorkflowPolicyTests
             finding.IsError &&
             finding.Message.Contains("global.json", StringComparison.OrdinalIgnoreCase) &&
             finding.Message.Contains("unproven", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Theory]
+    [InlineData("global.json", "GLOBAL.JSON")]
+    [InlineData("NuGet.config", "nuget.config")]
+    [InlineData("nugetready.json", "NuGetReady.json")]
+    [InlineData("Example.sln", "example.sln")]
+    [InlineData("src", "Src")]
+    [InlineData("src/Example/Example.csproj", "src/Example/example.csproj")]
+    [InlineData(".github", ".GITHUB")]
+    [InlineData(".github/workflows", ".github/Workflows")]
+    [InlineData(".github/workflows/release.yml", ".github/workflows/release.YML")]
+    public void Release_control_paths_require_exact_cross_platform_casing(string original, string replacement)
+    {
+        using var repository = WorkflowRepository.Create("release.yml", ReleaseWorkflow);
+        repository.RenamePath(original, replacement);
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+        Assert.Contains(findings, finding =>
+            finding.IsError &&
+            finding.Message.Contains("casing", StringComparison.OrdinalIgnoreCase));
     }
 
     [Theory]
@@ -1339,7 +1369,7 @@ public sealed class WorkflowPolicyTests
     [Fact]
     public void Artifact_validation_must_execute_before_publication()
     {
-        const string install = $"- name: Install the pinned NuGetReady tool\n        shell: pwsh\n        run: {ToolInstallCommand}";
+        const string install = $"- name: Install the pinned NuGetReady tool\n        shell: pwsh\n        working-directory: /tmp/nugetready-acquisition\n        run: {ToolInstallCommand}";
         const string checkout = "- name: Check out source at the triggering commit\n        uses: actions/checkout@v6\n        with:\n          fetch-depth: 0\n          ref: ${{ github.sha }}\n          persist-credentials: false";
         const string validation = $"- name: Validate exact artifacts\n        shell: pwsh\n        run: {ValidationCommand}";
         using var repository = WorkflowRepository.Create("release.yml", Mutate(
@@ -1796,6 +1826,19 @@ public sealed class WorkflowPolicyTests
               DOTNET_CLI_TELEMETRY_OPTOUT: '1'
               NUGET_PACKAGES: /tmp/nugetready-packages
             steps:
+              - name: Create the fixed validator SDK resolver
+                shell: pwsh
+                run: |
+                  New-Item -ItemType Directory -Path /tmp/nugetready-acquisition -Force | Out-Null
+                  @'
+                  {
+                    "sdk": {
+                      "version": "8.0.425",
+                      "rollForward": "latestPatch",
+                      "allowPrerelease": false
+                    }
+                  }
+                  '@ | Set-Content -LiteralPath /tmp/nugetready-acquisition/global.json -Encoding utf8NoBOM
               - name: Set up .NET SDK
                 uses: actions/setup-dotnet@v5
                 with:
@@ -1807,6 +1850,7 @@ public sealed class WorkflowPolicyTests
                   path: /tmp/nugetready-artifacts
               - name: Install the pinned NuGetReady tool
                 shell: pwsh
+                working-directory: /tmp/nugetready-acquisition
                 run: dotnet tool install KeelMatrix.NuGetReady --version 0.1.0 --tool-path /tmp/nugetready-tool --source https://api.nuget.org/v3/index.json --no-cache --verbosity minimal
               - name: Check out source at the triggering commit
                 uses: actions/checkout@v6
@@ -1908,6 +1952,9 @@ internal sealed class WorkflowRepository : IDisposable
               }
             }
             """);
+        File.WriteAllText(Path.Combine(root.FullName, "Example.sln"), string.Empty);
+        var projectDirectory = Directory.CreateDirectory(Path.Combine(root.FullName, "src", "Example"));
+        File.WriteAllText(Path.Combine(projectDirectory.FullName, "Example.csproj"), "<Project />");
         return new WorkflowRepository(root);
     }
 
@@ -1922,6 +1969,26 @@ internal sealed class WorkflowRepository : IDisposable
         var path = Path.Combine(Root.FullName, relativePath.Replace('/', Path.DirectorySeparatorChar));
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         File.WriteAllText(path, content);
+    }
+
+    public void RenamePath(string originalRelativePath, string replacementRelativePath)
+    {
+        var original = Path.Combine(Root.FullName, originalRelativePath.Replace('/', Path.DirectorySeparatorChar));
+        var replacement = Path.Combine(Root.FullName, replacementRelativePath.Replace('/', Path.DirectorySeparatorChar));
+        var temporary = Path.Combine(Root.FullName, $"case-rename-{Guid.NewGuid():N}");
+
+        if (Directory.Exists(original))
+        {
+            Directory.Move(original, temporary);
+            Directory.CreateDirectory(Path.GetDirectoryName(replacement)!);
+            Directory.Move(temporary, replacement);
+        }
+        else
+        {
+            File.Move(original, temporary);
+            Directory.CreateDirectory(Path.GetDirectoryName(replacement)!);
+            File.Move(temporary, replacement);
+        }
     }
 
     public void Dispose()

@@ -19,10 +19,23 @@ internal static class WorkflowPolicyInspector
     private const string SupportedSdkVersion = "8.0.425";
     private const string ArtifactIdentity = "validated-release-artifacts";
     private const string ImmutableValidationArtifactDirectory = "/tmp/nugetready-artifacts";
+    private const string ValidationAcquisitionDirectory = "/tmp/nugetready-acquisition";
     private const string InstalledToolDirectory = "/tmp/nugetready-tool";
     private const string CandidateToolConfigPath = "/tmp/nugetready-tool.config";
     private const string NuGetOrgSource = "https://api.nuget.org/v3/index.json";
     private const string InstalledValidationCommand = "/tmp/nugetready-tool/nugetready check --config nugetready.json --artifacts /tmp/nugetready-artifacts --format json";
+    private const string ValidationAcquisitionResolverCommand = """
+        New-Item -ItemType Directory -Path /tmp/nugetready-acquisition -Force | Out-Null
+        @'
+        {
+          "sdk": {
+            "version": "8.0.425",
+            "rollForward": "latestPatch",
+            "allowPrerelease": false
+          }
+        }
+        '@ | Set-Content -LiteralPath /tmp/nugetready-acquisition/global.json -Encoding utf8NoBOM
+        """;
     private const string CandidateToolSourceConfigurationCommand = """
         @'
         <?xml version="1.0" encoding="utf-8"?>
@@ -60,10 +73,21 @@ internal static class WorkflowPolicyInspector
 
     public static WorkflowInspectionResult InspectDetailed(string repositoryPath, NuGetReadyConfig? config = null)
     {
-        var workflowDirectory = Path.Combine(repositoryPath, ".github", "workflows");
-        if (!Directory.Exists(workflowDirectory))
+        var workflowDirectoryStatus = GetExactRepositoryPath(
+            repositoryPath,
+            ".github/workflows",
+            expectDirectory: true,
+            out var workflowDirectory);
+        if (workflowDirectoryStatus == RepositoryPathStatus.Missing)
         {
             return new WorkflowInspectionResult(Array.Empty<Failure>(), false);
+        }
+
+        if (workflowDirectoryStatus != RepositoryPathStatus.Exact)
+        {
+            return new WorkflowInspectionResult(
+                new[] { Unsupported("The .github/workflows release-control directory does not use exact cross-platform casing.") },
+                true);
         }
 
         string[] paths;
@@ -88,6 +112,16 @@ internal static class WorkflowPolicyInspector
         var evaluated = false;
         foreach (var path in paths)
         {
+            var relativePath = Path.GetRelativePath(repositoryPath, path).Replace(Path.DirectorySeparatorChar, '/');
+            if (GetExactRepositoryPath(repositoryPath, relativePath, expectDirectory: false, out _) != RepositoryPathStatus.Exact ||
+                (!relativePath.EndsWith(".yml", StringComparison.Ordinal) &&
+                 !relativePath.EndsWith(".yaml", StringComparison.Ordinal)))
+            {
+                failures.Add(Unsupported("A release workflow path or extension does not use exact cross-platform casing."));
+                evaluated = true;
+                continue;
+            }
+
             string content;
             try
             {
@@ -449,7 +483,7 @@ internal static class WorkflowPolicyInspector
         }
 
         InspectProducerJob(repositoryPath, workflow, producerJob, expectedArtifacts, failures);
-        InspectValidationJob(workflow, validationJob, producerJob, useCandidateToolArtifactSource, failures);
+        InspectValidationJob(repositoryPath, workflow, validationJob, producerJob, useCandidateToolArtifactSource, failures);
         InspectCredentialBearingJob(publishJob, primaryArtifact, failures);
 
         if (ContainsLongLivedCredential(workflow.Environment) ||
@@ -518,22 +552,23 @@ internal static class WorkflowPolicyInspector
 
         if (!HasSupportedNuGetConfiguration(repositoryPath))
         {
-            failures.Add(Unsupported("The supported validation profile requires NuGet.config to contain only the canonical NuGet.org v3 source."));
+            failures.Add(Unsupported("The supported validation profile requires NuGet.config with exact cross-platform casing and only the canonical NuGet.org v3 source."));
         }
 
         if (!HasSupportedGlobalJson(repositoryPath))
         {
             failures.Add(Unsupported(
-                "The repository global.json SDK resolver is unsupported/unproven; the supported profile requires only version 8.0.425, rollForward latestPatch, and allowPrerelease false."));
+                "The repository global.json SDK resolver is unsupported/unproven; the file must use exact cross-platform casing and contain only version 8.0.425, rollForward latestPatch, and allowPrerelease false."));
         }
 
-        if (!HasExactProducerSequence(producerJob.Steps, expectedArtifacts))
+        if (!HasExactProducerSequence(repositoryPath, producerJob.Steps, expectedArtifacts))
         {
-            failures.Add(Unsupported("The artifact-producer job must use the exact ordered closed command profile: checkout, SDK setup, restore, format, build, test, pack, and immediate exact artifact upload."));
+            failures.Add(Unsupported("The artifact-producer job must use the exact ordered closed command profile and every referenced repository path must exist with exact cross-platform casing: checkout, SDK setup, restore, format, build, test, pack, and immediate exact artifact upload."));
         }
     }
 
     private static void InspectValidationJob(
+        string repositoryPath,
         WorkflowDocument workflow,
         WorkflowJob validationJob,
         WorkflowJob producerJob,
@@ -581,9 +616,14 @@ internal static class WorkflowPolicyInspector
             failures.Add(new Failure("workflow-policy", "The validation job must not receive a long-lived NuGet publishing credential."));
         }
 
+        if (GetExactRepositoryPath(repositoryPath, "nugetready.json", expectDirectory: false, out _) != RepositoryPathStatus.Exact)
+        {
+            failures.Add(Unsupported("The validator's nugetready.json release-control path is missing or does not use exact cross-platform casing."));
+        }
+
         if (!HasExactValidationSequence(validationJob.Steps, useCandidateToolArtifactSource))
         {
-            failures.Add(Unsupported("The fresh-runner validation job must use the exact ordered closed command profile: literal SDK setup, immutable artifact download, source-exclusive pinned tool acquisition before checkout, exact triggering-commit checkout, and installed NuGetReady check as the final step."));
+            failures.Add(Unsupported("The fresh-runner validation job must use the exact ordered closed command profile: fixed runner-controlled SDK resolver, literal SDK setup, immutable artifact download, source-exclusive pinned tool acquisition from that resolver directory before checkout, exact triggering-commit checkout, and installed NuGetReady check as the final step."));
         }
     }
 
@@ -669,7 +709,13 @@ internal static class WorkflowPolicyInspector
         useCandidateToolArtifactSource = false;
         try
         {
-            var config = suppliedConfig ?? ConfigurationLoader.Load(Path.Combine(repositoryPath, "nugetready.json"));
+            if (GetExactRepositoryPath(repositoryPath, "nugetready.json", expectDirectory: false, out var configPath) != RepositoryPathStatus.Exact)
+            {
+                failures.Add(Unsupported("The supported release profile requires nugetready.json to exist with exact cross-platform casing."));
+                return false;
+            }
+
+            var config = suppliedConfig ?? ConfigurationLoader.Load(configPath);
             var packages = config.Packages!;
             if (packages.Count != 1)
             {
@@ -746,17 +792,18 @@ internal static class WorkflowPolicyInspector
     }
 
     private static bool HasExactProducerSequence(
+        string repositoryPath,
         IReadOnlyList<WorkflowStep> steps,
         IReadOnlyList<string> expectedArtifacts)
     {
         return steps.Count == 8 &&
                IsExactCheckoutStep(steps[0]) &&
                IsExactProducerSetupDotNetStep(steps[1]) &&
-               TryMatchRestoreStep(steps[2], out var solutionPath) &&
+               TryMatchRestoreStep(repositoryPath, steps[2], out var solutionPath) &&
                IsExactFormatStep(steps[3], solutionPath) &&
                IsExactBuildStep(steps[4], solutionPath) &&
                IsExactTestStep(steps[5], solutionPath) &&
-               IsExactPackStep(steps[6]) &&
+               IsExactPackStep(repositoryPath, steps[6]) &&
                IsExactUploadStep(steps[7], expectedArtifacts);
     }
 
@@ -764,23 +811,24 @@ internal static class WorkflowPolicyInspector
         IReadOnlyList<WorkflowStep> steps,
         bool useCandidateToolArtifactSource)
     {
-        if (steps.Count < 5 ||
-            !IsExactValidationSetupDotNetStep(steps[0]) ||
-            !IsExactDownloadStep(steps[1], ImmutableValidationArtifactDirectory))
+        if (steps.Count < 6 ||
+            !IsExactValidationAcquisitionResolverStep(steps[0]) ||
+            !IsExactValidationSetupDotNetStep(steps[1]) ||
+            !IsExactDownloadStep(steps[2], ImmutableValidationArtifactDirectory))
         {
             return false;
         }
 
         return useCandidateToolArtifactSource
-            ? steps.Count == 6 &&
-              IsExactCandidateToolSourceConfigurationStep(steps[2]) &&
-              IsExactToolInstallStep(steps[3], useCandidateToolArtifactSource: true) &&
+            ? steps.Count == 7 &&
+              IsExactCandidateToolSourceConfigurationStep(steps[3]) &&
+              IsExactToolInstallStep(steps[4], useCandidateToolArtifactSource: true) &&
+              IsExactCheckoutStep(steps[5]) &&
+              IsExactProfileValidationStep(steps[6])
+            : steps.Count == 6 &&
+              IsExactToolInstallStep(steps[3], useCandidateToolArtifactSource: false) &&
               IsExactCheckoutStep(steps[4]) &&
-              IsExactProfileValidationStep(steps[5])
-            : steps.Count == 5 &&
-              IsExactToolInstallStep(steps[2], useCandidateToolArtifactSource: false) &&
-              IsExactCheckoutStep(steps[3]) &&
-              IsExactProfileValidationStep(steps[4]);
+              IsExactProfileValidationStep(steps[5]);
     }
 
     private static bool IsExactCheckoutStep(WorkflowStep step)
@@ -808,7 +856,17 @@ internal static class WorkflowPolicyInspector
                HasExactInputs(step.With, ("dotnet-version", SupportedSdkVersion));
     }
 
-    private static bool TryMatchRestoreStep(WorkflowStep step, out string solutionPath)
+    private static bool IsExactValidationAcquisitionResolverStep(WorkflowStep step)
+    {
+        return IsDefinitelyEnabled(step.Condition) &&
+               !step.HasUninspectableStructure &&
+               string.Equals(step.Shell, "pwsh", StringComparison.Ordinal) &&
+               string.Equals(step.Run?.Trim(), ValidationAcquisitionResolverCommand, StringComparison.Ordinal) &&
+               step.Environment.Count == 0 &&
+               step.PresentKeys.All(key => key is "name" or "shell" or "run");
+    }
+
+    private static bool TryMatchRestoreStep(string repositoryPath, WorkflowStep step, out string solutionPath)
     {
         solutionPath = string.Empty;
         if (!TryGetDirectCommandTokens(step, out var tokens) ||
@@ -816,6 +874,7 @@ internal static class WorkflowPolicyInspector
             !tokens[0].Equals("dotnet", StringComparison.Ordinal) ||
             !tokens[1].Equals("restore", StringComparison.Ordinal) ||
             !IsLiteralRepositoryPath(tokens[2], "sln", "slnx") ||
+            GetExactRepositoryPath(repositoryPath, tokens[2], expectDirectory: false, out _) != RepositoryPathStatus.Exact ||
             !tokens[3].Equals("--configfile", StringComparison.Ordinal) ||
             !tokens[4].Equals("NuGet.config", StringComparison.Ordinal) ||
             !tokens[5].Equals("--nologo", StringComparison.Ordinal) ||
@@ -851,13 +910,14 @@ internal static class WorkflowPolicyInspector
             "dotnet", "test", solutionPath, "--configuration", "Release", "--no-build", "--no-restore", "--nologo", "--logger", "console;verbosity=minimal");
     }
 
-    private static bool IsExactPackStep(WorkflowStep step)
+    private static bool IsExactPackStep(string repositoryPath, WorkflowStep step)
     {
         if (!TryGetDirectCommandTokens(step, out var tokens) ||
             tokens.Length != 15 ||
             !tokens[0].Equals("dotnet", StringComparison.Ordinal) ||
             !tokens[1].Equals("pack", StringComparison.Ordinal) ||
-            !IsLiteralRepositoryPath(tokens[2], "csproj"))
+            !IsLiteralRepositoryPath(tokens[2], "csproj") ||
+            GetExactRepositoryPath(repositoryPath, tokens[2], expectDirectory: false, out _) != RepositoryPathStatus.Exact)
         {
             return false;
         }
@@ -868,13 +928,15 @@ internal static class WorkflowPolicyInspector
     private static bool IsExactToolInstallStep(WorkflowStep step, bool useCandidateToolArtifactSource)
     {
         return useCandidateToolArtifactSource
-            ? HasExactDirectCommand(
+            ? HasExactDirectCommandInWorkingDirectory(
                 step,
+                ValidationAcquisitionDirectory,
                 "dotnet", "tool", "install", "KeelMatrix.NuGetReady", "--version", SupportedToolVersion,
                 "--tool-path", InstalledToolDirectory, "--configfile", CandidateToolConfigPath,
                 "--no-cache", "--verbosity", "minimal")
-            : HasExactDirectCommand(
+            : HasExactDirectCommandInWorkingDirectory(
                 step,
+                ValidationAcquisitionDirectory,
                 "dotnet", "tool", "install", "KeelMatrix.NuGetReady", "--version", SupportedToolVersion,
                 "--tool-path", InstalledToolDirectory, "--source", NuGetOrgSource,
                 "--no-cache", "--verbosity", "minimal");
@@ -985,6 +1047,34 @@ internal static class WorkflowPolicyInspector
                tokens.SequenceEqual(expectedTokens, StringComparer.Ordinal);
     }
 
+    private static bool HasExactDirectCommandInWorkingDirectory(
+        WorkflowStep step,
+        string workingDirectory,
+        params string[] expectedTokens)
+    {
+        if (!IsDefinitelyEnabled(step.Condition) ||
+            step.HasUninspectableStructure ||
+            !string.Equals(step.Shell, "pwsh", StringComparison.Ordinal) ||
+            !string.Equals(step.WorkingDirectory, workingDirectory, StringComparison.Ordinal) ||
+            step.Environment.Count != 0 ||
+            step.PresentKeys.Any(key => key is not ("name" or "shell" or "working-directory" or "run")) ||
+            string.IsNullOrWhiteSpace(step.Run))
+        {
+            return false;
+        }
+
+        var command = step.Run.Trim();
+        if (HasUnquotedCommandSeparator(command) ||
+            command.Contains("${{", StringComparison.Ordinal) ||
+            Regex.IsMatch(command, @"(?<!\\)\$[A-Za-z_]|%[A-Za-z_][A-Za-z0-9_]*%", RegexOptions.CultureInvariant))
+        {
+            return false;
+        }
+
+        var tokens = TokenizeCommandLine(command);
+        return tokens.SequenceEqual(expectedTokens, StringComparer.Ordinal);
+    }
+
     private static bool IsLiteralRepositoryPath(string value, params string[] extensions)
     {
         if (Path.IsPathRooted(value) || value.Contains('\\', StringComparison.Ordinal) || ContainsExpression(value))
@@ -1002,11 +1092,92 @@ internal static class WorkflowPolicyInspector
         return extensions.Any(extension => value.EndsWith($".{extension}", StringComparison.OrdinalIgnoreCase));
     }
 
+    private static RepositoryPathStatus GetExactRepositoryPath(
+        string repositoryPath,
+        string relativePath,
+        bool expectDirectory,
+        out string resolvedPath)
+    {
+        resolvedPath = string.Empty;
+        if (Path.IsPathRooted(relativePath) || relativePath.Contains('\\', StringComparison.Ordinal))
+        {
+            return RepositoryPathStatus.Invalid;
+        }
+
+        var segments = relativePath.Split('/');
+        if (segments.Length == 0 || segments.Any(segment => segment.Length == 0 || segment is "." or ".."))
+        {
+            return RepositoryPathStatus.Invalid;
+        }
+
+        try
+        {
+            var current = Path.GetFullPath(repositoryPath);
+            if (!Directory.Exists(current))
+            {
+                return RepositoryPathStatus.Missing;
+            }
+
+            foreach (var segment in segments)
+            {
+                var matches = Directory.EnumerateFileSystemEntries(current)
+                    .Where(entry => string.Equals(Path.GetFileName(entry), segment, StringComparison.OrdinalIgnoreCase))
+                    .ToArray();
+                if (matches.Length == 0)
+                {
+                    return RepositoryPathStatus.Missing;
+                }
+
+                if (matches.Length != 1 ||
+                    !string.Equals(Path.GetFileName(matches[0]), segment, StringComparison.Ordinal))
+                {
+                    return RepositoryPathStatus.InexactCasing;
+                }
+
+                current = matches[0];
+            }
+
+            if (expectDirectory ? !Directory.Exists(current) : !File.Exists(current))
+            {
+                return RepositoryPathStatus.WrongKind;
+            }
+
+            resolvedPath = current;
+            return RepositoryPathStatus.Exact;
+        }
+        catch (IOException)
+        {
+            return RepositoryPathStatus.Unavailable;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return RepositoryPathStatus.Unavailable;
+        }
+        catch (ArgumentException)
+        {
+            return RepositoryPathStatus.Invalid;
+        }
+    }
+
+    private enum RepositoryPathStatus
+    {
+        Exact,
+        Missing,
+        InexactCasing,
+        WrongKind,
+        Unavailable,
+        Invalid
+    }
+
     private static bool HasSupportedNuGetConfiguration(string repositoryPath)
     {
         try
         {
-            var path = Path.Combine(repositoryPath, "NuGet.config");
+            if (GetExactRepositoryPath(repositoryPath, "NuGet.config", expectDirectory: false, out var path) != RepositoryPathStatus.Exact)
+            {
+                return false;
+            }
+
             var file = new FileInfo(path);
             if (!file.Exists || file.Length > 32 * 1024)
             {
@@ -1064,7 +1235,11 @@ internal static class WorkflowPolicyInspector
     {
         try
         {
-            var path = Path.Combine(repositoryPath, "global.json");
+            if (GetExactRepositoryPath(repositoryPath, "global.json", expectDirectory: false, out var path) != RepositoryPathStatus.Exact)
+            {
+                return false;
+            }
+
             var file = new FileInfo(path);
             if (!file.Exists || file.Length > 32 * 1024)
             {
@@ -1179,7 +1354,11 @@ internal static class WorkflowPolicyInspector
             return IndirectPublicationPath.Unknown;
         }
 
-        if (IsExactProfileValidationStep(step) || IsExactCandidateToolSourceConfigurationStep(step))
+        if (IsExactProfileValidationStep(step) ||
+            IsExactCandidateToolSourceConfigurationStep(step) ||
+            IsExactValidationAcquisitionResolverStep(step) ||
+            IsExactToolInstallStep(step, useCandidateToolArtifactSource: true) ||
+            IsExactToolInstallStep(step, useCandidateToolArtifactSource: false))
         {
             return IndirectPublicationPath.ProvenNonPublishing;
         }
