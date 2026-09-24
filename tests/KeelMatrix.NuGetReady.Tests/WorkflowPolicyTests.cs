@@ -1351,8 +1351,24 @@ public sealed class WorkflowPolicyTests
     [Theory]
     [InlineData("workflow-env")]
     [InlineData("workflow-run-name")]
+    [InlineData("workflow-concurrency")]
     [InlineData("job-env")]
     [InlineData("job-condition")]
+    [InlineData("job-name")]
+    [InlineData("job-concurrency")]
+    [InlineData("job-continue-on-error")]
+    [InlineData("job-strategy")]
+    [InlineData("job-defaults-run")]
+    [InlineData("job-output")]
+    [InlineData("job-environment-scalar")]
+    [InlineData("job-environment-url")]
+    [InlineData("container-scalar")]
+    [InlineData("container-image")]
+    [InlineData("container-credentials")]
+    [InlineData("container-env")]
+    [InlineData("service-image")]
+    [InlineData("service-credentials")]
+    [InlineData("service-env")]
     [InlineData("job-runs-on")]
     [InlineData("job-timeout")]
     [InlineData("step-env")]
@@ -1360,6 +1376,8 @@ public sealed class WorkflowPolicyTests
     [InlineData("action-with")]
     [InlineData("reusable-with")]
     [InlineData("reusable-secrets")]
+    [InlineData("workflow-call-input-default")]
+    [InlineData("workflow-call-output-value")]
     [InlineData("step-run")]
     [InlineData("step-condition")]
     [InlineData("step-shell")]
@@ -1396,6 +1414,20 @@ public sealed class WorkflowPolicyTests
                     steps:
                       - uses: actions/checkout@v6
                 """,
+            "workflow-concurrency" => $$"""
+                name: continuous integration
+                on: push
+                permissions:
+                  contents: read
+                concurrency:
+                  group: '{{malformedExpression}}'
+                  cancel-in-progress: false
+                jobs:
+                  build:
+                    runs-on: ubuntu-latest
+                    steps:
+                      - uses: actions/checkout@v6
+                """,
             "job-env" => $$"""
                 name: continuous integration
                 on: push
@@ -1417,6 +1449,211 @@ public sealed class WorkflowPolicyTests
                 jobs:
                   build:
                     if: '{{malformedExpression}}'
+                    runs-on: ubuntu-latest
+                    steps:
+                      - uses: actions/checkout@v6
+                """,
+            "job-name" => $$"""
+                name: continuous integration
+                on: push
+                permissions:
+                  contents: read
+                jobs:
+                  build:
+                    name: '{{malformedExpression}}'
+                    runs-on: ubuntu-latest
+                    steps:
+                      - uses: actions/checkout@v6
+                """,
+            "job-concurrency" => $$"""
+                name: continuous integration
+                on: push
+                permissions:
+                  contents: read
+                jobs:
+                  build:
+                    concurrency: '{{malformedExpression}}'
+                    runs-on: ubuntu-latest
+                    steps:
+                      - uses: actions/checkout@v6
+                """,
+            "job-continue-on-error" => $$"""
+                name: continuous integration
+                on: push
+                permissions:
+                  contents: read
+                jobs:
+                  build:
+                    continue-on-error: '{{malformedExpression}}'
+                    runs-on: ubuntu-latest
+                    steps:
+                      - uses: actions/checkout@v6
+                """,
+            "job-strategy" => $$"""
+                name: continuous integration
+                on: push
+                permissions:
+                  contents: read
+                jobs:
+                  build:
+                    strategy:
+                      fail-fast: '{{malformedExpression}}'
+                    runs-on: ubuntu-latest
+                    steps:
+                      - uses: actions/checkout@v6
+                """,
+            "job-defaults-run" => $$"""
+                name: continuous integration
+                on: push
+                permissions:
+                  contents: read
+                jobs:
+                  build:
+                    defaults:
+                      run:
+                        working-directory: '{{malformedExpression}}'
+                    runs-on: ubuntu-latest
+                    steps:
+                      - uses: actions/checkout@v6
+                """,
+            "job-output" => $$"""
+                name: continuous integration
+                on: push
+                permissions:
+                  contents: read
+                jobs:
+                  build:
+                    outputs:
+                      probe: '{{malformedExpression}}'
+                    runs-on: ubuntu-latest
+                    steps:
+                      - uses: actions/checkout@v6
+                """,
+            "job-environment-scalar" => $$"""
+                name: continuous integration
+                on: push
+                permissions:
+                  contents: read
+                jobs:
+                  build:
+                    environment: '{{malformedExpression}}'
+                    runs-on: ubuntu-latest
+                    steps:
+                      - uses: actions/checkout@v6
+                """,
+            "job-environment-url" => $$"""
+                name: continuous integration
+                on: push
+                permissions:
+                  contents: read
+                jobs:
+                  build:
+                    environment:
+                      name: probe
+                      url: '{{malformedExpression}}'
+                    runs-on: ubuntu-latest
+                    steps:
+                      - uses: actions/checkout@v6
+                """,
+            "container-scalar" => $$"""
+                name: continuous integration
+                on: push
+                permissions:
+                  contents: read
+                jobs:
+                  build:
+                    container: '{{malformedExpression}}'
+                    runs-on: ubuntu-latest
+                    steps:
+                      - uses: actions/checkout@v6
+                """,
+            "container-image" => $$"""
+                name: continuous integration
+                on: push
+                permissions:
+                  contents: read
+                jobs:
+                  build:
+                    container:
+                      image: '{{malformedExpression}}'
+                    runs-on: ubuntu-latest
+                    steps:
+                      - uses: actions/checkout@v6
+                """,
+            "container-credentials" => $$"""
+                name: continuous integration
+                on: push
+                permissions:
+                  contents: read
+                jobs:
+                  build:
+                    container:
+                      image: ubuntu:latest
+                      credentials:
+                        username: probe
+                        password: '{{malformedExpression}}'
+                    runs-on: ubuntu-latest
+                    steps:
+                      - uses: actions/checkout@v6
+                """,
+            "container-env" => $$"""
+                name: continuous integration
+                on: push
+                permissions:
+                  contents: read
+                jobs:
+                  build:
+                    container:
+                      image: ubuntu:latest
+                      env:
+                        PROBE: '{{malformedExpression}}'
+                    runs-on: ubuntu-latest
+                    steps:
+                      - uses: actions/checkout@v6
+                """,
+            "service-image" => $$"""
+                name: continuous integration
+                on: push
+                permissions:
+                  contents: read
+                jobs:
+                  build:
+                    services:
+                      redis:
+                        image: '{{malformedExpression}}'
+                    runs-on: ubuntu-latest
+                    steps:
+                      - uses: actions/checkout@v6
+                """,
+            "service-credentials" => $$"""
+                name: continuous integration
+                on: push
+                permissions:
+                  contents: read
+                jobs:
+                  build:
+                    services:
+                      redis:
+                        image: redis:latest
+                        credentials:
+                          username: probe
+                          password: '{{malformedExpression}}'
+                    runs-on: ubuntu-latest
+                    steps:
+                      - uses: actions/checkout@v6
+                """,
+            "service-env" => $$"""
+                name: continuous integration
+                on: push
+                permissions:
+                  contents: read
+                jobs:
+                  build:
+                    services:
+                      redis:
+                        image: redis:latest
+                        env:
+                          PROBE: '{{malformedExpression}}'
                     runs-on: ubuntu-latest
                     steps:
                       - uses: actions/checkout@v6
@@ -1504,6 +1741,42 @@ public sealed class WorkflowPolicyTests
                     secrets:
                       PROBE: '{{malformedExpression}}'
                 """,
+            "workflow-call-input-default" => $$"""
+                name: continuous integration
+                on:
+                  workflow_call:
+                    inputs:
+                      channel:
+                        description: Channel
+                        default: '{{malformedExpression}}'
+                        required: false
+                        type: string
+                permissions:
+                  contents: read
+                jobs:
+                  build:
+                    runs-on: ubuntu-latest
+                    steps:
+                      - uses: actions/checkout@v6
+                """,
+            "workflow-call-output-value" => $$"""
+                name: continuous integration
+                on:
+                  workflow_call:
+                    outputs:
+                      probe:
+                        description: Probe
+                        value: '{{malformedExpression}}'
+                permissions:
+                  contents: read
+                jobs:
+                  build:
+                    runs-on: ubuntu-latest
+                    outputs:
+                      probe: safe
+                    steps:
+                      - uses: actions/checkout@v6
+                """,
             "step-run" => $$"""
                 name: continuous integration
                 on: push
@@ -1587,6 +1860,40 @@ public sealed class WorkflowPolicyTests
                        failure.Message.Contains("malformed/incomplete expression framing", StringComparison.OrdinalIgnoreCase));
     }
 
+    [Fact]
+    public void Malformed_expression_framing_in_composite_action_inputs_is_unsupported_unproven()
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", """
+            name: continuous integration
+            on: push
+            permissions:
+              contents: read
+            jobs:
+              build:
+                runs-on: ubuntu-latest
+                steps:
+                  - uses: ./.github/actions/adversarial-probe
+            """);
+        repository.WriteFile(".github/actions/adversarial-probe/action.yml", """
+            name: Adversarial probe
+            description: Test fixture
+            runs:
+              using: composite
+              steps:
+                - uses: actions/checkout@v6
+                  with:
+                    fetch-depth: '${{ matrix.release_channel'
+            """);
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        AssertLimitedUnproven(inspection);
+        Assert.Contains(
+            inspection.Failures,
+            failure => failure.IsError &&
+                       failure.Message.Contains("malformed/incomplete expression framing", StringComparison.OrdinalIgnoreCase));
+    }
+
     [Theory]
     [InlineData("ordinary-literal")]
     [InlineData("${{ vars['ARTIFACT.PATH'] }}")]
@@ -1609,6 +1916,137 @@ public sealed class WorkflowPolicyTests
                   - uses: actions/checkout@v6
                     with:
                       note: {{value}}
+            """);
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        Assert.False(inspection.Evaluated);
+        Assert.Empty(inspection.Failures);
+    }
+
+    [Theory]
+    [InlineData("workflow-concurrency")]
+    [InlineData("job-scalars")]
+    [InlineData("job-objects")]
+    [InlineData("workflow-call")]
+    public void Complete_noncredential_expressions_stay_outside_release_policy_across_structural_families(string family)
+    {
+        var workflow = family switch
+        {
+            "workflow-concurrency" => """
+                name: continuous integration
+                on: push
+                permissions:
+                  contents: read
+                concurrency:
+                  group: ${{ github.ref_name }}
+                  cancel-in-progress: ${{ github.ref_type == 'branch' }}
+                jobs:
+                  build:
+                    runs-on: ubuntu-latest
+                    steps:
+                      - uses: actions/checkout@v6
+                """,
+            "job-scalars" => """
+                name: continuous integration
+                on: push
+                permissions:
+                  contents: read
+                jobs:
+                  build:
+                    name: ${{ matrix.display_name }}
+                    concurrency: ${{ matrix.concurrency_group }}
+                    continue-on-error: ${{ matrix.experimental }}
+                    runs-on: ubuntu-latest
+                    steps:
+                      - uses: actions/checkout@v6
+                """,
+            "job-objects" => """
+                name: continuous integration
+                on: push
+                permissions:
+                  contents: read
+                jobs:
+                  build:
+                    strategy:
+                      fail-fast: ${{ github.ref_type == 'branch' }}
+                    defaults:
+                      run:
+                        working-directory: ${{ github.workspace }}
+                    outputs:
+                      probe: ${{ steps.probe.outputs.value }}
+                    container:
+                      image: ${{ vars.CONTAINER_IMAGE }}
+                      credentials:
+                        username: ${{ vars.CONTAINER_USER }}
+                        password: ${{ vars.CONTAINER_PASSWORD }}
+                      env:
+                        PROBE: ${{ github.ref_name }}
+                    services:
+                      redis:
+                        image: ${{ vars.SERVICE_IMAGE }}
+                        credentials:
+                          username: ${{ vars.SERVICE_USER }}
+                          password: ${{ vars.SERVICE_PASSWORD }}
+                        env:
+                          PROBE: ${{ github.ref_name }}
+                    runs-on: ubuntu-latest
+                    steps:
+                      - id: probe
+                        run: echo probe
+                """,
+            _ => """
+                name: continuous integration
+                on:
+                  workflow_call:
+                    inputs:
+                      channel:
+                        default: ${{ vars.DEFAULT_CHANNEL }}
+                        required: false
+                        type: string
+                    outputs:
+                      probe:
+                        value: ${{ vars.OUTPUT_VALUE }}
+                permissions:
+                  contents: read
+                jobs:
+                  build:
+                    runs-on: ubuntu-latest
+                    steps:
+                      - uses: actions/checkout@v6
+                """
+        };
+        using var repository = WorkflowRepository.Create("ci.yml", workflow);
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        Assert.False(inspection.Evaluated);
+        Assert.Empty(inspection.Failures);
+    }
+
+    [Fact]
+    public void Complete_noncredential_expression_in_composite_action_input_stays_outside_release_policy()
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", """
+            name: continuous integration
+            on: push
+            permissions:
+              contents: read
+            jobs:
+              build:
+                runs-on: ubuntu-latest
+                steps:
+                  - uses: ./.github/actions/read-only
+            """);
+        repository.WriteFile(".github/actions/read-only/action.yml", """
+            name: Read-only action
+            description: Test fixture
+            runs:
+              using: composite
+              steps:
+                - uses: actions/checkout@v6
+                  with:
+                    ref: ${{ github.ref_name }}
             """);
 
         var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
@@ -1719,8 +2157,11 @@ public sealed class WorkflowPolicyTests
         }
     }
 
-    [Fact]
-    public void Static_branch_pattern_with_unmatched_opener_does_not_block_a_valid_release_rehearsal()
+    [Theory]
+    [InlineData("branches", "${{feature")]
+    [InlineData("tags", "${{feature")]
+    [InlineData("tags", "docs-*")]
+    public void Static_nonrelease_filters_do_not_block_a_valid_release_rehearsal(string filter, string pattern)
     {
         using var corpus = PackedCorpus.Create();
         var package = corpus.Pack("Standard/Standard.csproj");
@@ -1748,12 +2189,12 @@ public sealed class WorkflowPolicyTests
             "KeelMatrix.NuGetReady.1.0.0.snupkg",
             Path.GetFileName(symbolPackage));
         using var repository = WorkflowRepository.Create("release.yml", releaseWorkflow);
-        repository.WriteWorkflow("ci.yml", """
+        repository.WriteWorkflow("ci.yml", $$"""
             name: CI Probe
             on:
               push:
-                branches:
-                  - '${{feature'
+                {{filter}}:
+                  - '{{pattern}}'
             permissions:
               contents: read
             jobs:
@@ -1775,7 +2216,7 @@ public sealed class WorkflowPolicyTests
             configPath);
         var workflowPolicyStatus = report.Checks.Single(check => check.Id == "workflow-policy").Status;
 
-        Console.WriteLine($"case=static_branch_pattern_with_unmatched_opener expected=pass/pass/0 overall={report.Status} workflow-policy={workflowPolicyStatus} exit={report.ExitCode}");
+        Console.WriteLine($"case=static_{filter}_{pattern} expected=pass/pass/0 overall={report.Status} workflow-policy={workflowPolicyStatus} exit={report.ExitCode}");
         Assert.True(
             report.Status == "pass" && workflowPolicyStatus == "pass" && report.ExitCode == 0,
             $"overall={report.Status}; workflow-policy={workflowPolicyStatus}; exit={report.ExitCode}; failures={string.Join(" | ", report.Failures.Select(failure => failure.Message))}");
@@ -1783,7 +2224,6 @@ public sealed class WorkflowPolicyTests
 
     [Theory]
     [InlineData("workflow-name")]
-    [InlineData("job-name")]
     [InlineData("push-path")]
     [InlineData("push-tag-ignore")]
     [InlineData("workflow-default")]
@@ -1798,18 +2238,6 @@ public sealed class WorkflowPolicyTests
                   contents: read
                 jobs:
                   build:
-                    runs-on: ubuntu-latest
-                    steps:
-                      - uses: actions/checkout@v6
-                """,
-            "job-name" => """
-                name: CI Probe
-                on: push
-                permissions:
-                  contents: read
-                jobs:
-                  build:
-                    name: 'Build ${{feature'
                     runs-on: ubuntu-latest
                     steps:
                       - uses: actions/checkout@v6

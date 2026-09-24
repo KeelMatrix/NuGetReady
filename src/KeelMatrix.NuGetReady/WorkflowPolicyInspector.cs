@@ -219,20 +219,26 @@ internal static class WorkflowPolicyInspector
         var indirectContext = new IndirectInspectionContext();
 
         var hasReleaseControl = workflow.HasPublicationShapedTrigger ||
-                                workflow.HasPublicationInput ||
-                                workflow.TagPatterns.Count > 0;
+                                workflow.HasPublicationInput;
         foreach (var job in activeJobs)
         {
+            var hasIndirectPublication = false;
+            foreach (var step in job.Steps)
+            {
+                hasIndirectPublication |= InspectIndirectPublicationPath(repositoryPath, step, indirectContext) ==
+                    IndirectPublicationPath.Publication;
+            }
+
             if (hasReleaseControl ||
                 IsDirectPublicationJob(job) ||
                 job.Steps.Any(IsPublicationRelevantStep) ||
-                job.Steps.Any(step =>
-                    InspectIndirectPublicationPath(repositoryPath, step, indirectContext) == IndirectPublicationPath.Publication) ||
+                hasIndirectPublication ||
                 HasPublicationCapability(workflow, job))
             {
                 boundary.Add(job);
             }
         }
+        workflow.HasMalformedExpressionFraming |= indirectContext.HasMalformedExpressionFraming;
 
         var jobsById = activeJobs.ToDictionary(job => job.Id, StringComparer.OrdinalIgnoreCase);
         var artifactProducers = activeJobs
@@ -1610,6 +1616,11 @@ internal static class WorkflowPolicyInspector
             {
                 return CacheCompositeResult(context, actionDirectory, IndirectPublicationPath.Unknown);
             }
+            if (action.HasMalformedExpressionFraming)
+            {
+                context.HasMalformedExpressionFraming = true;
+                return CacheCompositeResult(context, actionDirectory, IndirectPublicationPath.Unknown);
+            }
 
             var result = IndirectPublicationPath.ProvenNonPublishing;
             foreach (var step in action.Steps)
@@ -1745,6 +1756,8 @@ internal static class WorkflowPolicyInspector
         public HashSet<string> ActiveComposites { get; } = new(StringComparer.OrdinalIgnoreCase);
 
         public Dictionary<string, IndirectPublicationPath> CompositeResults { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+        public bool HasMalformedExpressionFraming { get; set; }
 
         public long BytesRead { get; private set; }
 
@@ -3141,6 +3154,7 @@ internal static class WorkflowPolicyInspector
     {
         public bool IsComposite { get; set; }
         public bool HasInspectableSteps { get; set; }
+        public bool HasMalformedExpressionFraming { get; set; }
         public List<WorkflowStep> Steps { get; } = new();
     }
 
@@ -3211,6 +3225,18 @@ internal static class WorkflowPolicyInspector
         {
             WorkflowRunName,
             WorkflowEnvironmentValue,
+            WorkflowConcurrency,
+            WorkflowCallInputDefault,
+            WorkflowCallOutputValue,
+            JobName,
+            JobConcurrency,
+            JobContinueOnError,
+            JobStrategy,
+            JobDefaultsRun,
+            JobOutputValue,
+            JobDeploymentEnvironment,
+            JobContainer,
+            JobServices,
             JobCondition,
             JobRunsOn,
             JobTimeoutMinutes,
@@ -3236,6 +3262,7 @@ internal static class WorkflowPolicyInspector
         public static CompositeActionDocument ParseCompositeAction(string content)
         {
             var action = new CompositeActionDocument();
+            var aggregationTarget = new WorkflowDocument();
             if (!TryLoadRoot(content, out var root, out var unsupported) || root is null)
             {
                 return action;
@@ -3262,10 +3289,12 @@ internal static class WorkflowPolicyInspector
                     continue;
                 }
 
-                var step = ParseStep(stepMapping, workflow: null);
+                var step = ParseStep(stepMapping, aggregationTarget);
                 action.Steps.Add(step);
                 action.HasInspectableSteps &= !step.HasUninspectableStructure;
             }
+
+            action.HasMalformedExpressionFraming = aggregationTarget.HasMalformedExpressionFraming;
 
             return action;
         }
@@ -3343,6 +3372,12 @@ internal static class WorkflowPolicyInspector
                             workflow.HasUninspectableCredentialBinding = true;
                             workflow.HasUninspectableStructure = true;
                         }
+                        break;
+                    case "concurrency":
+                        TrackEvaluatedScalarLeaves(
+                            pair.Value,
+                            workflow,
+                            EvaluatedScalarField.WorkflowConcurrency);
                         break;
                     case "jobs":
                         ParseJobs(pair.Value, workflow);
@@ -3452,6 +3487,10 @@ internal static class WorkflowPolicyInspector
                 {
                     ParseTriggerInputs(pair.Value, workflow);
                 }
+                if (trigger.Equals("workflow_call", StringComparison.OrdinalIgnoreCase))
+                {
+                    ParseWorkflowCallEvaluatedValues(pair.Value, workflow);
+                }
             }
         }
 
@@ -3537,6 +3576,38 @@ internal static class WorkflowPolicyInspector
             }
         }
 
+        private static void ParseWorkflowCallEvaluatedValues(YamlNode node, WorkflowDocument workflow)
+        {
+            if (node is not YamlMappingNode workflowCall)
+            {
+                return;
+            }
+
+            if (TryGet(workflowCall, "inputs", out var inputsNode) && inputsNode is YamlMappingNode inputs)
+            {
+                foreach (var inputNode in inputs.Children.Values)
+                {
+                    TrackEvaluatedMappingEntryLeaves(
+                        inputNode,
+                        "default",
+                        workflow,
+                        EvaluatedScalarField.WorkflowCallInputDefault);
+                }
+            }
+
+            if (TryGet(workflowCall, "outputs", out var outputsNode) && outputsNode is YamlMappingNode outputs)
+            {
+                foreach (var outputNode in outputs.Children.Values)
+                {
+                    TrackEvaluatedMappingEntryLeaves(
+                        outputNode,
+                        "value",
+                        workflow,
+                        EvaluatedScalarField.WorkflowCallOutputValue);
+                }
+            }
+        }
+
         private static void ParseJobs(YamlNode node, WorkflowDocument workflow)
         {
             if (node is not YamlMappingNode jobs)
@@ -3572,6 +3643,50 @@ internal static class WorkflowPolicyInspector
                     {
                         case "name":
                             job.Name = ReadRequiredScalar(property.Value, workflow, job);
+                            TrackEvaluatedScalar(workflow, EvaluatedScalarField.JobName, job.Name);
+                            break;
+                        case "concurrency":
+                            TrackEvaluatedScalarLeaves(
+                                property.Value,
+                                workflow,
+                                EvaluatedScalarField.JobConcurrency);
+                            break;
+                        case "continue-on-error":
+                            TrackEvaluatedScalar(
+                                workflow,
+                                EvaluatedScalarField.JobContinueOnError,
+                                ReadRequiredScalar(property.Value, workflow, job));
+                            break;
+                        case "strategy":
+                            TrackEvaluatedScalarLeaves(
+                                property.Value,
+                                workflow,
+                                EvaluatedScalarField.JobStrategy);
+                            break;
+                        case "defaults":
+                            TrackEvaluatedMappingEntryLeaves(
+                                property.Value,
+                                "run",
+                                workflow,
+                                EvaluatedScalarField.JobDefaultsRun);
+                            break;
+                        case "outputs":
+                            TrackEvaluatedScalarLeaves(
+                                property.Value,
+                                workflow,
+                                EvaluatedScalarField.JobOutputValue);
+                            break;
+                        case "container":
+                            TrackEvaluatedScalarLeaves(
+                                property.Value,
+                                workflow,
+                                EvaluatedScalarField.JobContainer);
+                            break;
+                        case "services":
+                            TrackEvaluatedScalarLeaves(
+                                property.Value,
+                                workflow,
+                                EvaluatedScalarField.JobServices);
                             break;
                         case "uses":
                             job.Uses = ReadRequiredScalar(property.Value, workflow, job);
@@ -3639,6 +3754,10 @@ internal static class WorkflowPolicyInspector
                             job.HasSecretBinding = true;
                             break;
                         case "environment":
+                            TrackEvaluatedScalarLeaves(
+                                property.Value,
+                                workflow,
+                                EvaluatedScalarField.JobDeploymentEnvironment);
                             job.HasSecretBinding = true;
                             break;
                         default:
@@ -3911,6 +4030,47 @@ internal static class WorkflowPolicyInspector
             }
         }
 
+        private static void TrackEvaluatedScalarLeaves(
+            YamlNode node,
+            WorkflowDocument workflow,
+            EvaluatedScalarField field)
+        {
+            if (TryScalar(node, out var scalar))
+            {
+                TrackEvaluatedScalar(workflow, field, scalar);
+                return;
+            }
+
+            if (node is YamlMappingNode mapping)
+            {
+                foreach (var value in mapping.Children.Values)
+                {
+                    TrackEvaluatedScalarLeaves(value, workflow, field);
+                }
+                return;
+            }
+
+            if (node is YamlSequenceNode sequence)
+            {
+                foreach (var value in sequence.Children)
+                {
+                    TrackEvaluatedScalarLeaves(value, workflow, field);
+                }
+            }
+        }
+
+        private static void TrackEvaluatedMappingEntryLeaves(
+            YamlNode node,
+            string entryName,
+            WorkflowDocument workflow,
+            EvaluatedScalarField field)
+        {
+            if (node is YamlMappingNode mapping && TryGet(mapping, entryName, out var entry))
+            {
+                TrackEvaluatedScalarLeaves(entry, workflow, field);
+            }
+        }
+
         private static void TrackEvaluatedScalar(
             WorkflowDocument? workflow,
             EvaluatedScalarField field,
@@ -3921,12 +4081,25 @@ internal static class WorkflowPolicyInspector
                 return;
             }
 
-            // GitHub Actions "Contexts reference: Context availability" defines these
-            // modeled keys. Static trigger filters and workflow/job names stay outside.
+            // github/docs@786d6053f421ec05b3643cd9520723ff42283f6b,
+            // content/actions/reference/workflows-and-actions/contexts.md defines these
+            // modeled keys. Static trigger filters and the workflow name stay outside.
             var isEvaluatedField = field switch
             {
                 EvaluatedScalarField.WorkflowRunName or
                 EvaluatedScalarField.WorkflowEnvironmentValue or
+                EvaluatedScalarField.WorkflowConcurrency or
+                EvaluatedScalarField.WorkflowCallInputDefault or
+                EvaluatedScalarField.WorkflowCallOutputValue or
+                EvaluatedScalarField.JobName or
+                EvaluatedScalarField.JobConcurrency or
+                EvaluatedScalarField.JobContinueOnError or
+                EvaluatedScalarField.JobStrategy or
+                EvaluatedScalarField.JobDefaultsRun or
+                EvaluatedScalarField.JobOutputValue or
+                EvaluatedScalarField.JobDeploymentEnvironment or
+                EvaluatedScalarField.JobContainer or
+                EvaluatedScalarField.JobServices or
                 EvaluatedScalarField.JobCondition or
                 EvaluatedScalarField.JobRunsOn or
                 EvaluatedScalarField.JobTimeoutMinutes or
