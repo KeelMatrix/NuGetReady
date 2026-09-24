@@ -119,6 +119,24 @@ public sealed class ReleaseContractTests
         Assert.Contains("Release contract passed", tagResult.StandardOutput, StringComparison.OrdinalIgnoreCase);
     }
 
+    [Fact]
+    public void Current_repository_release_contract_matches_the_execution_context()
+    {
+        var root = SyntheticReleaseRepository.FindRepositoryRoot();
+        var tagMode = string.Equals(Environment.GetEnvironmentVariable("GITHUB_REF_TYPE"), "tag", StringComparison.Ordinal);
+        var tagVersion = tagMode ? Environment.GetEnvironmentVariable("GITHUB_REF_NAME") : null;
+        var result = RunValidator(
+            Path.Combine(root, "scripts", "validate-release-contract.ps1"),
+            root,
+            tagMode ? "Tag" : "PreRelease",
+            "0.1.0",
+            tagVersion);
+
+        Assert.True(
+            result.ExitCode == 0,
+            $"Release contract validation failed.{Environment.NewLine}{result.StandardOutput}{Environment.NewLine}{result.StandardError}");
+    }
+
     private static ProcessResult RunValidator(string script, string root, string mode, string expectedVersion, string? tagVersion)
     {
         var arguments = new List<string>

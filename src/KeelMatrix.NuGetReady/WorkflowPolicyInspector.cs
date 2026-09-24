@@ -1,5 +1,7 @@
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Xml;
+using System.Xml.Linq;
 using YamlDotNet.Core;
 using YamlDotNet.RepresentationModel;
 
@@ -12,6 +14,16 @@ internal static class WorkflowPolicyInspector
     private const int MaxWorkflowBytes = 512 * 1024;
     private const int MaxIndirectPathDepth = 8;
     private const long MaxIndirectPathBytes = 2 * 1024 * 1024;
+    private const string SupportedToolVersion = "0.1.0";
+    private const string InstalledValidationCommand = "./.nugetready/nugetready check --config nugetready.json --artifacts artifacts/release --format json";
+    private static readonly string[] InstalledValidationTokens = TokenizeCommandLine(InstalledValidationCommand);
+    private static readonly string[] ExactPackArguments =
+    {
+        "--configuration", "Release", "--no-build", "--no-restore", "--include-symbols",
+        "-p:SymbolPackageFormat=snupkg", "-p:ImportDirectoryBuildTargets=false",
+        "-p:ImportDirectoryTargets=false", "--output", "artifacts/release", "--nologo",
+        "-p:UseSharedCompilation=false"
+    };
 
     public static IReadOnlyList<Failure> Inspect(string repositoryPath, NuGetReadyConfig? config = null)
     {
@@ -389,7 +401,7 @@ internal static class WorkflowPolicyInspector
             failures.Add(Unsupported("The 0.1.0 supported release profile contains exactly one validation job and one NuGet publish job; additional jobs are unproven."));
         }
 
-        InspectValidationJob(workflow, validationJob, expectedArtifacts, failures);
+        InspectValidationJob(repositoryPath, workflow, validationJob, expectedArtifacts, failures);
         InspectCredentialBearingJob(publishJob, primaryArtifact, failures);
 
         if (ContainsLongLivedCredential(workflow.Environment) ||
@@ -408,6 +420,7 @@ internal static class WorkflowPolicyInspector
     }
 
     private static void InspectValidationJob(
+        string repositoryPath,
         WorkflowDocument workflow,
         WorkflowJob validationJob,
         IReadOnlyList<string> expectedArtifacts,
@@ -454,50 +467,14 @@ internal static class WorkflowPolicyInspector
             failures.Add(new Failure("workflow-policy", "The validation job must not receive a long-lived NuGet publishing credential."));
         }
 
-        foreach (var step in validationJob.Steps)
+        if (!HasSupportedNuGetConfiguration(repositoryPath))
         {
-            if (!string.IsNullOrWhiteSpace(step.Uses))
-            {
-                if (!IsSupportedValidationAction(step))
-                {
-                    failures.Add(Unsupported("The validation job contains an action or action input outside the supported release profile."));
-                }
-            }
-            else if (!string.Equals(step.Shell, "pwsh", StringComparison.Ordinal) ||
-                     step.Environment.Count != 0 ||
-                     step.PresentKeys.Any(key => key is not ("name" or "shell" or "run")))
-            {
-                failures.Add(Unsupported("The validation job contains unsupported shell or step execution controls."));
-            }
+            failures.Add(Unsupported("The supported validation profile requires NuGet.config to contain only the canonical NuGet.org v3 source."));
         }
 
-        var uploadIndices = validationJob.Steps
-            .Select((step, index) => (step, index))
-            .Where(item => UsesExactly(item.step, "actions/upload-artifact@v4"))
-            .ToArray();
-        if (uploadIndices.Length != 1)
+        if (!HasExactValidationSequence(validationJob.Steps, expectedArtifacts))
         {
-            failures.Add(Unsupported("The validation job must upload exactly one artifact with actions/upload-artifact@v4."));
-            return;
-        }
-
-        var upload = uploadIndices[0];
-        if (!IsDefinitelyEnabled(upload.step.Condition) || upload.step.HasUninspectableStructure ||
-            !HasExactInputs(upload.step.With,
-                ("name", "validated-release-artifacts"),
-                ("path", JoinArtifactPaths(expectedArtifacts)),
-                ("if-no-files-found", "error")))
-        {
-            failures.Add(Unsupported("The artifact upload must be unconditional and name only the exact validated package paths."));
-        }
-
-        var validationIndices = validationJob.Steps
-            .Select((step, index) => (step, index))
-            .Where(item => IsExactProfileValidationStep(item.step))
-            .ToArray();
-        if (validationIndices.Length != 1 || validationIndices[0].index + 1 != upload.index)
-        {
-            failures.Add(Unsupported("The exact NuGetReady validation must execute once and immediately before the artifact upload."));
+            failures.Add(Unsupported("The validation job must use the exact ordered closed command profile: checkout, SDK setup, restore, format, build, test, pack, pinned tool-path install, installed NuGetReady check, and exact artifact upload."));
         }
     }
 
@@ -644,18 +621,121 @@ internal static class WorkflowPolicyInspector
         return string.Equals(step.Uses, action, StringComparison.Ordinal);
     }
 
-    private static bool IsSupportedValidationAction(WorkflowStep step)
+    private static bool HasExactValidationSequence(
+        IReadOnlyList<WorkflowStep> steps,
+        IReadOnlyList<string> expectedArtifacts)
     {
-        if (!IsSimpleActionStep(step, allowId: false))
+        if (steps.Count != 10 ||
+            !IsExactCheckoutStep(steps[0]) ||
+            !IsExactSetupDotNetStep(steps[1]) ||
+            !TryMatchRestoreStep(steps[2], out var solutionPath) ||
+            !IsExactFormatStep(steps[3], solutionPath) ||
+            !IsExactBuildStep(steps[4], solutionPath) ||
+            !IsExactTestStep(steps[5], solutionPath) ||
+            !IsExactPackStep(steps[6]) ||
+            !IsExactToolInstallStep(steps[7]) ||
+            !IsExactProfileValidationStep(steps[8]) ||
+            !IsExactUploadStep(steps[9], expectedArtifacts))
         {
             return false;
         }
 
-        return UsesExactly(step, "actions/checkout@v6")
-            ? HasExactInputs(step.With, ("fetch-depth", "0"), ("ref", "${{ github.ref }}"))
-            : UsesExactly(step, "actions/setup-dotnet@v5")
-                ? HasExactInputs(step.With, ("global-json-file", "global.json"))
-                : UsesExactly(step, "actions/upload-artifact@v4");
+        return true;
+    }
+
+    private static bool IsExactCheckoutStep(WorkflowStep step)
+    {
+        return UsesExactly(step, "actions/checkout@v6") &&
+               IsSimpleActionStep(step, allowId: false) &&
+               HasExactInputs(
+                   step.With,
+                   ("fetch-depth", "0"),
+                   ("ref", "${{ github.ref }}"),
+                   ("persist-credentials", "false"));
+    }
+
+    private static bool IsExactSetupDotNetStep(WorkflowStep step)
+    {
+        return UsesExactly(step, "actions/setup-dotnet@v5") &&
+               IsSimpleActionStep(step, allowId: false) &&
+               HasExactInputs(step.With, ("global-json-file", "global.json"));
+    }
+
+    private static bool TryMatchRestoreStep(WorkflowStep step, out string solutionPath)
+    {
+        solutionPath = string.Empty;
+        if (!TryGetDirectCommandTokens(step, out var tokens) ||
+            tokens.Length != 9 ||
+            !tokens[0].Equals("dotnet", StringComparison.Ordinal) ||
+            !tokens[1].Equals("restore", StringComparison.Ordinal) ||
+            !IsLiteralRepositoryPath(tokens[2], "sln", "slnx") ||
+            !tokens[3].Equals("--configfile", StringComparison.Ordinal) ||
+            !tokens[4].Equals("NuGet.config", StringComparison.Ordinal) ||
+            !tokens[5].Equals("--nologo", StringComparison.Ordinal) ||
+            !tokens[6].Equals("-p:NuGetAuditMode=all", StringComparison.Ordinal) ||
+            !tokens[7].Equals("-p:NuGetAuditLevel=low", StringComparison.Ordinal) ||
+            !tokens[8].Equals("-p:TreatWarningsAsErrors=true", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        solutionPath = tokens[2];
+        return true;
+    }
+
+    private static bool IsExactFormatStep(WorkflowStep step, string solutionPath)
+    {
+        return HasExactDirectCommand(
+            step,
+            "dotnet", "format", solutionPath, "--verify-no-changes", "--no-restore", "--verbosity", "minimal");
+    }
+
+    private static bool IsExactBuildStep(WorkflowStep step, string solutionPath)
+    {
+        return HasExactDirectCommand(
+            step,
+            "dotnet", "build", solutionPath, "--configuration", "Release", "--no-restore", "--nologo", "-p:UseSharedCompilation=false");
+    }
+
+    private static bool IsExactTestStep(WorkflowStep step, string solutionPath)
+    {
+        return HasExactDirectCommand(
+            step,
+            "dotnet", "test", solutionPath, "--configuration", "Release", "--no-build", "--no-restore", "--nologo", "--logger", "console;verbosity=minimal");
+    }
+
+    private static bool IsExactPackStep(WorkflowStep step)
+    {
+        if (!TryGetDirectCommandTokens(step, out var tokens) ||
+            tokens.Length != 15 ||
+            !tokens[0].Equals("dotnet", StringComparison.Ordinal) ||
+            !tokens[1].Equals("pack", StringComparison.Ordinal) ||
+            !IsLiteralRepositoryPath(tokens[2], "csproj"))
+        {
+            return false;
+        }
+
+        return tokens.Skip(3).SequenceEqual(ExactPackArguments, StringComparer.Ordinal);
+    }
+
+    private static bool IsExactToolInstallStep(WorkflowStep step)
+    {
+        return HasExactDirectCommand(
+            step,
+            "dotnet", "tool", "install", "KeelMatrix.NuGetReady", "--version", SupportedToolVersion,
+            "--tool-path", ".nugetready", "--configfile", "NuGet.config", "--add-source", "artifacts/release",
+            "--no-cache", "--verbosity", "minimal");
+    }
+
+    private static bool IsExactUploadStep(WorkflowStep step, IReadOnlyList<string> expectedArtifacts)
+    {
+        return UsesExactly(step, "actions/upload-artifact@v4") &&
+               IsSimpleActionStep(step, allowId: false) &&
+               HasExactInputs(
+                   step.With,
+                   ("name", "validated-release-artifacts"),
+                   ("path", JoinArtifactPaths(expectedArtifacts)),
+                   ("if-no-files-found", "error"));
     }
 
     private static bool IsSimpleActionStep(WorkflowStep step, bool allowId)
@@ -669,12 +749,145 @@ internal static class WorkflowPolicyInspector
 
     private static bool IsExactProfileValidationStep(WorkflowStep step)
     {
-        const string command = "dotnet run --project src/KeelMatrix.NuGetReady/KeelMatrix.NuGetReady.csproj --configuration Release --no-build --no-restore -- check --config nugetready.json --artifacts artifacts/release --format json";
         return IsDefinitelyEnabled(step.Condition) &&
                string.Equals(step.Shell, "pwsh", StringComparison.Ordinal) &&
-               string.Equals(step.Run?.Trim(), command, StringComparison.Ordinal) &&
+               string.Equals(step.Run?.Trim(), InstalledValidationCommand, StringComparison.Ordinal) &&
                step.Environment.Count == 0 &&
                step.PresentKeys.All(key => key is "name" or "shell" or "run");
+    }
+
+    private static bool TryGetDirectCommandTokens(WorkflowStep step, out string[] tokens)
+    {
+        tokens = Array.Empty<string>();
+        if (!IsDefinitelyEnabled(step.Condition) ||
+            step.HasUninspectableStructure ||
+            !string.Equals(step.Shell, "pwsh", StringComparison.Ordinal) ||
+            step.Environment.Count != 0 ||
+            step.PresentKeys.Any(key => key is not ("name" or "shell" or "run")) ||
+            string.IsNullOrWhiteSpace(step.Run))
+        {
+            return false;
+        }
+
+        var command = step.Run.Trim();
+        if (HasUnquotedCommandSeparator(command) ||
+            command.Contains("${{", StringComparison.Ordinal) ||
+            Regex.IsMatch(command, @"(?<!\\)\$[A-Za-z_]|%[A-Za-z_][A-Za-z0-9_]*%", RegexOptions.CultureInvariant))
+        {
+            return false;
+        }
+
+        tokens = TokenizeCommandLine(command);
+        return tokens.Length > 0;
+    }
+
+    private static bool HasUnquotedCommandSeparator(string command)
+    {
+        var quote = '\0';
+        foreach (var character in command)
+        {
+            if (quote != '\0')
+            {
+                if (character == quote)
+                {
+                    quote = '\0';
+                }
+
+                continue;
+            }
+
+            if (character is '\'' or '"')
+            {
+                quote = character;
+            }
+            else if (character is '\r' or '\n' or ';' or '|' or '&' or '`')
+            {
+                return true;
+            }
+        }
+
+        return quote != '\0';
+    }
+
+    private static bool HasExactDirectCommand(WorkflowStep step, params string[] expectedTokens)
+    {
+        return TryGetDirectCommandTokens(step, out var tokens) &&
+               tokens.SequenceEqual(expectedTokens, StringComparer.Ordinal);
+    }
+
+    private static bool IsLiteralRepositoryPath(string value, params string[] extensions)
+    {
+        if (Path.IsPathRooted(value) || value.Contains('\\', StringComparison.Ordinal) || ContainsExpression(value))
+        {
+            return false;
+        }
+
+        var segments = value.Split('/');
+        if (segments.Any(segment => segment.Length == 0 || segment is "." or ".." ||
+                                    !Regex.IsMatch(segment, "^[A-Za-z0-9._-]+$", RegexOptions.CultureInvariant)))
+        {
+            return false;
+        }
+
+        return extensions.Any(extension => value.EndsWith($".{extension}", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool HasSupportedNuGetConfiguration(string repositoryPath)
+    {
+        try
+        {
+            var path = Path.Combine(repositoryPath, "NuGet.config");
+            var file = new FileInfo(path);
+            if (!file.Exists || file.Length > 32 * 1024)
+            {
+                return false;
+            }
+
+            var settings = new XmlReaderSettings { DtdProcessing = DtdProcessing.Prohibit };
+            using var reader = XmlReader.Create(path, settings);
+            var document = XDocument.Load(reader, LoadOptions.None);
+            var root = document.Root;
+            if (root is null || root.Name != "configuration" || root.Attributes().Any())
+            {
+                return false;
+            }
+
+            var rootElements = root.Elements().ToArray();
+            if (rootElements.Length != 1 || rootElements[0].Name != "packageSources" || rootElements[0].Attributes().Any())
+            {
+                return false;
+            }
+
+            var sources = rootElements[0].Elements().ToArray();
+            if (sources.Length != 2 || sources[0].Name != "clear" || sources[0].HasAttributes || sources[0].HasElements ||
+                sources[1].Name != "add" || sources[1].HasElements ||
+                sources[1].Attributes().Any(attribute => !string.IsNullOrEmpty(attribute.Name.NamespaceName)))
+            {
+                return false;
+            }
+
+            var attributes = sources[1].Attributes().ToDictionary(attribute => attribute.Name.LocalName, attribute => attribute.Value, StringComparer.Ordinal);
+            return attributes.Count == 3 &&
+                   attributes.TryGetValue("key", out var key) && key == "nuget.org" &&
+                   attributes.TryGetValue("value", out var value) && value == "https://api.nuget.org/v3/index.json" &&
+                   attributes.TryGetValue("protocolVersion", out var protocol) && protocol == "3";
+        }
+        catch (IOException)
+        {
+            return false;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return false;
+        }
+        catch (XmlException)
+        {
+            return false;
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
     }
 
     private static string JoinArtifactPaths(IReadOnlyList<string> expectedArtifacts)
@@ -1780,8 +1993,12 @@ internal static class WorkflowPolicyInspector
                    tokens[commandIndex + 1].Equals("check", StringComparison.OrdinalIgnoreCase);
         }
 
-        return normalizedCommand.Equals("git", StringComparison.OrdinalIgnoreCase) ||
-               normalizedCommand.Equals("git.exe", StringComparison.OrdinalIgnoreCase) ||
+        if (normalizedCommand.Equals("./.nugetready/nugetready", StringComparison.Ordinal))
+        {
+            return tokens.Skip(commandIndex).SequenceEqual(InstalledValidationTokens, StringComparer.Ordinal);
+        }
+
+        return IsSupportedReadOnlyGitCommand(normalizedCommand, tokens, commandIndex) ||
                normalizedCommand.Equals("echo", StringComparison.OrdinalIgnoreCase) ||
                normalizedCommand.Equals("printf", StringComparison.OrdinalIgnoreCase) ||
                normalizedCommand.Equals("cat", StringComparison.OrdinalIgnoreCase) ||
@@ -1822,6 +2039,21 @@ internal static class WorkflowPolicyInspector
                normalizedCommand.Equals("Sort-Object", StringComparison.OrdinalIgnoreCase) ||
                normalizedCommand.Equals("Out-Null", StringComparison.OrdinalIgnoreCase) ||
                normalizedCommand.Equals("Split-Path", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsSupportedReadOnlyGitCommand(string command, string[] tokens, int commandIndex)
+    {
+        if (!command.Equals("git", StringComparison.OrdinalIgnoreCase) &&
+            !command.Equals("git.exe", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var argumentCount = tokens.Length - commandIndex - 1;
+        return (argumentCount == 1 && tokens[commandIndex + 1].Equals("status", StringComparison.OrdinalIgnoreCase)) ||
+               (argumentCount == 2 &&
+                tokens[commandIndex + 1].Equals("status", StringComparison.OrdinalIgnoreCase) &&
+                tokens[commandIndex + 2].Equals("--short", StringComparison.OrdinalIgnoreCase));
     }
 
     private static bool IsNuGetReadyCheckInvocation(string[] tokens, int commandIndex)

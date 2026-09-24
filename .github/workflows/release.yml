@@ -26,6 +26,7 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ github.ref }}
+          persist-credentials: false
 
       - name: Set up .NET SDK
         uses: actions/setup-dotnet@v5
@@ -34,63 +35,31 @@ jobs:
 
       - name: Restore from controlled sources and audit dependencies
         shell: pwsh
-        run: |
-          dotnet restore KeelMatrix.NuGetReady.sln --configfile NuGet.config --nologo -p:NuGetAuditMode=all -p:NuGetAuditLevel=low -p:TreatWarningsAsErrors=true
-          if ($LASTEXITCODE -ne 0) { throw "Dependency restore or NuGet audit failed." }
-
-      - name: Validate the tag and repository release contract
-        shell: pwsh
-        run: |
-          pwsh -NoProfile -NonInteractive -File scripts/validate-release-contract.ps1 -RepositoryRoot $env:GITHUB_WORKSPACE -Mode Tag -ExpectedVersion 0.1.0 -TagVersion $env:GITHUB_REF_NAME
-          if ($LASTEXITCODE -ne 0) { throw "Release contract validation failed." }
+        run: dotnet restore KeelMatrix.NuGetReady.sln --configfile NuGet.config --nologo -p:NuGetAuditMode=all -p:NuGetAuditLevel=low -p:TreatWarningsAsErrors=true
 
       - name: Verify format
         shell: pwsh
-        run: |
-          dotnet format KeelMatrix.NuGetReady.sln --verify-no-changes --no-restore --verbosity minimal
-          if ($LASTEXITCODE -ne 0) { throw "Formatting verification failed." }
+        run: dotnet format KeelMatrix.NuGetReady.sln --verify-no-changes --no-restore --verbosity minimal
 
       - name: Build Release
         shell: pwsh
-        run: |
-          dotnet build KeelMatrix.NuGetReady.sln --configuration Release --no-restore --nologo -p:UseSharedCompilation=false
-          if ($LASTEXITCODE -ne 0) { throw "Release build failed." }
+        run: dotnet build KeelMatrix.NuGetReady.sln --configuration Release --no-restore --nologo -p:UseSharedCompilation=false
 
-      - name: Run release tests
+      - name: Run release tests and validate the tag contract
         shell: pwsh
-        run: |
-          dotnet test KeelMatrix.NuGetReady.sln --configuration Release --no-build --no-restore --nologo --logger "console;verbosity=minimal"
-          if ($LASTEXITCODE -ne 0) { throw "Release tests failed." }
+        run: dotnet test KeelMatrix.NuGetReady.sln --configuration Release --no-build --no-restore --nologo --logger "console;verbosity=minimal"
 
       - name: Pack the exact release artifacts
         shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $output = Join-Path $env:GITHUB_WORKSPACE 'artifacts/release'
-          if (Test-Path -LiteralPath $output) { Remove-Item -LiteralPath $output -Recurse -Force }
-          New-Item -ItemType Directory -Path $output -Force | Out-Null
-          dotnet pack src/KeelMatrix.NuGetReady/KeelMatrix.NuGetReady.csproj --configuration Release --no-build --no-restore --include-symbols -p:SymbolPackageFormat=snupkg -p:ImportDirectoryBuildTargets=false -p:ImportDirectoryTargets=false --output $output --nologo -p:UseSharedCompilation=false
-          if ($LASTEXITCODE -ne 0) { throw "Release package creation failed." }
+        run: dotnet pack src/KeelMatrix.NuGetReady/KeelMatrix.NuGetReady.csproj --configuration Release --no-build --no-restore --include-symbols -p:SymbolPackageFormat=snupkg -p:ImportDirectoryBuildTargets=false -p:ImportDirectoryTargets=false --output artifacts/release --nologo -p:UseSharedCompilation=false
 
-          $expected = @(
-            'KeelMatrix.NuGetReady.0.1.0.nupkg',
-            'KeelMatrix.NuGetReady.0.1.0.snupkg'
-          )
-          $actual = @(Get-ChildItem -LiteralPath $output -File | ForEach-Object { $_.Name })
-          $difference = Compare-Object ($expected | Sort-Object) ($actual | Sort-Object)
-          if ($null -ne $difference) {
-            throw "Release output is not the exact expected artifact set. Expected: $($expected -join ', '). Actual: $($actual -join ', ')."
-          }
-
-      - name: Inspect the exact package archives
+      - name: Install the pinned NuGetReady tool
         shell: pwsh
-        run: |
-          pwsh -NoProfile -File scripts/inspect-package.ps1 -PackagePath artifacts/release/KeelMatrix.NuGetReady.0.1.0.nupkg -SymbolsPackagePath artifacts/release/KeelMatrix.NuGetReady.0.1.0.snupkg -ExpectedVersion 0.1.0
-          if ($LASTEXITCODE -ne 0) { throw "Package archive inspection failed." }
+        run: dotnet tool install KeelMatrix.NuGetReady --version 0.1.0 --tool-path .nugetready --configfile NuGet.config --add-source artifacts/release --no-cache --verbosity minimal
 
       - name: Validate the exact package set with NuGetReady
         shell: pwsh
-        run: dotnet run --project src/KeelMatrix.NuGetReady/KeelMatrix.NuGetReady.csproj --configuration Release --no-build --no-restore -- check --config nugetready.json --artifacts artifacts/release --format json
+        run: ./.nugetready/nugetready check --config nugetready.json --artifacts artifacts/release --format json
 
       - name: Upload only the validated release artifacts
         uses: actions/upload-artifact@v4

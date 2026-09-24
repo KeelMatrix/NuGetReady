@@ -32,6 +32,19 @@ public sealed class ReleaseWorkflowContractTests
     }
 
     [Fact]
+    public void Release_workflow_uses_the_pinned_installed_cli_profile()
+    {
+        var root = FindRepositoryRoot();
+        var workflowPath = Path.Combine(root, ".github", "workflows", "release.yml");
+        var workflow = File.ReadAllText(workflowPath);
+
+        Assert.Contains("persist-credentials: false", workflow, StringComparison.Ordinal);
+        Assert.Contains("dotnet tool install KeelMatrix.NuGetReady --version 0.1.0 --tool-path .nugetready --configfile NuGet.config --add-source artifacts/release --no-cache --verbosity minimal", workflow, StringComparison.Ordinal);
+        Assert.Contains("./.nugetready/nugetready check --config nugetready.json --artifacts artifacts/release --format json", workflow, StringComparison.Ordinal);
+        Assert.DoesNotContain("dotnet run --project", workflow, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Ci_installed_tool_rehearses_corpus_outside_repository()
     {
         var root = FindRepositoryRoot();

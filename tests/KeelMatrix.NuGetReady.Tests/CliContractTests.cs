@@ -35,6 +35,9 @@ public sealed class CliContractTests
         Assert.Contains("closed-world 0.1.0 release profile", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("validated-release-artifacts", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("NuGet/login@v1", CliParser.HelpText, StringComparison.Ordinal);
+        Assert.Contains("--tool-path .nugetready", CliParser.HelpText, StringComparison.Ordinal);
+        Assert.Contains("./.nugetready/nugetready check", CliParser.HelpText, StringComparison.Ordinal);
+        Assert.Contains("Extra validation commands or arguments block", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("unknown or unsupported publication-relevant node", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("error/exit 2", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("never defaults to safe", CliParser.HelpText, StringComparison.Ordinal);

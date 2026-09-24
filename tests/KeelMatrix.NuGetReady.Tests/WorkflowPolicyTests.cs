@@ -214,7 +214,7 @@ public sealed class WorkflowPolicyTests
     {
         using var repository = WorkflowRepository.Create("release.yml", Mutate(
             ReleaseWorkflow,
-            "run: dotnet run --project src/KeelMatrix.NuGetReady/KeelMatrix.NuGetReady.csproj --configuration Release --no-build --no-restore -- check --config nugetready.json --artifacts artifacts/release --format json",
+            $"run: {ValidationCommand}",
             "run: echo dotnet nugetready check --artifacts artifacts/release"));
 
         var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
@@ -1312,7 +1312,7 @@ public sealed class WorkflowPolicyTests
     [Fact]
     public void Artifact_validation_must_execute_before_publication()
     {
-        const string validation = "- name: Validate exact artifacts\n        shell: pwsh\n        run: dotnet run --project src/KeelMatrix.NuGetReady/KeelMatrix.NuGetReady.csproj --configuration Release --no-build --no-restore -- check --config nugetready.json --artifacts artifacts/release --format json";
+        const string validation = $"- name: Validate exact artifacts\n        shell: pwsh\n        run: {ValidationCommand}";
         const string upload = "- name: Upload exact artifacts\n        uses: actions/upload-artifact@v4\n        with:\n          name: validated-release-artifacts\n          path: |\n            artifacts/release/KeelMatrix.NuGetReady.1.0.0.nupkg\n            artifacts/release/KeelMatrix.NuGetReady.1.0.0.snupkg\n          if-no-files-found: error";
         using var repository = WorkflowRepository.Create("release.yml", Mutate(
             ReleaseWorkflow,
@@ -1335,6 +1335,74 @@ public sealed class WorkflowPolicyTests
         var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
 
         Assert.Contains(findings, finding => finding.Message.Contains("telemetry", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Theory]
+    [InlineData("dotnet build KeelMatrix.NuGetReady.sln -t:Publish")]
+    [InlineData("dotnet msbuild publish.proj -t:Publish")]
+    [InlineData("dotnet tool run arbitrary-tool")]
+    [InlineData("git -c alias.ship=!dotnet-nuget-push ship")]
+    [InlineData("pwsh -Command ./scripts/generated.ps1")]
+    [InlineData("Set-Content generated.ps1 'Write-Output generated'")]
+    [InlineData("echo additional-command")]
+    public void Unsupported_validation_job_execution_never_remains_certifiable(string command)
+    {
+        using var repository = WorkflowRepository.Create("release.yml", Mutate(
+            ReleaseWorkflow,
+            $"      - name: Validate exact artifacts\n        shell: pwsh\n        run: {ValidationCommand}",
+            $"      - name: Unsupported validation execution\n        shell: pwsh\n        run: {command}\n      - name: Validate exact artifacts\n        shell: pwsh\n        run: {ValidationCommand}"));
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+        Assert.Contains(findings, finding => finding.IsError && finding.Message.Contains("closed command profile", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Theory]
+    [InlineData(
+        "dotnet build Example.sln --configuration Release --no-restore --nologo -p:UseSharedCompilation=false",
+        "dotnet build Example.sln -t:Publish")]
+    [InlineData(
+        "dotnet build Example.sln --configuration Release --no-restore --nologo -p:UseSharedCompilation=false",
+        "git -c alias.ship=!dotnet-nuget-push ship")]
+    [InlineData(
+        "dotnet tool install KeelMatrix.NuGetReady --version 0.1.0 --tool-path .nugetready --configfile NuGet.config --add-source artifacts/release --no-cache --verbosity minimal",
+        "dotnet tool run arbitrary-tool")]
+    [InlineData(
+        "dotnet pack src/Example/Example.csproj --configuration Release --no-build --no-restore --include-symbols -p:SymbolPackageFormat=snupkg -p:ImportDirectoryBuildTargets=false -p:ImportDirectoryTargets=false --output artifacts/release --nologo -p:UseSharedCompilation=false",
+        "dotnet pack src/Example/Example.csproj --configuration Release -p:CustomAfterMicrosoftCommonTargets=publish.targets")]
+    [InlineData(
+        "dotnet restore Example.sln --configfile NuGet.config --nologo -p:NuGetAuditMode=all -p:NuGetAuditLevel=low -p:TreatWarningsAsErrors=true",
+        "dotnet restore Example.sln -p:CustomAfterMicrosoftCommonTargets=publish.targets")]
+    [InlineData(
+        ValidationCommand,
+        "nugetready check --config nugetready.json --artifacts artifacts/release --format json")]
+    public void Mutating_a_supported_validation_command_never_remains_certifiable(string original, string replacement)
+    {
+        using var repository = WorkflowRepository.Create("release.yml", Mutate(ReleaseWorkflow, original, replacement));
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+        Assert.Contains(findings, finding => finding.IsError && finding.Message.Contains("closed command profile", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void Additional_tool_acquisition_source_is_blocking()
+    {
+        using var repository = WorkflowRepository.Create("release.yml", ReleaseWorkflow);
+        repository.WriteFile("NuGet.config", """
+            <?xml version="1.0" encoding="utf-8"?>
+            <configuration>
+              <packageSources>
+                <clear />
+                <add key="nuget.org" value="https://api.nuget.org/v3/index.json" protocolVersion="3" />
+                <add key="other" value="https://packages.example.invalid/v3/index.json" protocolVersion="3" />
+              </packageSources>
+            </configuration>
+            """);
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+        Assert.Contains(findings, finding => finding.IsError && finding.Message.Contains("NuGet.config", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -1591,6 +1659,8 @@ public sealed class WorkflowPolicyTests
         AssertLimitedUnproven(WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName));
     }
 
+    private const string ValidationCommand = "./.nugetready/nugetready check --config nugetready.json --artifacts artifacts/release --format json";
+
     private const string ReleaseWorkflow = """
         name: release
         on:
@@ -1606,9 +1676,37 @@ public sealed class WorkflowPolicyTests
               KEELMATRIX_NO_TELEMETRY: '1'
               DOTNET_CLI_TELEMETRY_OPTOUT: '1'
             steps:
+              - name: Check out source at the triggering tag
+                uses: actions/checkout@v6
+                with:
+                  fetch-depth: 0
+                  ref: ${{ github.ref }}
+                  persist-credentials: false
+              - name: Set up .NET SDK
+                uses: actions/setup-dotnet@v5
+                with:
+                  global-json-file: global.json
+              - name: Restore from controlled sources and audit dependencies
+                shell: pwsh
+                run: dotnet restore Example.sln --configfile NuGet.config --nologo -p:NuGetAuditMode=all -p:NuGetAuditLevel=low -p:TreatWarningsAsErrors=true
+              - name: Verify format
+                shell: pwsh
+                run: dotnet format Example.sln --verify-no-changes --no-restore --verbosity minimal
+              - name: Build Release
+                shell: pwsh
+                run: dotnet build Example.sln --configuration Release --no-restore --nologo -p:UseSharedCompilation=false
+              - name: Run release tests
+                shell: pwsh
+                run: dotnet test Example.sln --configuration Release --no-build --no-restore --nologo --logger "console;verbosity=minimal"
+              - name: Pack the exact release artifacts
+                shell: pwsh
+                run: dotnet pack src/Example/Example.csproj --configuration Release --no-build --no-restore --include-symbols -p:SymbolPackageFormat=snupkg -p:ImportDirectoryBuildTargets=false -p:ImportDirectoryTargets=false --output artifacts/release --nologo -p:UseSharedCompilation=false
+              - name: Install the pinned NuGetReady tool
+                shell: pwsh
+                run: dotnet tool install KeelMatrix.NuGetReady --version 0.1.0 --tool-path .nugetready --configfile NuGet.config --add-source artifacts/release --no-cache --verbosity minimal
               - name: Validate exact artifacts
                 shell: pwsh
-                run: dotnet run --project src/KeelMatrix.NuGetReady/KeelMatrix.NuGetReady.csproj --configuration Release --no-build --no-restore -- check --config nugetready.json --artifacts artifacts/release --format json
+                run: ./.nugetready/nugetready check --config nugetready.json --artifacts artifacts/release --format json
               - name: Upload exact artifacts
                 uses: actions/upload-artifact@v4
                 with:
@@ -1672,6 +1770,15 @@ internal sealed class WorkflowRepository : IDisposable
         var root = Directory.CreateTempSubdirectory("nugetready-workflow-");
         var directory = Directory.CreateDirectory(Path.Combine(root.FullName, ".github", "workflows"));
         File.WriteAllText(Path.Combine(directory.FullName, fileName), content);
+        File.WriteAllText(Path.Combine(root.FullName, "NuGet.config"), """
+            <?xml version="1.0" encoding="utf-8"?>
+            <configuration>
+              <packageSources>
+                <clear />
+                <add key="nuget.org" value="https://api.nuget.org/v3/index.json" protocolVersion="3" />
+              </packageSources>
+            </configuration>
+            """);
         File.WriteAllText(Path.Combine(root.FullName, "nugetready.json"), """
             {
               "schemaVersion": 1,
