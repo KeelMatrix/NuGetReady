@@ -85,11 +85,11 @@ internal static class WorkflowPolicyInspector
         "statuses",
         "vulnerability-alerts"
     };
-    private static readonly HashSet<string> CredentialBindingNames = new(StringComparer.Ordinal)
+    private static readonly HashSet<string> CredentialBindingTokens = new(StringComparer.Ordinal)
     {
-        "NUGET_API_KEY",
-        "API_KEY",
-        "ACCESS_TOKEN",
+        "NUGETAPIKEY",
+        "APIKEY",
+        "ACCESSTOKEN",
         "AUTHORIZATION",
         "PASSWORD",
         "SECRET",
@@ -1785,12 +1785,217 @@ internal static class WorkflowPolicyInspector
                step.Uses?.Contains("nuget/login@", StringComparison.OrdinalIgnoreCase) == true;
     }
 
-    private static bool ContainsLongLivedCredential(string? run)
+    private static bool ContainsLongLivedCredential(string? value)
     {
-        return run is not null && Regex.IsMatch(
-            run,
-            @"\bsecrets\b",
-            RegexOptions.IgnoreCase);
+        return value is not null && ContainsCredentialExpressionReference(value);
+    }
+
+    private static bool ContainsCredentialExpressionReference(string value)
+    {
+        var searchIndex = 0;
+        while (searchIndex < value.Length)
+        {
+            var expressionStart = value.IndexOf("${{", searchIndex, StringComparison.Ordinal);
+            if (expressionStart < 0)
+            {
+                return false;
+            }
+
+            var expressionEnd = FindExpressionEnd(value, expressionStart + 3);
+            if (expressionEnd < 0)
+            {
+                return false;
+            }
+
+            if (ContainsCredentialExpressionReference(value.AsSpan(expressionStart + 3, expressionEnd - expressionStart - 3)))
+            {
+                return true;
+            }
+
+            searchIndex = expressionEnd + 2;
+        }
+
+        return false;
+    }
+
+    private static int FindExpressionEnd(string value, int searchIndex)
+    {
+        while (searchIndex < value.Length - 1)
+        {
+            if (value[searchIndex] is '\'' or '"')
+            {
+                searchIndex = SkipExpressionString(value.AsSpan(), searchIndex);
+                continue;
+            }
+
+            if (value[searchIndex] == '}' && value[searchIndex + 1] == '}')
+            {
+                return searchIndex;
+            }
+
+            searchIndex++;
+        }
+
+        return -1;
+    }
+
+    private static bool ContainsCredentialExpressionReference(ReadOnlySpan<char> expression)
+    {
+        for (var index = 0; index < expression.Length;)
+        {
+            if (expression[index] is '\'' or '"')
+            {
+                index = SkipExpressionString(expression, index);
+                continue;
+            }
+
+            if (!IsExpressionIdentifierStart(expression[index]))
+            {
+                index++;
+                continue;
+            }
+
+            var identifierStart = index++;
+            while (index < expression.Length && IsExpressionIdentifierCharacter(expression[index]))
+            {
+                index++;
+            }
+
+            var context = expression[identifierStart..index];
+            if (IsPropertyAccess(expression, identifierStart))
+            {
+                continue;
+            }
+
+            if (context.Equals("secrets", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            if (!IsSupportedCredentialMemberContext(context))
+            {
+                continue;
+            }
+
+            var memberIndex = index;
+            SkipExpressionWhitespace(expression, ref memberIndex);
+            if (memberIndex < expression.Length && expression[memberIndex] == '.')
+            {
+                memberIndex++;
+                SkipExpressionWhitespace(expression, ref memberIndex);
+                var memberStart = memberIndex;
+                while (memberIndex < expression.Length && IsExpressionIdentifierCharacter(expression[memberIndex]))
+                {
+                    memberIndex++;
+                }
+
+                if (memberIndex > memberStart && IsCredentialBindingName(expression[memberStart..memberIndex].ToString()))
+                {
+                    return true;
+                }
+            }
+            else if (TryReadBracketMember(expression, memberIndex, out var member) && IsCredentialBindingName(member))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool IsSupportedCredentialMemberContext(ReadOnlySpan<char> identifier)
+    {
+        return identifier.Equals("vars", StringComparison.OrdinalIgnoreCase) ||
+               identifier.Equals("inputs", StringComparison.OrdinalIgnoreCase) ||
+               identifier.Equals("env", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsPropertyAccess(ReadOnlySpan<char> expression, int identifierStart)
+    {
+        for (var index = identifierStart - 1; index >= 0; index--)
+        {
+            if (!char.IsWhiteSpace(expression[index]))
+            {
+                return expression[index] == '.';
+            }
+        }
+
+        return false;
+    }
+
+    private static bool TryReadBracketMember(ReadOnlySpan<char> expression, int index, out string member)
+    {
+        member = string.Empty;
+        SkipExpressionWhitespace(expression, ref index);
+        if (index >= expression.Length || expression[index] != '[')
+        {
+            return false;
+        }
+
+        index++;
+        SkipExpressionWhitespace(expression, ref index);
+        if (index >= expression.Length || expression[index] is not ('\'' or '"'))
+        {
+            return false;
+        }
+
+        var quote = expression[index++];
+        var memberStart = index;
+        while (index < expression.Length && expression[index] != quote)
+        {
+            index++;
+        }
+
+        if (index >= expression.Length)
+        {
+            return false;
+        }
+
+        member = expression[memberStart..index].ToString();
+        index++;
+        SkipExpressionWhitespace(expression, ref index);
+        return index < expression.Length && expression[index] == ']';
+    }
+
+    private static int SkipExpressionString(ReadOnlySpan<char> expression, int index)
+    {
+        var quote = expression[index++];
+        while (index < expression.Length)
+        {
+            if (expression[index] != quote)
+            {
+                index++;
+                continue;
+            }
+
+            if (quote == '\'' && index + 1 < expression.Length && expression[index + 1] == '\'')
+            {
+                index += 2;
+                continue;
+            }
+
+            return index + 1;
+        }
+
+        return expression.Length;
+    }
+
+    private static void SkipExpressionWhitespace(ReadOnlySpan<char> expression, ref int index)
+    {
+        while (index < expression.Length && char.IsWhiteSpace(expression[index]))
+        {
+            index++;
+        }
+    }
+
+    private static bool IsExpressionIdentifierStart(char character)
+    {
+        return char.IsLetter(character) || character == '_';
+    }
+
+    private static bool IsExpressionIdentifierCharacter(char character)
+    {
+        return char.IsLetterOrDigit(character) || character is '_' or '-';
     }
 
     private static bool ContainsLongLivedCredential(IReadOnlyDictionary<string, string> environment)
@@ -1805,8 +2010,10 @@ internal static class WorkflowPolicyInspector
 
     private static bool IsCredentialBindingName(string name)
     {
-        var canonicalName = name.Trim().Replace('-', '_').ToUpperInvariant();
-        return CredentialBindingNames.Contains(canonicalName);
+        var token = name.Trim().Replace("-", string.Empty, StringComparison.Ordinal)
+            .Replace("_", string.Empty, StringComparison.Ordinal)
+            .ToUpperInvariant();
+        return CredentialBindingTokens.Contains(token);
     }
 
     private static bool HasPublicationCapability(WorkflowDocument workflow, WorkflowJob job)
@@ -1837,7 +2044,7 @@ internal static class WorkflowPolicyInspector
         if (HasPublicationCapability(effectivePermissions) ||
             job.HasSecretBinding ||
             ContainsLongLivedCredential(job.Inputs) ||
-            ContainsLongLivedCredential(MergeEnvironment(workflow.Environment, job.Environment)))
+            (activeSteps.Length == 0 && ContainsLongLivedCredential(MergeEnvironment(workflow.Environment, job.Environment))))
         {
             return true;
         }

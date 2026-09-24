@@ -49,6 +49,10 @@ public sealed class CliContractTests
         Assert.Contains("dependency and artifact-producer job", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("Omitted effective permissions", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("NUGET_API_KEY, API_KEY, ACCESS_TOKEN, AUTHORIZATION, PASSWORD, SECRET, and CREDENTIAL", CliParser.HelpText, StringComparison.Ordinal);
+        Assert.Contains("separator-free, case-insensitive token equality", CliParser.HelpText, StringComparison.Ordinal);
+        Assert.Contains("vars.*, inputs.*, and env.*", CliParser.HelpText, StringComparison.Ordinal);
+        Assert.Contains("before each active step is evaluated", CliParser.HelpText, StringComparison.Ordinal);
+        Assert.Contains("literal paths or prose containing the word secrets do not imply the context", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("without a recognized credential binding stays outside", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("error/exit 2", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("warnings never create release confidence", CliParser.HelpText, StringComparison.Ordinal);

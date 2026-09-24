@@ -948,17 +948,34 @@ public sealed class WorkflowPolicyTests
                 }
             ]
         };
+        var releaseWorkflow = Mutate(
+            ReleaseWorkflow,
+            "KeelMatrix.NuGetReady.1.0.0.nupkg",
+            Path.GetFileName(package));
+        releaseWorkflow = Mutate(
+            releaseWorkflow,
+            "KeelMatrix.NuGetReady.1.0.0.snupkg",
+            Path.GetFileName(Path.ChangeExtension(package, ".snupkg")));
         var probes = new[]
         {
             (Name: "literal environment", Map: "env", Binding: "NUGET_API_KEY", Value: "literal-credential"),
             (Name: "vars environment", Map: "env", Binding: "NUGET_API_KEY", Value: "${{ vars.NUGET_API_KEY }}"),
             (Name: "literal action input", Map: "with", Binding: "api-key", Value: "literal-credential"),
-            (Name: "vars action input", Map: "with", Binding: "api-key", Value: "${{ vars.NUGET_API_KEY }}")
+            (Name: "vars action input", Map: "with", Binding: "api-key", Value: "${{ vars.NUGET_API_KEY }}"),
+            (Name: "camel-case NuGet API key", Map: "with", Binding: "NuGetApiKey", Value: "literal-credential"),
+            (Name: "separator-free NuGet API key", Map: "with", Binding: "nugetapikey", Value: "literal-credential"),
+            (Name: "camel-case API key", Map: "with", Binding: "ApiKey", Value: "literal-credential"),
+            (Name: "camel-case access token", Map: "with", Binding: "AccessToken", Value: "literal-credential"),
+            (Name: "neutral vars member binding", Map: "with", Binding: "note", Value: "${{ vars.NUGET_API_KEY }}"),
+            (Name: "inputs member control", Map: "with", Binding: "nuget-api-key", Value: "${{ inputs.nuget_api_key }}"),
+            (Name: "literal access-token control", Map: "with", Binding: "access-token", Value: "literal-credential"),
+            (Name: "trimmed quoted API key control", Map: "with", Binding: "\" API_KEY \"", Value: "literal-credential")
         };
 
         foreach (var probe in probes)
         {
-            using var repository = WorkflowRepository.Create("ci.yml", $"""
+            using var repository = WorkflowRepository.Create("release.yml", releaseWorkflow);
+            repository.WriteWorkflow("ci.yml", $"""
                 name: continuous integration
                 on:
                   pull_request:
@@ -971,13 +988,16 @@ public sealed class WorkflowPolicyTests
                         {probe.Map}:
                           {probe.Binding}: {probe.Value}
                 """);
+            var configPath = Path.Combine(repository.Root.FullName, "nugetready.json");
+            repository.WriteFile("nugetready.json", System.Text.Json.JsonSerializer.Serialize(config));
 
             var report = CheckRunner.Run(
                 config,
                 corpus.OutputPath,
                 repository.Root.FullName,
                 TimeSpan.FromMinutes(2),
-                new ConsumerRehearsalOptions(PublicFeedPath: corpus.OutputPath));
+                new ConsumerRehearsalOptions(PublicFeedPath: corpus.OutputPath),
+                configPath);
 
             Assert.True(
                 report.Status == "error" && report.ExitCode == 2,
@@ -988,14 +1008,85 @@ public sealed class WorkflowPolicyTests
     }
 
     [Theory]
+    [InlineData("api-key-path", "artifacts/key.txt")]
+    [InlineData("ApiKeyPath", "artifacts/key.txt")]
+    [InlineData("cache-path", ".secrets/cache")]
+    [InlineData("note", "documentation-secrets-reference")]
+    [InlineData("note", "NUGET_API_KEY")]
+    [InlineData("note", "vars.NUGET_API_KEY")]
+    public void Safe_credential_boundary_probes_preserve_a_valid_release_result(
+        string bindingName,
+        string bindingValue)
+    {
+        using var corpus = PackedCorpus.Create();
+        var package = corpus.Pack("Standard/Standard.csproj");
+        var symbolPackage = Path.ChangeExtension(package, ".snupkg");
+        var config = new NuGetReadyConfig
+        {
+            SchemaVersion = 1,
+            Packages =
+            [
+                new PackageExpectation
+                {
+                    Id = "Fixture.Standard",
+                    Kind = "library",
+                    Version = "1.0.0",
+                    Artifacts = [Path.GetFileName(package), Path.GetFileName(symbolPackage)]
+                }
+            ]
+        };
+        var workflow = Mutate(
+            ReleaseWorkflow,
+            "KeelMatrix.NuGetReady.1.0.0.nupkg",
+            Path.GetFileName(package));
+        workflow = Mutate(
+            workflow,
+            "KeelMatrix.NuGetReady.1.0.0.snupkg",
+            Path.GetFileName(symbolPackage));
+        using var repository = WorkflowRepository.Create("release.yml", workflow);
+        repository.WriteWorkflow("ci.yml", $$"""
+            name: continuous integration
+            on:
+              pull_request:
+            permissions: {}
+            jobs:
+              build:
+                steps:
+                  - uses: owner/repository/action@v1
+                    with:
+                      {{bindingName}}: {{bindingValue}}
+            """);
+        var configPath = Path.Combine(repository.Root.FullName, "nugetready.json");
+        repository.WriteFile("nugetready.json", System.Text.Json.JsonSerializer.Serialize(config));
+
+        var report = CheckRunner.Run(
+            config,
+            corpus.OutputPath,
+            repository.Root.FullName,
+            TimeSpan.FromMinutes(2),
+            new ConsumerRehearsalOptions(PublicFeedPath: corpus.OutputPath),
+            configPath);
+
+        Assert.True(
+            report.Status == "pass" && report.ExitCode == 0,
+            $"Binding '{bindingName}: {bindingValue}' returned status={report.Status}, exitCode={report.ExitCode}; failures={string.Join(" | ", report.Failures.Select(failure => failure.Message))}");
+        Assert.Equal("pass", report.Checks.Single(check => check.Id == "workflow-policy").Status);
+    }
+
+    [Theory]
     [InlineData("NUGET_API_KEY")]
+    [InlineData("NuGetApiKey")]
+    [InlineData("nugetapikey")]
     [InlineData("API_KEY")]
+    [InlineData("ApiKey")]
     [InlineData("api-key")]
     [InlineData("ACCESS_TOKEN")]
+    [InlineData("AccessToken")]
     [InlineData("authorization")]
     [InlineData("PASSWORD")]
     [InlineData("secret")]
     [InlineData("CREDENTIAL")]
+    [InlineData("\" API_KEY \"")]
     public void Bounded_credential_binding_name_family_enters_publication_policy(string bindingName)
     {
         using var repository = WorkflowRepository.Create("ci.yml", $"""
@@ -1015,6 +1106,294 @@ public sealed class WorkflowPolicyTests
         var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
 
         AssertLimitedUnproven(inspection);
+    }
+
+    [Theory]
+    [InlineData("${{ vars.NUGET_API_KEY }}")]
+    [InlineData("${{ vars.NuGetApiKey }}")]
+    [InlineData("${{ inputs.ApiKey }}")]
+    [InlineData("${{ env.AccessToken }}")]
+    [InlineData("prefix-${{ vars['api-key'] }}-suffix")]
+    [InlineData("${{ inputs[\"ACCESS_TOKEN\"] }}")]
+    [InlineData("${{ format('}}') || vars.ApiKey }}")]
+    public void Credential_shaped_member_reference_enters_publication_policy(string value)
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", $$"""
+            name: continuous integration
+            on:
+              pull_request:
+            permissions: {}
+            jobs:
+              build:
+                steps:
+                  - uses: owner/repository/action@v1
+                    with:
+                      note: {{value}}
+            """);
+
+        AssertLimitedUnproven(WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName));
+    }
+
+    [Theory]
+    [InlineData(".secrets/cache")]
+    [InlineData("documentation-secrets-reference")]
+    [InlineData("secrets")]
+    [InlineData("${{ format('documentation-secrets-reference') }}")]
+    [InlineData("${{ 'secrets.NUGET_API_KEY' }}")]
+    public void Literal_secrets_text_keeps_read_only_ci_outside_release_policy(string value)
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", $$"""
+            name: continuous integration
+            on:
+              pull_request:
+            permissions: {}
+            jobs:
+              build:
+                steps:
+                  - uses: owner/repository/action@v1
+                    with:
+                      note: {{value}}
+            """);
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        Assert.False(inspection.Evaluated);
+        Assert.Empty(inspection.Failures);
+    }
+
+    [Theory]
+    [InlineData("workflow-to-job", true)]
+    [InlineData("workflow-to-job", false)]
+    [InlineData("workflow-to-step", true)]
+    [InlineData("workflow-to-step", false)]
+    [InlineData("job-to-step", true)]
+    [InlineData("job-to-step", false)]
+    public void Effective_environment_overrides_determine_credential_capability(
+        string overridePath,
+        bool credentialInOuterScope)
+    {
+        const string credential = "${{ secrets.READ_ONLY_INPUT }}";
+        const string literal = "ordinary-literal";
+        var outerValue = credentialInOuterScope ? credential : literal;
+        var innerValue = credentialInOuterScope ? literal : credential;
+        var workflow = overridePath switch
+        {
+            "workflow-to-job" => $$"""
+                name: continuous integration
+                on:
+                  pull_request:
+                permissions: {}
+                env:
+                  NEUTRAL_VALUE: {{outerValue}}
+                jobs:
+                  build:
+                    env:
+                      NEUTRAL_VALUE: {{innerValue}}
+                    steps:
+                      - uses: owner/repository/action@v1
+                """,
+            "workflow-to-step" => $$"""
+                name: continuous integration
+                on:
+                  pull_request:
+                permissions: {}
+                env:
+                  NEUTRAL_VALUE: {{outerValue}}
+                jobs:
+                  build:
+                    steps:
+                      - uses: owner/repository/action@v1
+                        env:
+                          NEUTRAL_VALUE: {{innerValue}}
+                """,
+            _ => $$"""
+                name: continuous integration
+                on:
+                  pull_request:
+                permissions: {}
+                jobs:
+                  build:
+                    env:
+                      NEUTRAL_VALUE: {{outerValue}}
+                    steps:
+                      - uses: owner/repository/action@v1
+                        env:
+                          NEUTRAL_VALUE: {{innerValue}}
+                """
+        };
+        using var repository = WorkflowRepository.Create("ci.yml", workflow);
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        if (credentialInOuterScope)
+        {
+            Assert.False(inspection.Evaluated);
+            Assert.Empty(inspection.Failures);
+        }
+        else
+        {
+            AssertLimitedUnproven(inspection);
+        }
+    }
+
+    [Fact]
+    public void Effective_environment_override_probes_update_the_complete_readiness_result()
+    {
+        using var corpus = PackedCorpus.Create();
+        var package = corpus.Pack("Standard/Standard.csproj");
+        var symbolPackage = Path.ChangeExtension(package, ".snupkg");
+        var config = new NuGetReadyConfig
+        {
+            SchemaVersion = 1,
+            Packages =
+            [
+                new PackageExpectation
+                {
+                    Id = "Fixture.Standard",
+                    Kind = "library",
+                    Version = "1.0.0",
+                    Artifacts = [Path.GetFileName(package), Path.GetFileName(symbolPackage)]
+                }
+            ]
+        };
+        var releaseWorkflow = Mutate(
+            ReleaseWorkflow,
+            "KeelMatrix.NuGetReady.1.0.0.nupkg",
+            Path.GetFileName(package));
+        releaseWorkflow = Mutate(
+            releaseWorkflow,
+            "KeelMatrix.NuGetReady.1.0.0.snupkg",
+            Path.GetFileName(symbolPackage));
+        var probes = new[]
+        {
+            (OverridePath: "workflow-to-job", CredentialInOuterScope: true),
+            (OverridePath: "workflow-to-job", CredentialInOuterScope: false),
+            (OverridePath: "workflow-to-step", CredentialInOuterScope: true),
+            (OverridePath: "workflow-to-step", CredentialInOuterScope: false),
+            (OverridePath: "job-to-step", CredentialInOuterScope: true),
+            (OverridePath: "job-to-step", CredentialInOuterScope: false)
+        };
+
+        foreach (var probe in probes)
+        {
+            const string credential = "${{ secrets.READ_ONLY_INPUT }}";
+            const string literal = "ordinary-literal";
+            var outerValue = probe.CredentialInOuterScope ? credential : literal;
+            var innerValue = probe.CredentialInOuterScope ? literal : credential;
+            var ciWorkflow = probe.OverridePath switch
+            {
+                "workflow-to-job" => $$"""
+                    name: continuous integration
+                    on:
+                      pull_request:
+                    permissions: {}
+                    env:
+                      NEUTRAL_VALUE: {{outerValue}}
+                    jobs:
+                      build:
+                        env:
+                          NEUTRAL_VALUE: {{innerValue}}
+                        steps:
+                          - uses: owner/repository/action@v1
+                    """,
+                "workflow-to-step" => $$"""
+                    name: continuous integration
+                    on:
+                      pull_request:
+                    permissions: {}
+                    env:
+                      NEUTRAL_VALUE: {{outerValue}}
+                    jobs:
+                      build:
+                        steps:
+                          - uses: owner/repository/action@v1
+                            env:
+                              NEUTRAL_VALUE: {{innerValue}}
+                    """,
+                _ => $$"""
+                    name: continuous integration
+                    on:
+                      pull_request:
+                    permissions: {}
+                    jobs:
+                      build:
+                        env:
+                          NEUTRAL_VALUE: {{outerValue}}
+                        steps:
+                          - uses: owner/repository/action@v1
+                            env:
+                              NEUTRAL_VALUE: {{innerValue}}
+                    """
+            };
+            using var repository = WorkflowRepository.Create("release.yml", releaseWorkflow);
+            repository.WriteWorkflow("ci.yml", ciWorkflow);
+            var configPath = Path.Combine(repository.Root.FullName, "nugetready.json");
+            repository.WriteFile("nugetready.json", System.Text.Json.JsonSerializer.Serialize(config));
+
+            var report = CheckRunner.Run(
+                config,
+                corpus.OutputPath,
+                repository.Root.FullName,
+                TimeSpan.FromMinutes(2),
+                new ConsumerRehearsalOptions(PublicFeedPath: corpus.OutputPath),
+                configPath);
+            var expectedStatus = probe.CredentialInOuterScope ? "pass" : "error";
+            var expectedExitCode = probe.CredentialInOuterScope ? 0 : 2;
+
+            Assert.True(
+                report.Status == expectedStatus && report.ExitCode == expectedExitCode,
+                $"Probe '{probe.OverridePath}' with credentialInOuterScope={probe.CredentialInOuterScope} returned status={report.Status}, exitCode={report.ExitCode}; failures={string.Join(" | ", report.Failures.Select(failure => failure.Message))}");
+            Assert.Equal(expectedStatus, report.Checks.Single(check => check.Id == "workflow-policy").Status);
+        }
+    }
+
+    [Theory]
+    [InlineData("${{ vars.ApiKeyPath }}")]
+    [InlineData("${{ inputs.AccessTokenizer }}")]
+    [InlineData("${{ env.CredentialHelper }}")]
+    [InlineData("${{ vars['NuGetApiKeyFile'] }}")]
+    [InlineData("${{ format('vars.NUGET_API_KEY') }}")]
+    public void Credential_member_near_misses_keep_read_only_ci_outside_release_policy(string value)
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", $$"""
+            name: continuous integration
+            on:
+              pull_request:
+            permissions: {}
+            jobs:
+              build:
+                steps:
+                  - uses: owner/repository/action@v1
+                    with:
+                      note: {{value}}
+            """);
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        Assert.False(inspection.Evaluated);
+        Assert.Empty(inspection.Failures);
+    }
+
+    [Fact]
+    public void Inherited_job_credential_remains_effective_when_any_active_step_does_not_override_it()
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", """
+            name: continuous integration
+            on:
+              pull_request:
+            permissions: {}
+            jobs:
+              build:
+                env:
+                  NEUTRAL_VALUE: ${{ secrets.READ_ONLY_INPUT }}
+                steps:
+                  - uses: owner/repository/action@v1
+                    env:
+                      NEUTRAL_VALUE: ordinary-literal
+                  - uses: owner/repository/another-action@v1
+            """);
+
+        AssertLimitedUnproven(WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName));
     }
 
     [Theory]
@@ -1111,6 +1490,7 @@ public sealed class WorkflowPolicyTests
                     with:
                       nuget-api-key-file: artifacts/key.txt
                       api-key-path: artifacts/key.txt
+                      ApiKeyPath: artifacts/key.txt
                       access-tokenizer: enabled
                       authorization-policy: read-only
                       passwordless: enabled
