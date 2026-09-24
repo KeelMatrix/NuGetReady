@@ -33,22 +33,24 @@ public sealed class CliContractTests
     public void Help_documents_the_conservative_workflow_soundness_boundary()
     {
         Assert.Contains("closed-world 0.1.0 release profile", CliParser.HelpText, StringComparison.Ordinal);
+        Assert.Contains("exact tag v<configured version>", CliParser.HelpText, StringComparison.Ordinal);
+        Assert.Contains("configured artifact filenames", CliParser.HelpText, StringComparison.Ordinal);
+        Assert.Contains("packed nuspec ID/version", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("validated-release-artifacts", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("NuGet/login@v1", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("/tmp/nugetready-tool", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("/tmp/nugetready-tool/nugetready check", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("exclusive source selection", CliParser.HelpText, StringComparison.Ordinal);
-        Assert.Contains("maps only the tool ID", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("fresh-runner validator", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("fixed runner-controlled", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("exact cross-platform casing", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("exact repository-root nugetready.json", CliParser.HelpText, StringComparison.Ordinal);
-        Assert.Contains("effective publication capability", CliParser.HelpText, StringComparison.Ordinal);
-        Assert.Contains("explicit effective permissions", CliParser.HelpText, StringComparison.Ordinal);
-        Assert.Contains("whole secrets context", CliParser.HelpText, StringComparison.Ordinal);
-        Assert.Contains("unknown or unsupported publication-relevant node", CliParser.HelpText, StringComparison.Ordinal);
+        Assert.Contains("capability-and-reachability boundary", CliParser.HelpText, StringComparison.Ordinal);
+        Assert.Contains("dependency and artifact-producer job", CliParser.HelpText, StringComparison.Ordinal);
+        Assert.Contains("Omitted effective permissions", CliParser.HelpText, StringComparison.Ordinal);
+        Assert.Contains("credential-free, read-only CI stays outside", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("error/exit 2", CliParser.HelpText, StringComparison.Ordinal);
-        Assert.Contains("never defaults to safe", CliParser.HelpText, StringComparison.Ordinal);
+        Assert.Contains("warnings never create release confidence", CliParser.HelpText, StringComparison.Ordinal);
     }
 
     [Fact]

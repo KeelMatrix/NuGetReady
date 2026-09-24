@@ -155,7 +155,8 @@ internal static class CheckRunner
             checkStates["dependency-coherence"] = CheckContract.NotRun;
         }
 
-        if (repositoryPath is not null && !archiveParseBlocked)
+        var releaseIdentityBlocked = HasBlockingFailure(failures["archive-metadata"]);
+        if (repositoryPath is not null && !archiveParseBlocked && !releaseIdentityBlocked)
         {
             var workflowInspection = WorkflowPolicyInspector.InspectDetailed(repositoryPath, config, configPath);
             foreach (var failure in workflowInspection.Failures)

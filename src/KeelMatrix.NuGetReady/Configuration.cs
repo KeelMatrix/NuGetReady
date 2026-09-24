@@ -180,6 +180,19 @@ internal static partial class ConfigurationLoader
                 }
             }
 
+            var normalizedVersion = VersionText.Normalize(package.Version);
+            var expectedPrimary = $"{package.Id}.{normalizedVersion}.nupkg";
+            var primary = PackageArtifacts.Primary(package);
+            var symbols = package.Artifacts.SingleOrDefault(artifact =>
+                artifact.EndsWith(".snupkg", StringComparison.OrdinalIgnoreCase));
+            if (!string.Equals(primary, expectedPrimary, StringComparison.Ordinal) ||
+                (symbols is not null &&
+                 !string.Equals(symbols, $"{package.Id}.{normalizedVersion}.snupkg", StringComparison.Ordinal)))
+            {
+                throw new NuGetReadyInputException(
+                    $"Artifact filenames for package '{package.Id}' must bind exactly to configured version '{normalizedVersion}'.");
+            }
+
             if (package.Smoke is not null && (package.Smoke.Count > 20 || package.Smoke.Any(argument => argument is null || argument.Length > 200)))
             {
                 throw new NuGetReadyInputException("Tool smoke arguments are too large.");

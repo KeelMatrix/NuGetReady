@@ -63,6 +63,28 @@ public sealed class ConfigurationContractTests
     }
 
     [Fact]
+    public void Artifact_filenames_must_bind_to_the_configured_package_identity_and_version()
+    {
+        using var fixture = PackageFixture.Create();
+        var path = WriteConfig(fixture, """
+            {
+              "schemaVersion": 1,
+              "packages": [{
+                "id": "Example.Core",
+                "kind": "library",
+                "version": "1.0.0",
+                "artifacts": ["Example.Core.9.9.9.nupkg", "Example.Core.1.0.0.snupkg"]
+              }]
+            }
+            """);
+
+        var exception = Assert.Throws<NuGetReadyInputException>(() => ConfigurationLoader.Load(path));
+
+        Assert.Contains("bind exactly", exception.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("1.0.0", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Each_package_must_have_one_primary_and_at_most_one_symbol_archive()
     {
         using var fixture = PackageFixture.Create();

@@ -23,6 +23,60 @@ public sealed class WorkflowPolicyTests
     }
 
     [Fact]
+    public void Broad_version_tag_without_release_identity_binding_is_blocking()
+    {
+        using var repository = WorkflowRepository.Create(
+            "release.yml",
+            ReleaseWorkflow.Replace("v1.0.0", "v*.*.*", StringComparison.Ordinal));
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+        Assert.Contains(findings, finding =>
+            finding.Message.Contains("release version", StringComparison.OrdinalIgnoreCase) ||
+            finding.Message.Contains("release identity", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void Exact_tag_for_a_different_configured_version_is_blocking()
+    {
+        using var repository = WorkflowRepository.Create(
+            "release.yml",
+            ReleaseWorkflow.Replace("v1.0.0", "v9.9.9", StringComparison.Ordinal));
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+        Assert.Contains(findings, finding =>
+            finding.Message.Contains("v9.9.9", StringComparison.Ordinal) &&
+            finding.Message.Contains("1.0.0", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Configured_artifact_filename_for_a_different_version_is_blocking()
+    {
+        using var repository = WorkflowRepository.Create("release.yml", ReleaseWorkflow);
+        var config = new NuGetReadyConfig
+        {
+            SchemaVersion = 1,
+            Packages =
+            [
+                new PackageExpectation
+                {
+                    Id = "KeelMatrix.NuGetReady",
+                    Kind = "dotnetTool",
+                    Version = "1.0.0",
+                    Artifacts = ["KeelMatrix.NuGetReady.9.9.9.nupkg", "KeelMatrix.NuGetReady.1.0.0.snupkg"]
+                }
+            ]
+        };
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName, config);
+
+        Assert.Contains(findings, finding =>
+            finding.Message.Contains("artifact filenames", StringComparison.OrdinalIgnoreCase) &&
+            finding.Message.Contains("1.0.0", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public void Unsupported_publication_relevant_mutations_never_remain_pass()
     {
         var mutations = new Dictionary<string, string>
@@ -432,7 +486,7 @@ public sealed class WorkflowPolicyTests
     [Fact]
     public void An_unconstrained_tag_pattern_is_not_a_version_gate()
     {
-        using var repository = WorkflowRepository.Create("release.yml", ReleaseWorkflow.Replace("v*.*.*", "*", StringComparison.Ordinal));
+        using var repository = WorkflowRepository.Create("release.yml", ReleaseWorkflow.Replace("v1.0.0", "*", StringComparison.Ordinal));
 
         var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
 
@@ -444,8 +498,8 @@ public sealed class WorkflowPolicyTests
     {
         using var repository = WorkflowRepository.Create("release.yml", Mutate(
             ReleaseWorkflow,
-            "tags: [\"v*.*.*\"]",
-            "branches: [\"main\"]\n    tags: [\"v*.*.*\"]"));
+            "tags: [\"v1.0.0\"]",
+            "branches: [\"main\"]\n    tags: [\"v1.0.0\"]"));
 
         var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
 
@@ -457,8 +511,8 @@ public sealed class WorkflowPolicyTests
     {
         using var repository = WorkflowRepository.Create("release.yml", Mutate(
             ReleaseWorkflow,
-            "tags: [\"v*.*.*\"]",
-            "tags: [\"v*.*.*\"]\n    branches-ignore: [\"main\"]"));
+            "tags: [\"v1.0.0\"]",
+            "tags: [\"v1.0.0\"]\n    branches-ignore: [\"main\"]"));
 
         var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
 
@@ -470,7 +524,7 @@ public sealed class WorkflowPolicyTests
     {
         using var repository = WorkflowRepository.Create("release.yml", Mutate(
             ReleaseWorkflow,
-            "tags: [\"v*.*.*\"]",
+            "tags: [\"v1.0.0\"]",
             "tags-ignore: [\"v0.*\"]"));
 
         var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
@@ -822,14 +876,17 @@ public sealed class WorkflowPolicyTests
         AssertLimitedUnproven(inspection);
     }
 
-    [Fact]
-    public void Ordinary_remote_action_is_limited_unproven()
+    [Theory]
+    [InlineData("permissions: {}")]
+    [InlineData("permissions:\n  contents: read")]
+    public void Unknown_action_in_credential_free_read_only_ci_stays_outside_release_policy(string permissions)
     {
-        using var repository = WorkflowRepository.Create("ci.yml", """
+        using var repository = WorkflowRepository.Create("ci.yml", $$"""
             name: continuous integration
             on:
               push:
                 branches: [main]
+            {{permissions}}
             jobs:
               build:
                 steps:
@@ -838,8 +895,139 @@ public sealed class WorkflowPolicyTests
 
         var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
 
+        Assert.False(inspection.Evaluated);
+        Assert.Empty(inspection.Failures);
+    }
+
+    [Theory]
+    [InlineData("id-token: write", null)]
+    [InlineData("contents: write", null)]
+    [InlineData(null, "PUBLISH_TOKEN: ${{ secrets.NUGET_API_KEY }}")]
+    public void Unknown_action_with_publication_capability_is_blocking(string? permission, string? environment)
+    {
+        var permissionYaml = permission is null
+            ? "permissions: {}"
+            : $"permissions:\n  {permission}";
+        var environmentYaml = environment is null
+            ? string.Empty
+            : $"    env:\n      {environment}\n";
+        using var repository = WorkflowRepository.Create("ci.yml", $$"""
+            name: continuous integration
+            on:
+              pull_request:
+            {{permissionYaml}}
+            jobs:
+              build:
+            {{environmentYaml}}    steps:
+                  - uses: owner/repository/action@v1
+            """);
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
         AssertLimitedUnproven(inspection);
         Assert.Contains(inspection.Failures, failure => failure.Message.Contains("remote action", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void Unknown_reusable_workflow_receiving_a_secret_is_blocking()
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", """
+            name: continuous integration
+            on:
+              pull_request:
+            permissions: {}
+            jobs:
+              build:
+                uses: owner/repository/.github/workflows/build.yml@v1
+                with:
+                  token: ${{ secrets.BUILD_TOKEN }}
+            """);
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        AssertLimitedUnproven(inspection);
+        Assert.Contains(inspection.Failures, failure => failure.Message.Contains("reusable workflow", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void Unknown_action_on_an_artifact_path_to_publication_is_blocking()
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", """
+            name: package publication
+            on:
+              push:
+                branches: [main]
+            permissions: {}
+            jobs:
+              produce:
+                steps:
+                  - uses: owner/repository/action@v1
+                  - uses: actions/upload-artifact@v4
+                    with:
+                      name: release-package
+                      path: artifacts/package.nupkg
+              publish:
+                permissions:
+                  contents: write
+                steps:
+                  - uses: actions/download-artifact@v4
+                    with:
+                      name: release-package
+                      path: artifacts
+                  - run: dotnet nuget push artifacts/package.nupkg
+            """);
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        AssertLimitedUnproven(inspection);
+        Assert.Contains(inspection.Failures, failure => failure.Message.Contains("remote action", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void Unknown_action_on_a_dependency_path_to_publication_is_blocking()
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", """
+            name: package publication
+            on:
+              push:
+                branches: [main]
+            permissions: {}
+            jobs:
+              prepare:
+                steps:
+                  - uses: owner/repository/action@v1
+              publish:
+                needs: prepare
+                permissions:
+                  contents: write
+                steps:
+                  - run: dotnet nuget push artifacts/package.nupkg
+            """);
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        AssertLimitedUnproven(inspection);
+        Assert.Contains(inspection.Failures, failure => failure.Message.Contains("remote action", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void Unrelated_unknown_ci_does_not_change_a_valid_release_workflow()
+    {
+        using var repository = WorkflowRepository.Create("release.yml", ReleaseWorkflow);
+        repository.WriteWorkflow("ci.yml", """
+            name: continuous integration
+            on:
+              pull_request:
+            permissions: {}
+            jobs:
+              build:
+                steps:
+                  - uses: owner/repository/action@v1
+            """);
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+        Assert.Empty(findings);
     }
 
     [Fact]
@@ -1741,6 +1929,8 @@ public sealed class WorkflowPolicyTests
             (Name: "mis-cased permission name", WorkflowPermissions: "Contents: read", JobPermissions: string.Empty),
             (Name: "unknown workflow value", WorkflowPermissions: "contents: future", JobPermissions: string.Empty),
             (Name: "unknown job value", WorkflowPermissions: "{}", JobPermissions: "contents: future"),
+            (Name: "uninspectable workflow permissions", WorkflowPermissions: "${{ vars.PERMISSIONS }}", JobPermissions: string.Empty),
+            (Name: "uninspectable job permissions", WorkflowPermissions: "{}", JobPermissions: "${{ vars.PERMISSIONS }}"),
             (Name: "invalid id-token read value", WorkflowPermissions: "id-token: read", JobPermissions: string.Empty),
             (Name: "invalid vulnerability-alerts write value", WorkflowPermissions: "{}", JobPermissions: "vulnerability-alerts: write")
         };
@@ -2080,7 +2270,7 @@ public sealed class WorkflowPolicyTests
         name: release
         on:
           push:
-            tags: ["v*.*.*"]
+            tags: ["v1.0.0"]
         permissions:
           contents: read
         jobs:

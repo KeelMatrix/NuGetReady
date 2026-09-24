@@ -13,6 +13,17 @@ public sealed class ReleaseWorkflowContractTests
     }
 
     [Fact]
+    public void Current_release_workflow_binds_the_trigger_to_the_configured_release_version()
+    {
+        var root = FindRepositoryRoot();
+        var workflow = File.ReadAllText(Path.Combine(root, ".github", "workflows", "release.yml"));
+
+        Assert.Contains("tags:\n      - 'v0.1.0'", workflow, StringComparison.Ordinal);
+        Assert.DoesNotContain("v*.*.*", workflow, StringComparison.Ordinal);
+        Assert.Contains("Run release tests and validate the tag contract", workflow, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Release_workflow_publishes_symbols_exactly_once()
     {
         var root = FindRepositoryRoot();

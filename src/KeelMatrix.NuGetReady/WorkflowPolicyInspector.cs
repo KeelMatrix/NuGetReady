@@ -189,52 +189,94 @@ internal static class WorkflowPolicyInspector
 
     private static bool LooksLikeReleaseWorkflow(string repositoryPath, string path, WorkflowDocument workflow)
     {
-        if (workflow.HasPublicationShapedTrigger ||
-            workflow.HasPublicationInput ||
-            workflow.HasUninspectableStructure ||
-            HasPublicationCapability(workflow) ||
-            workflow.Jobs.Any(job => IsDirectPublicationJob(job) ||
-                                     job.Steps.Any(IsPublicationRelevantStep) ||
-                                     job.Steps.Any(step => HasIndirectPublicationPath(repositoryPath, step))))
-        {
-            return true;
-        }
-
-        return workflow.Jobs.Any(job => IsReleaseLikePublicationJob(repositoryPath, path, workflow, job));
+        return BuildPublicationBoundary(repositoryPath, workflow).Count > 0 ||
+               (workflow.HasUninspectableControlStructure &&
+                (HasReleasePublicationSignal(Path.GetFileNameWithoutExtension(path)) ||
+                 HasReleasePublicationSignal(workflow.Name)));
     }
 
-    private static bool IsReleaseLikePublicationJob(string repositoryPath, string path, WorkflowDocument workflow, WorkflowJob job)
+    private static HashSet<WorkflowJob> BuildPublicationBoundary(string repositoryPath, WorkflowDocument workflow)
     {
-        if (IsExplicitlyDisabled(job.Condition))
+        var activeJobs = workflow.Jobs
+            .Where(job => !IsExplicitlyDisabled(job.Condition))
+            .ToArray();
+        var boundary = new HashSet<WorkflowJob>();
+        var indirectContext = new IndirectInspectionContext();
+
+        var hasReleaseControl = workflow.HasPublicationShapedTrigger ||
+                                workflow.HasPublicationInput ||
+                                workflow.TagPatterns.Count > 0;
+        foreach (var job in activeJobs)
+        {
+            if (hasReleaseControl ||
+                IsDirectPublicationJob(job) ||
+                job.Steps.Any(IsPublicationRelevantStep) ||
+                job.Steps.Any(step =>
+                    InspectIndirectPublicationPath(repositoryPath, step, indirectContext) == IndirectPublicationPath.Publication) ||
+                HasPublicationCapability(workflow, job))
+            {
+                boundary.Add(job);
+            }
+        }
+
+        var jobsById = activeJobs.ToDictionary(job => job.Id, StringComparer.OrdinalIgnoreCase);
+        var artifactProducers = activeJobs
+            .SelectMany(job => job.Steps
+                .Where(step => !IsExplicitlyDisabled(step.Condition) && IsArtifactAction(step, "actions/upload-artifact"))
+                .Select(step => (Job: job, Name: GetArtifactName(step))))
+            .ToArray();
+
+        var changed = true;
+        while (changed)
+        {
+            changed = false;
+            foreach (var job in boundary.ToArray())
+            {
+                foreach (var dependency in job.DependsOn)
+                {
+                    if (jobsById.TryGetValue(dependency, out var dependencyJob))
+                    {
+                        changed |= boundary.Add(dependencyJob);
+                    }
+                }
+
+                foreach (var download in job.Steps.Where(step =>
+                             !IsExplicitlyDisabled(step.Condition) &&
+                             IsArtifactAction(step, "actions/download-artifact")))
+                {
+                    var downloadedName = GetArtifactName(download);
+                    foreach (var producer in artifactProducers.Where(candidate =>
+                                 downloadedName is null ||
+                                 candidate.Name is null ||
+                                 string.Equals(candidate.Name, downloadedName, StringComparison.Ordinal)))
+                    {
+                        changed |= boundary.Add(producer.Job);
+                    }
+                }
+            }
+        }
+
+        return boundary;
+    }
+
+    private static bool IsArtifactAction(WorkflowStep step, string action)
+    {
+        if (string.IsNullOrWhiteSpace(step.Uses))
         {
             return false;
         }
 
-        if (job.HasUninspectableStructure || job.Steps.Any(step => step.HasUninspectableStructure))
-        {
-            return true;
-        }
+        var separator = step.Uses.IndexOf('@');
+        return separator > 0 && step.Uses[..separator].Equals(action, StringComparison.OrdinalIgnoreCase);
+    }
 
-        if (job.Steps.Any(step => HasIndirectPublicationPath(repositoryPath, step)))
-        {
-            return true;
-        }
-
-        if (HasReleasePublicationSignal(Path.GetFileNameWithoutExtension(path)) ||
-               HasReleasePublicationSignal(workflow.Name) ||
-               HasReleasePublicationSignal(job.Id) ||
-               HasReleasePublicationSignal(job.Name) ||
-               HasReleasePublicationSignal(job.Uses))
-        {
-            return true;
-        }
-
-        if (string.IsNullOrWhiteSpace(job.Uses))
-        {
-            return false;
-        }
-
-        return !TryProveLocalReusableWorkflow(repositoryPath, job.Uses, new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+    private static string? GetArtifactName(WorkflowStep step)
+    {
+        return step.With.TryGetValue("name", out var name) &&
+               !string.IsNullOrWhiteSpace(name) &&
+               !ContainsExpression(name)
+            ? name
+            : null;
     }
 
     private static bool HasReleasePublicationSignal(string? value)
@@ -250,101 +292,6 @@ internal static class WorkflowPolicyInspector
         return !IsExplicitlyDisabled(job.Condition) && job.Steps.Any(IsPublishStep);
     }
 
-    private static bool TryProveLocalReusableWorkflow(
-        string repositoryPath,
-        string uses,
-        HashSet<string> visitedPaths)
-    {
-        if (!IsLocalWorkflowReference(uses) || ContainsExpression(uses))
-        {
-            return false;
-        }
-
-        string workflowPath;
-        try
-        {
-            var repositoryRoot = Path.GetFullPath(repositoryPath);
-            workflowPath = Path.GetFullPath(Path.Combine(
-                repositoryRoot,
-                uses[2..].Replace('/', Path.DirectorySeparatorChar).Replace('\\', Path.DirectorySeparatorChar)));
-            if (!workflowPath.StartsWith(repositoryRoot + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase) ||
-                (!workflowPath.EndsWith(".yml", StringComparison.OrdinalIgnoreCase) &&
-                 !workflowPath.EndsWith(".yaml", StringComparison.OrdinalIgnoreCase)))
-            {
-                return false;
-            }
-        }
-        catch (ArgumentException)
-        {
-            return false;
-        }
-
-        if (!visitedPaths.Add(workflowPath))
-        {
-            return false;
-        }
-
-        try
-        {
-            var file = new FileInfo(workflowPath);
-            if (!file.Exists || file.Length > MaxWorkflowBytes)
-            {
-                return false;
-            }
-
-            var workflow = SupportedYaml.Parse(File.ReadAllText(workflowPath));
-            if (workflow.Jobs.Count == 0 ||
-                workflow.HasPublicationShapedTrigger ||
-                workflow.HasPublicationInput ||
-                workflow.HasUninspectableStructure ||
-                workflow.Jobs.Any(job => IsDirectPublicationJob(job)) ||
-                HasReleasePublicationSignal(Path.GetFileNameWithoutExtension(workflowPath)) ||
-                HasReleasePublicationSignal(workflow.Name))
-            {
-                return false;
-            }
-
-            foreach (var job in workflow.Jobs)
-            {
-                if (IsExplicitlyDisabled(job.Condition))
-                {
-                    continue;
-                }
-
-                if (job.HasUninspectableStructure ||
-                    job.Steps.Any(step => step.HasUninspectableStructure) ||
-                    HasReleasePublicationSignal(job.Id) ||
-                    HasReleasePublicationSignal(job.Name) ||
-                    HasReleasePublicationSignal(job.Uses))
-                {
-                    return false;
-                }
-
-                if (job.Steps.Any(step => HasIndirectPublicationPath(repositoryPath, step)))
-                {
-                    return false;
-                }
-
-                if (!string.IsNullOrWhiteSpace(job.Uses) &&
-                    !TryProveLocalReusableWorkflow(repositoryPath, job.Uses, visitedPaths))
-                {
-                    return false;
-                }
-            }
-
-            visitedPaths.Remove(workflowPath);
-            return true;
-        }
-        catch (IOException)
-        {
-            return false;
-        }
-        catch (UnauthorizedAccessException)
-        {
-            return false;
-        }
-    }
-
     private static bool ContainsExpression(string? value)
     {
         return value?.Contains("${{", StringComparison.Ordinal) == true;
@@ -358,24 +305,27 @@ internal static class WorkflowPolicyInspector
         string? configPath,
         List<Failure> failures)
     {
+        var publicationBoundary = BuildPublicationBoundary(repositoryPath, workflow);
         var indirectPathContext = new IndirectInspectionContext();
-        var unsupportedPublicationPath = InspectUnsupportedPublicationPaths(repositoryPath, workflow, failures, indirectPathContext);
-        var publishingJobs = workflow.Jobs.Where(job => job.Steps.Any(IsPublishStep)).ToArray();
-        var hasPublicationRelevantStep = workflow.Jobs.Any(job => job.Steps.Any(IsPublicationRelevantStep));
+        var unsupportedPublicationPath = InspectUnsupportedPublicationPaths(
+            repositoryPath,
+            publicationBoundary,
+            failures,
+            indirectPathContext);
+        var publishingJobs = publicationBoundary.Where(job => job.Steps.Any(IsPublishStep)).ToArray();
+        var hasPublicationRelevantStep = publicationBoundary.Any(job => job.Steps.Any(IsPublicationRelevantStep));
         var hasReleaseVocabulary = HasReleasePublicationSignal(Path.GetFileNameWithoutExtension(path)) ||
                                    HasReleasePublicationSignal(workflow.Name) ||
-                                   workflow.Jobs.Any(job =>
-                                       !IsExplicitlyDisabled(job.Condition) &&
+                                   publicationBoundary.Any(job =>
                                        (HasReleasePublicationSignal(job.Id) ||
                                         HasReleasePublicationSignal(job.Name) ||
                                         HasReleasePublicationSignal(job.Uses)));
-        var hasPublicationCapability = HasPublicationCapability(workflow);
         var limitedUnprovenShape = workflow.HasPublicationShapedTrigger ||
                                    workflow.HasPublicationInput ||
-                                   workflow.HasUninspectableStructure ||
-                                   (hasPublicationCapability && publishingJobs.Length == 0) ||
-                                   workflow.Jobs.Any(job => job.HasUninspectableStructure ||
-                                                            job.Steps.Any(step => step.HasUninspectableStructure)) ||
+                                   workflow.HasUninspectableControlStructure ||
+                                   (publicationBoundary.Count > 0 && publishingJobs.Length == 0) ||
+                                   publicationBoundary.Any(job => job.HasUninspectableStructure ||
+                                                                  job.Steps.Any(step => step.HasUninspectableStructure)) ||
                                    (publishingJobs.Length == 0 && (hasReleaseVocabulary || hasPublicationRelevantStep));
         if (limitedUnprovenShape && !unsupportedPublicationPath)
         {
@@ -410,11 +360,6 @@ internal static class WorkflowPolicyInspector
         string? configPath,
         List<Failure> failures)
     {
-        if (!workflow.HasVersionedTagTrigger || workflow.HasUnsupportedTagPattern)
-        {
-            failures.Add(new Failure("workflow-policy", "Release workflow is not gated exclusively by the supported version-tag pattern v*.*.*."));
-        }
-
         if (workflow.HasPushBranchTrigger)
         {
             failures.Add(new Failure("workflow-policy", "Release workflow has an additional branch-triggered publication path; publication must be restricted to version tags."));
@@ -455,9 +400,23 @@ internal static class WorkflowPolicyInspector
                 failures,
                 out var expectedArtifacts,
                 out var primaryArtifact,
+                out var releaseVersion,
                 out var useCandidateToolArtifactSource))
         {
             return;
+        }
+
+        var expectedTag = $"v{releaseVersion}";
+        if (workflow.HasUnsupportedTagPattern ||
+            workflow.TagPatterns.Count != 1 ||
+            !string.Equals(workflow.TagPatterns[0], expectedTag, StringComparison.Ordinal))
+        {
+            var configuredTags = workflow.TagPatterns.Count == 0
+                ? "none"
+                : string.Join(", ", workflow.TagPatterns.Select(pattern => $"'{pattern}'"));
+            failures.Add(new Failure(
+                "workflow-policy",
+                $"Release identity is not bound to the configured release version {releaseVersion}: on.push.tags must contain only the exact tag '{expectedTag}', but found {configuredTags}."));
         }
 
         if (!IsDefinitelyEnabled(publishJob.Condition))
@@ -759,10 +718,12 @@ internal static class WorkflowPolicyInspector
         List<Failure> failures,
         out IReadOnlyList<string> artifacts,
         out string primaryArtifact,
+        out string releaseVersion,
         out bool useCandidateToolArtifactSource)
     {
         artifacts = Array.Empty<string>();
         primaryArtifact = string.Empty;
+        releaseVersion = string.Empty;
         useCandidateToolArtifactSource = false;
         try
         {
@@ -794,12 +755,28 @@ internal static class WorkflowPolicyInspector
             }
 
             var package = packages[0];
+            releaseVersion = VersionText.Normalize(package.Version!);
             artifacts = package.Artifacts!.OrderBy(value => value, StringComparer.Ordinal).ToArray();
+            var expectedPrimaryName = $"{package.Id}.{releaseVersion}.nupkg";
+            var expectedSymbolsName = $"{package.Id}.{releaseVersion}.snupkg";
+            if (artifacts.Count is < 1 or > 2 ||
+                artifacts.Distinct(StringComparer.Ordinal).Count() != artifacts.Count ||
+                !artifacts.Contains(expectedPrimaryName, StringComparer.Ordinal) ||
+                artifacts.Any(artifact =>
+                    !string.Equals(artifact, expectedPrimaryName, StringComparison.Ordinal) &&
+                    !string.Equals(artifact, expectedSymbolsName, StringComparison.Ordinal)))
+            {
+                failures.Add(new Failure(
+                    "workflow-policy",
+                    $"Release artifact filenames are not bound to configured package identity '{package.Id}' and release version {releaseVersion}."));
+                return false;
+            }
+
             primaryArtifact = artifacts.Single(value => value.EndsWith(".nupkg", StringComparison.OrdinalIgnoreCase) &&
-                                                          !value.EndsWith(".snupkg", StringComparison.OrdinalIgnoreCase));
+                                                           !value.EndsWith(".snupkg", StringComparison.OrdinalIgnoreCase));
             useCandidateToolArtifactSource = string.Equals(package.Id, "KeelMatrix.NuGetReady", StringComparison.OrdinalIgnoreCase) &&
                                              string.Equals(package.Kind, "dotnetTool", StringComparison.OrdinalIgnoreCase) &&
-                                             string.Equals(package.Version, SupportedToolVersion, StringComparison.Ordinal) &&
+                                             string.Equals(releaseVersion, SupportedToolVersion, StringComparison.Ordinal) &&
                                              string.Equals(primaryArtifact, $"KeelMatrix.NuGetReady.{SupportedToolVersion}.nupkg", StringComparison.OrdinalIgnoreCase);
             return true;
         }
@@ -1360,12 +1337,12 @@ internal static class WorkflowPolicyInspector
 
     private static bool InspectUnsupportedPublicationPaths(
         string repositoryPath,
-        WorkflowDocument workflow,
+        IEnumerable<WorkflowJob> publicationBoundary,
         List<Failure> failures,
         IndirectInspectionContext context)
     {
         var foundUnsupportedPath = false;
-        foreach (var job in workflow.Jobs)
+        foreach (var job in publicationBoundary)
         {
             if (!IsExplicitlyDisabled(job.Condition) && !string.IsNullOrWhiteSpace(job.Uses))
             {
@@ -1781,13 +1758,6 @@ internal static class WorkflowPolicyInspector
         return uses is not null && (uses.StartsWith("./", StringComparison.Ordinal) || uses.StartsWith(".\\", StringComparison.Ordinal));
     }
 
-    private static bool IsLocalWorkflowReference(string? uses)
-    {
-        return uses is not null && IsLocalActionReference(uses) &&
-               (uses.EndsWith(".yml", StringComparison.OrdinalIgnoreCase) ||
-                uses.EndsWith(".yaml", StringComparison.OrdinalIgnoreCase));
-    }
-
     private static bool IsPublishStep(WorkflowStep step)
     {
         return !IsExplicitlyDisabled(step.Condition) && ContainsExecutablePackagePublicationCommand(step.Run);
@@ -1818,41 +1788,46 @@ internal static class WorkflowPolicyInspector
         return environment.Any(pair => ContainsLongLivedCredential(pair.Value));
     }
 
-    private static bool HasPublicationCapability(WorkflowDocument workflow)
+    private static bool HasPublicationCapability(WorkflowDocument workflow, WorkflowJob job)
     {
-        foreach (var job in workflow.Jobs.Where(job => !IsExplicitlyDisabled(job.Condition)))
+        var activeSteps = job.Steps.Where(step => !IsExplicitlyDisabled(step.Condition)).ToArray();
+        if (activeSteps.Length == 0 &&
+            string.IsNullOrWhiteSpace(job.Uses) &&
+            !job.HasUninspectableStructure)
         {
-            var activeSteps = job.Steps.Where(step => !IsExplicitlyDisabled(step.Condition)).ToArray();
-            if (activeSteps.Length == 0 && string.IsNullOrWhiteSpace(job.Uses))
-            {
-                continue;
-            }
+            return false;
+        }
 
-            if (!job.PermissionsSpecified && !workflow.PermissionsSpecified)
+        if (!job.PermissionsSpecified && !workflow.PermissionsSpecified)
+        {
+            return true;
+        }
+
+        if ((job.PermissionsSpecified && job.HasUninspectablePermissions) ||
+            (!job.PermissionsSpecified && workflow.HasUninspectablePermissions) ||
+            workflow.HasUninspectableCredentialBinding ||
+            job.HasUninspectableCredentialBinding ||
+            activeSteps.Any(step => step.HasUninspectableCredentialBinding))
+        {
+            return true;
+        }
+
+        var effectivePermissions = job.PermissionsSpecified ? job.Permissions : workflow.Permissions;
+        if (HasPublicationCapability(effectivePermissions) ||
+            job.HasSecretBinding ||
+            ContainsLongLivedCredential(job.Inputs) ||
+            ContainsLongLivedCredential(MergeEnvironment(workflow.Environment, job.Environment)))
+        {
+            return true;
+        }
+
+        foreach (var step in activeSteps)
+        {
+            if (ContainsLongLivedCredential(step.Run) ||
+                ContainsLongLivedCredential(step.With) ||
+                ContainsLongLivedCredential(MergeEnvironment(workflow.Environment, job.Environment, step.Environment)))
             {
                 return true;
-            }
-
-            var effectivePermissions = job.PermissionsSpecified ? job.Permissions : workflow.Permissions;
-            if (HasPublicationCapability(effectivePermissions))
-            {
-                return true;
-            }
-
-            if (!string.IsNullOrWhiteSpace(job.Uses) &&
-                ContainsLongLivedCredential(MergeEnvironment(workflow.Environment, job.Environment)))
-            {
-                return true;
-            }
-
-            foreach (var step in activeSteps)
-            {
-                if (ContainsLongLivedCredential(step.Run) ||
-                    ContainsLongLivedCredential(step.With) ||
-                    ContainsLongLivedCredential(MergeEnvironment(workflow.Environment, job.Environment, step.Environment)))
-                {
-                    return true;
-                }
             }
         }
 
@@ -2874,7 +2849,9 @@ internal static class WorkflowPolicyInspector
         public bool HasPublicationShapedTrigger { get; set; }
         public bool HasPublicationInput { get; set; }
         public bool HasUninspectableStructure { get; set; }
-        public bool HasVersionedTagTrigger { get; set; }
+        public bool HasUninspectableControlStructure { get; set; }
+        public bool HasUninspectableCredentialBinding { get; set; }
+        public bool HasUninspectablePermissions { get; set; }
         public bool HasUnsupportedTagPattern { get; set; }
         public bool HasPushBranchTrigger { get; set; }
         public bool HasOtherTrigger { get; set; }
@@ -2882,6 +2859,7 @@ internal static class WorkflowPolicyInspector
         public Dictionary<string, string> Permissions { get; } = new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, string> Environment { get; } = new(StringComparer.OrdinalIgnoreCase);
         public HashSet<string> PresentKeys { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public List<string> TagPatterns { get; } = new();
         public List<WorkflowJob> Jobs { get; } = new();
     }
 
@@ -2895,11 +2873,15 @@ internal static class WorkflowPolicyInspector
         public string? RunsOn { get; set; }
         public string? TimeoutMinutes { get; set; }
         public bool HasUninspectableStructure { get; set; }
+        public bool HasUninspectableCredentialBinding { get; set; }
+        public bool HasUninspectablePermissions { get; set; }
+        public bool HasSecretBinding { get; set; }
         public bool PermissionsSpecified { get; set; }
         public HashSet<string> PresentKeys { get; } = new(StringComparer.OrdinalIgnoreCase);
         public HashSet<string> DependsOn { get; } = new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, string> Permissions { get; } = new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, string> Environment { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public Dictionary<string, string> Inputs { get; } = new(StringComparer.OrdinalIgnoreCase);
         public List<WorkflowStep> Steps { get; } = new();
     }
 
@@ -2913,6 +2895,7 @@ internal static class WorkflowPolicyInspector
         public string? Shell { get; set; }
         public string? WorkingDirectory { get; set; }
         public bool HasUninspectableStructure { get; set; }
+        public bool HasUninspectableCredentialBinding { get; set; }
         public bool PermissionsSpecified { get; set; }
         public HashSet<string> PresentKeys { get; } = new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, string> Permissions { get; } = new(StringComparer.OrdinalIgnoreCase);
@@ -2970,6 +2953,7 @@ internal static class WorkflowPolicyInspector
             if (!TryLoadRoot(content, out var root, out var unsupported) || root is null)
             {
                 workflow.HasUninspectableStructure = true;
+                workflow.HasUninspectableControlStructure = true;
                 return workflow;
             }
 
@@ -3012,12 +2996,14 @@ internal static class WorkflowPolicyInspector
                         workflow.PermissionsSpecified = true;
                         if (!ParseStringMapOrPermission(pair.Value, workflow.Permissions))
                         {
+                            workflow.HasUninspectablePermissions = true;
                             workflow.HasUninspectableStructure = true;
                         }
                         break;
                     case "env":
                         if (!ParseStringMap(pair.Value, workflow.Environment))
                         {
+                            workflow.HasUninspectableCredentialBinding = true;
                             workflow.HasUninspectableStructure = true;
                         }
                         break;
@@ -3027,6 +3013,8 @@ internal static class WorkflowPolicyInspector
                 }
             }
 
+            workflow.HasUninspectableControlStructure = workflow.HasUninspectableStructure &&
+                workflow.Jobs.All(job => !job.HasUninspectableStructure);
             return workflow;
         }
 
@@ -3264,12 +3252,21 @@ internal static class WorkflowPolicyInspector
                             job.PermissionsSpecified = true;
                             if (!ParseStringMapOrPermission(property.Value, job.Permissions))
                             {
+                                job.HasUninspectablePermissions = true;
                                 MarkUninspectable(workflow, job);
                             }
                             break;
                         case "env":
                             if (!ParseStringMap(property.Value, job.Environment))
                             {
+                                job.HasUninspectableCredentialBinding = true;
+                                MarkUninspectable(workflow, job);
+                            }
+                            break;
+                        case "with":
+                            if (!ParseStringMap(property.Value, job.Inputs))
+                            {
+                                job.HasUninspectableCredentialBinding = true;
                                 MarkUninspectable(workflow, job);
                             }
                             break;
@@ -3285,6 +3282,10 @@ internal static class WorkflowPolicyInspector
                             break;
                         case "steps":
                             ParseSteps(property.Value, workflow, job);
+                            break;
+                        case "secrets":
+                        case "environment":
+                            job.HasSecretBinding = true;
                             break;
                         default:
                             if (!IsSupportedJobKey(key))
@@ -3362,14 +3363,22 @@ internal static class WorkflowPolicyInspector
                         step.WorkingDirectory = ReadStepScalar(pair.Value, step);
                         break;
                     case "env":
-                        step.HasUninspectableStructure |= !ParseStringMap(pair.Value, step.Environment);
+                        if (!ParseStringMap(pair.Value, step.Environment))
+                        {
+                            step.HasUninspectableCredentialBinding = true;
+                            step.HasUninspectableStructure = true;
+                        }
                         break;
                     case "permissions":
                         step.PermissionsSpecified = true;
                         step.HasUninspectableStructure |= !ParseStringMapOrPermission(pair.Value, step.Permissions);
                         break;
                     case "with":
-                        step.HasUninspectableStructure |= !ParseStringMap(pair.Value, step.With);
+                        if (!ParseStringMap(pair.Value, step.With))
+                        {
+                            step.HasUninspectableCredentialBinding = true;
+                            step.HasUninspectableStructure = true;
+                        }
                         break;
                     default:
                         if (!IsSupportedStepKey(key) || pair.Value is not YamlScalarNode)
@@ -3548,11 +3557,11 @@ internal static class WorkflowPolicyInspector
 
             foreach (var pattern in values)
             {
-                if (pattern.Equals("v*.*.*", StringComparison.OrdinalIgnoreCase))
-                {
-                    workflow.HasVersionedTagTrigger = true;
-                }
-                else
+                workflow.TagPatterns.Add(pattern);
+                if (!Regex.IsMatch(
+                    pattern,
+                    @"^v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$",
+                    RegexOptions.CultureInvariant))
                 {
                     workflow.HasUnsupportedTagPattern = true;
                 }

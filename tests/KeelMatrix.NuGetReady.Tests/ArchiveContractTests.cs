@@ -99,6 +99,33 @@ public sealed class ArchiveContractTests
     }
 
     [Fact]
+    public void Nuspec_identity_mismatch_prevents_a_workflow_policy_pass()
+    {
+        using var fixture = PackageFixture.Create();
+        fixture.AddPackage("Example.Core.1.2.3.nupkg", "Different.Core", "1.2.4");
+        using var repository = WorkflowRepository.Create("release.yml", """
+            name: release
+            on:
+              push:
+                tags: ["v1.2.3"]
+            permissions: {}
+            jobs:
+              publish:
+                steps:
+                  - run: dotnet nuget push artifacts/Example.Core.1.2.3.nupkg
+            """);
+
+        var report = CheckRunner.Run(
+            Config("Example.Core", "library", "1.2.3", "Example.Core.1.2.3.nupkg"),
+            fixture.ArtifactsPath,
+            repository.Root.FullName,
+            TimeSpan.FromSeconds(1));
+
+        Assert.Equal("fail", report.Checks.Single(check => check.Id == "archive-metadata").Status);
+        Assert.Equal("not-run", report.Checks.Single(check => check.Id == "workflow-policy").Status);
+    }
+
+    [Fact]
     public void Dependency_group_must_match_package_assets()
     {
         using var fixture = PackageFixture.Create();
