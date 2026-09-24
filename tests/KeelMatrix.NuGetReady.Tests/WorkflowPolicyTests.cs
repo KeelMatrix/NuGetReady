@@ -1315,6 +1315,7 @@ public sealed class WorkflowPolicyTests
     [InlineData("${{ env.ApiKey")]
     [InlineData("${{ secrets.ApiKey")]
     [InlineData("${{ vars['ARTIFACT.PATH']")]
+    [InlineData("${{ matrix.release_channel")]
     [InlineData("${{ ${{ vars.NUGET_API_KEY }}")]
     [InlineData("${{${{ vars.NUGET_API_KEY }}}}")]
     [InlineData("${{ vars.SAFE_VALUE }}-${{ inputs.ApiKey")]
@@ -1349,13 +1350,22 @@ public sealed class WorkflowPolicyTests
 
     [Theory]
     [InlineData("workflow-env")]
+    [InlineData("workflow-run-name")]
     [InlineData("job-env")]
+    [InlineData("job-condition")]
+    [InlineData("job-runs-on")]
+    [InlineData("job-timeout")]
     [InlineData("step-env")]
+    [InlineData("step-name")]
     [InlineData("action-with")]
     [InlineData("reusable-with")]
     [InlineData("reusable-secrets")]
     [InlineData("step-run")]
     [InlineData("step-condition")]
+    [InlineData("step-shell")]
+    [InlineData("step-working-directory")]
+    [InlineData("step-timeout")]
+    [InlineData("step-continue-on-error")]
     public void Malformed_expression_framing_is_blocking_across_evaluated_scalar_surfaces(string surface)
     {
         const string malformedExpression = "${{ vars.ARTIFACT_PATH";
@@ -1368,6 +1378,18 @@ public sealed class WorkflowPolicyTests
                   contents: read
                 env:
                   PROBE: '{{malformedExpression}}'
+                jobs:
+                  build:
+                    runs-on: ubuntu-latest
+                    steps:
+                      - uses: actions/checkout@v6
+                """,
+            "workflow-run-name" => $$"""
+                name: continuous integration
+                run-name: '{{malformedExpression}}'
+                on: push
+                permissions:
+                  contents: read
                 jobs:
                   build:
                     runs-on: ubuntu-latest
@@ -1387,6 +1409,41 @@ public sealed class WorkflowPolicyTests
                     steps:
                       - uses: actions/checkout@v6
                 """,
+            "job-condition" => $$"""
+                name: continuous integration
+                on: push
+                permissions:
+                  contents: read
+                jobs:
+                  build:
+                    if: '{{malformedExpression}}'
+                    runs-on: ubuntu-latest
+                    steps:
+                      - uses: actions/checkout@v6
+                """,
+            "job-runs-on" => $$"""
+                name: continuous integration
+                on: push
+                permissions:
+                  contents: read
+                jobs:
+                  build:
+                    runs-on: '{{malformedExpression}}'
+                    steps:
+                      - uses: actions/checkout@v6
+                """,
+            "job-timeout" => $$"""
+                name: continuous integration
+                on: push
+                permissions:
+                  contents: read
+                jobs:
+                  build:
+                    runs-on: ubuntu-latest
+                    timeout-minutes: '{{malformedExpression}}'
+                    steps:
+                      - uses: actions/checkout@v6
+                """,
             "step-env" => $$"""
                 name: continuous integration
                 on: push
@@ -1399,6 +1456,18 @@ public sealed class WorkflowPolicyTests
                       - uses: actions/checkout@v6
                         env:
                           PROBE: '{{malformedExpression}}'
+                """,
+            "step-name" => $$"""
+                name: continuous integration
+                on: push
+                permissions:
+                  contents: read
+                jobs:
+                  build:
+                    runs-on: ubuntu-latest
+                    steps:
+                      - name: '{{malformedExpression}}'
+                        uses: actions/checkout@v6
                 """,
             "action-with" => $$"""
                 name: continuous integration
@@ -1446,7 +1515,7 @@ public sealed class WorkflowPolicyTests
                     steps:
                       - run: echo '{{malformedExpression}}'
                 """,
-            _ => $$"""
+            "step-condition" => $$"""
                 name: continuous integration
                 on: push
                 permissions:
@@ -1457,6 +1526,54 @@ public sealed class WorkflowPolicyTests
                     steps:
                       - if: '{{malformedExpression}}'
                         uses: actions/checkout@v6
+                """,
+            "step-shell" => $$"""
+                name: continuous integration
+                on: push
+                permissions:
+                  contents: read
+                jobs:
+                  build:
+                    runs-on: ubuntu-latest
+                    steps:
+                      - shell: '{{malformedExpression}}'
+                        run: echo probe
+                """,
+            "step-working-directory" => $$"""
+                name: continuous integration
+                on: push
+                permissions:
+                  contents: read
+                jobs:
+                  build:
+                    runs-on: ubuntu-latest
+                    steps:
+                      - working-directory: '{{malformedExpression}}'
+                        run: echo probe
+                """,
+            "step-timeout" => $$"""
+                name: continuous integration
+                on: push
+                permissions:
+                  contents: read
+                jobs:
+                  build:
+                    runs-on: ubuntu-latest
+                    steps:
+                      - timeout-minutes: '{{malformedExpression}}'
+                        run: echo probe
+                """,
+            _ => $$"""
+                name: continuous integration
+                on: push
+                permissions:
+                  contents: read
+                jobs:
+                  build:
+                    runs-on: ubuntu-latest
+                    steps:
+                      - continue-on-error: '{{malformedExpression}}'
+                        run: echo probe
                 """
         };
         using var repository = WorkflowRepository.Create("ci.yml", workflow);
@@ -1539,6 +1656,7 @@ public sealed class WorkflowPolicyTests
             (Name: "env_root", Value: "${{ env.ApiKey"),
             (Name: "secrets_root", Value: "${{ secrets.ApiKey"),
             (Name: "static_nonbounded_member", Value: "${{ vars['ARTIFACT.PATH']"),
+            (Name: "unknown_root", Value: "${{ matrix.release_channel"),
             (Name: "nested_opener", Value: "${{ ${{ vars.NUGET_API_KEY }}"),
             (Name: "doubled_opener", Value: "${{${{ vars.NUGET_API_KEY }}}}"),
             (Name: "complete_then_unclosed", Value: "${{ vars.SAFE_VALUE }}-${{ inputs.ApiKey")
@@ -1599,6 +1717,179 @@ public sealed class WorkflowPolicyTests
                 report.Status == "error" && workflowPolicyStatus == "error" && report.ExitCode == 2,
                 $"case={testCase.Name} overall={report.Status}; workflow-policy={workflowPolicyStatus}; exit={report.ExitCode}; failures={string.Join(" | ", report.Failures.Select(failure => failure.Message))}");
         }
+    }
+
+    [Fact]
+    public void Static_branch_pattern_with_unmatched_opener_does_not_block_a_valid_release_rehearsal()
+    {
+        using var corpus = PackedCorpus.Create();
+        var package = corpus.Pack("Standard/Standard.csproj");
+        var symbolPackage = Path.ChangeExtension(package, ".snupkg");
+        var config = new NuGetReadyConfig
+        {
+            SchemaVersion = 1,
+            Packages =
+            [
+                new PackageExpectation
+                {
+                    Id = "Fixture.Standard",
+                    Kind = "library",
+                    Version = "1.0.0",
+                    Artifacts = [Path.GetFileName(package), Path.GetFileName(symbolPackage)]
+                }
+            ]
+        };
+        var releaseWorkflow = Mutate(
+            ReleaseWorkflow,
+            "KeelMatrix.NuGetReady.1.0.0.nupkg",
+            Path.GetFileName(package));
+        releaseWorkflow = Mutate(
+            releaseWorkflow,
+            "KeelMatrix.NuGetReady.1.0.0.snupkg",
+            Path.GetFileName(symbolPackage));
+        using var repository = WorkflowRepository.Create("release.yml", releaseWorkflow);
+        repository.WriteWorkflow("ci.yml", """
+            name: CI Probe
+            on:
+              push:
+                branches:
+                  - '${{feature'
+            permissions:
+              contents: read
+            jobs:
+              build:
+                runs-on: ubuntu-latest
+                steps:
+                  - name: Read-only action
+                    uses: actions/checkout@v6
+            """);
+        var configPath = Path.Combine(repository.Root.FullName, "nugetready.json");
+        repository.WriteFile("nugetready.json", System.Text.Json.JsonSerializer.Serialize(config));
+
+        var report = CheckRunner.Run(
+            config,
+            corpus.OutputPath,
+            repository.Root.FullName,
+            TimeSpan.FromMinutes(2),
+            new ConsumerRehearsalOptions(PublicFeedPath: corpus.OutputPath),
+            configPath);
+        var workflowPolicyStatus = report.Checks.Single(check => check.Id == "workflow-policy").Status;
+
+        Console.WriteLine($"case=static_branch_pattern_with_unmatched_opener expected=pass/pass/0 overall={report.Status} workflow-policy={workflowPolicyStatus} exit={report.ExitCode}");
+        Assert.True(
+            report.Status == "pass" && workflowPolicyStatus == "pass" && report.ExitCode == 0,
+            $"overall={report.Status}; workflow-policy={workflowPolicyStatus}; exit={report.ExitCode}; failures={string.Join(" | ", report.Failures.Select(failure => failure.Message))}");
+    }
+
+    [Theory]
+    [InlineData("workflow-name")]
+    [InlineData("job-name")]
+    [InlineData("push-path")]
+    [InlineData("push-tag-ignore")]
+    [InlineData("workflow-default")]
+    public void Static_workflow_data_with_unmatched_opener_stays_outside_release_policy(string surface)
+    {
+        var workflow = surface switch
+        {
+            "workflow-name" => """
+                name: 'CI ${{feature'
+                on: push
+                permissions:
+                  contents: read
+                jobs:
+                  build:
+                    runs-on: ubuntu-latest
+                    steps:
+                      - uses: actions/checkout@v6
+                """,
+            "job-name" => """
+                name: CI Probe
+                on: push
+                permissions:
+                  contents: read
+                jobs:
+                  build:
+                    name: 'Build ${{feature'
+                    runs-on: ubuntu-latest
+                    steps:
+                      - uses: actions/checkout@v6
+                """,
+            "push-path" => """
+                name: CI Probe
+                on:
+                  push:
+                    paths:
+                      - '${{feature'
+                permissions:
+                  contents: read
+                jobs:
+                  build:
+                    runs-on: ubuntu-latest
+                    steps:
+                      - uses: actions/checkout@v6
+                """,
+            "push-tag-ignore" => """
+                name: CI Probe
+                on:
+                  push:
+                    tags-ignore:
+                      - '${{feature'
+                permissions:
+                  contents: read
+                jobs:
+                  build:
+                    runs-on: ubuntu-latest
+                    steps:
+                      - uses: actions/checkout@v6
+                """,
+            _ => """
+                name: CI Probe
+                on: push
+                permissions:
+                  contents: read
+                defaults:
+                  run:
+                    working-directory: '${{feature'
+                jobs:
+                  build:
+                    runs-on: ubuntu-latest
+                    steps:
+                      - uses: actions/checkout@v6
+                """
+        };
+        using var repository = WorkflowRepository.Create("ci.yml", workflow);
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        Assert.False(inspection.Evaluated);
+        Assert.Empty(inspection.Failures);
+    }
+
+    [Fact]
+    public void Static_tag_pattern_with_unmatched_opener_is_not_classified_as_expression_framing()
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", """
+            name: CI Probe
+            on:
+              push:
+                tags:
+                  - '${{feature'
+            permissions:
+              contents: read
+            jobs:
+              build:
+                runs-on: ubuntu-latest
+                steps:
+                  - uses: actions/checkout@v6
+            """);
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        Assert.DoesNotContain(
+            inspection.Failures,
+            failure => failure.Message.Contains(
+                "malformed/incomplete expression framing",
+                StringComparison.OrdinalIgnoreCase));
     }
 
     [Theory]

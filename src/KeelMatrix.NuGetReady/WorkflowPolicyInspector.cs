@@ -3207,6 +3207,27 @@ internal static class WorkflowPolicyInspector
 
     private static class SupportedYaml
     {
+        private enum EvaluatedScalarField
+        {
+            WorkflowRunName,
+            WorkflowEnvironmentValue,
+            JobCondition,
+            JobRunsOn,
+            JobTimeoutMinutes,
+            JobEnvironmentValue,
+            ReusableWorkflowInputValue,
+            ReusableWorkflowSecretValue,
+            StepName,
+            StepRun,
+            StepCondition,
+            StepShell,
+            StepWorkingDirectory,
+            StepTimeoutMinutes,
+            StepContinueOnError,
+            StepEnvironmentValue,
+            ActionInputValue
+        }
+
         private static readonly HashSet<string> SupportedTopLevelKeys = new(StringComparer.OrdinalIgnoreCase)
         {
             "name", "run-name", "on", "permissions", "env", "defaults", "concurrency", "jobs"
@@ -3241,7 +3262,7 @@ internal static class WorkflowPolicyInspector
                     continue;
                 }
 
-                var step = ParseStep(stepMapping);
+                var step = ParseStep(stepMapping, workflow: null);
                 action.Steps.Add(step);
                 action.HasInspectableSteps &= !step.HasUninspectableStructure;
             }
@@ -3260,7 +3281,6 @@ internal static class WorkflowPolicyInspector
             }
 
             workflow.HasUninspectableStructure = unsupported;
-            workflow.HasMalformedExpressionFraming = ContainsMalformedExpressionFraming(root);
             foreach (var pair in root.Children)
             {
                 if (!TryScalar(pair.Key, out var key))
@@ -3292,6 +3312,16 @@ internal static class WorkflowPolicyInspector
                             workflow.HasUninspectableStructure = true;
                         }
                         break;
+                    case "run-name":
+                        if (TryScalar(pair.Value, out var runName))
+                        {
+                            TrackEvaluatedScalar(workflow, EvaluatedScalarField.WorkflowRunName, runName);
+                        }
+                        else
+                        {
+                            workflow.HasUninspectableStructure = true;
+                        }
+                        break;
                     case "on":
                         ParseTriggers(pair.Value, workflow);
                         break;
@@ -3304,7 +3334,11 @@ internal static class WorkflowPolicyInspector
                         }
                         break;
                     case "env":
-                        if (!ParseStringMap(pair.Value, workflow.Environment))
+                        if (!ParseEvaluatedStringMap(
+                                pair.Value,
+                                workflow.Environment,
+                                workflow,
+                                EvaluatedScalarField.WorkflowEnvironmentValue))
                         {
                             workflow.HasUninspectableCredentialBinding = true;
                             workflow.HasUninspectableStructure = true;
@@ -3544,12 +3578,15 @@ internal static class WorkflowPolicyInspector
                             break;
                         case "if":
                             job.Condition = ReadRequiredScalar(property.Value, workflow, job);
+                            TrackEvaluatedScalar(workflow, EvaluatedScalarField.JobCondition, job.Condition);
                             break;
                         case "runs-on":
                             job.RunsOn = ReadRequiredScalar(property.Value, workflow, job);
+                            TrackEvaluatedScalar(workflow, EvaluatedScalarField.JobRunsOn, job.RunsOn);
                             break;
                         case "timeout-minutes":
                             job.TimeoutMinutes = ReadRequiredScalar(property.Value, workflow, job);
+                            TrackEvaluatedScalar(workflow, EvaluatedScalarField.JobTimeoutMinutes, job.TimeoutMinutes);
                             break;
                         case "permissions":
                             job.PermissionsSpecified = true;
@@ -3560,14 +3597,22 @@ internal static class WorkflowPolicyInspector
                             }
                             break;
                         case "env":
-                            if (!ParseStringMap(property.Value, job.Environment))
+                            if (!ParseEvaluatedStringMap(
+                                    property.Value,
+                                    job.Environment,
+                                    workflow,
+                                    EvaluatedScalarField.JobEnvironmentValue))
                             {
                                 job.HasUninspectableCredentialBinding = true;
                                 MarkUninspectable(workflow, job);
                             }
                             break;
                         case "with":
-                            if (!ParseStringMap(property.Value, job.Inputs))
+                            if (!ParseEvaluatedStringMap(
+                                    property.Value,
+                                    job.Inputs,
+                                    workflow,
+                                    EvaluatedScalarField.ReusableWorkflowInputValue))
                             {
                                 job.HasUninspectableCredentialBinding = true;
                                 MarkUninspectable(workflow, job);
@@ -3587,6 +3632,12 @@ internal static class WorkflowPolicyInspector
                             ParseSteps(property.Value, workflow, job);
                             break;
                         case "secrets":
+                            TrackEvaluatedMapValues(
+                                property.Value,
+                                workflow,
+                                EvaluatedScalarField.ReusableWorkflowSecretValue);
+                            job.HasSecretBinding = true;
+                            break;
                         case "environment":
                             job.HasSecretBinding = true;
                             break;
@@ -3617,7 +3668,7 @@ internal static class WorkflowPolicyInspector
                     continue;
                 }
 
-                var step = ParseStep(stepMapping);
+                var step = ParseStep(stepMapping, workflow);
                 job.Steps.Add(step);
                 if (step.HasUninspectableStructure)
                 {
@@ -3626,7 +3677,7 @@ internal static class WorkflowPolicyInspector
             }
         }
 
-        private static WorkflowStep ParseStep(YamlMappingNode mapping)
+        private static WorkflowStep ParseStep(YamlMappingNode mapping, WorkflowDocument? workflow)
         {
             var step = new WorkflowStep();
             foreach (var pair in mapping.Children)
@@ -3646,6 +3697,7 @@ internal static class WorkflowPolicyInspector
                 {
                     case "name":
                         step.Name = ReadStepScalar(pair.Value, step);
+                        TrackEvaluatedScalar(workflow, EvaluatedScalarField.StepName, step.Name);
                         break;
                     case "id":
                         step.Id = ReadStepScalar(pair.Value, step);
@@ -3655,18 +3707,38 @@ internal static class WorkflowPolicyInspector
                         break;
                     case "run":
                         step.Run = ReadStepScalar(pair.Value, step);
+                        TrackEvaluatedScalar(workflow, EvaluatedScalarField.StepRun, step.Run);
                         break;
                     case "if":
                         step.Condition = ReadStepScalar(pair.Value, step);
+                        TrackEvaluatedScalar(workflow, EvaluatedScalarField.StepCondition, step.Condition);
                         break;
                     case "shell":
                         step.Shell = ReadStepScalar(pair.Value, step);
+                        TrackEvaluatedScalar(workflow, EvaluatedScalarField.StepShell, step.Shell);
                         break;
                     case "working-directory":
                         step.WorkingDirectory = ReadStepScalar(pair.Value, step);
+                        TrackEvaluatedScalar(workflow, EvaluatedScalarField.StepWorkingDirectory, step.WorkingDirectory);
+                        break;
+                    case "timeout-minutes":
+                        TrackEvaluatedScalar(
+                            workflow,
+                            EvaluatedScalarField.StepTimeoutMinutes,
+                            ReadStepScalar(pair.Value, step));
+                        break;
+                    case "continue-on-error":
+                        TrackEvaluatedScalar(
+                            workflow,
+                            EvaluatedScalarField.StepContinueOnError,
+                            ReadStepScalar(pair.Value, step));
                         break;
                     case "env":
-                        if (!ParseStringMap(pair.Value, step.Environment))
+                        if (!ParseEvaluatedStringMap(
+                                pair.Value,
+                                step.Environment,
+                                workflow,
+                                EvaluatedScalarField.StepEnvironmentValue))
                         {
                             step.HasUninspectableCredentialBinding = true;
                             step.HasUninspectableStructure = true;
@@ -3677,7 +3749,11 @@ internal static class WorkflowPolicyInspector
                         step.HasUninspectableStructure |= !ParseStringMapOrPermission(pair.Value, step.Permissions);
                         break;
                     case "with":
-                        if (!ParseStringMap(pair.Value, step.With))
+                        if (!ParseEvaluatedStringMap(
+                                pair.Value,
+                                step.With,
+                                workflow,
+                                EvaluatedScalarField.ActionInputValue))
                         {
                             step.HasUninspectableCredentialBinding = true;
                             step.HasUninspectableStructure = true;
@@ -3756,6 +3832,21 @@ internal static class WorkflowPolicyInspector
             return valid;
         }
 
+        private static bool ParseEvaluatedStringMap(
+            YamlNode node,
+            Dictionary<string, string> destination,
+            WorkflowDocument? workflow,
+            EvaluatedScalarField field)
+        {
+            var valid = ParseStringMap(node, destination);
+            foreach (var value in destination.Values)
+            {
+                TrackEvaluatedScalar(workflow, field, value);
+            }
+
+            return valid;
+        }
+
         private static bool TryReadScalarSequence(YamlNode node, out IReadOnlyList<string> values)
         {
             if (TryScalar(node, out var scalar))
@@ -3801,16 +3892,60 @@ internal static class WorkflowPolicyInspector
             return false;
         }
 
-        private static bool ContainsMalformedExpressionFraming(YamlNode node)
+        private static void TrackEvaluatedMapValues(
+            YamlNode node,
+            WorkflowDocument workflow,
+            EvaluatedScalarField field)
         {
-            return node switch
+            if (node is not YamlMappingNode mapping)
             {
-                YamlScalarNode scalar => scalar.Value is not null &&
-                                         AnalyzeExpressionReferences(scalar.Value).HasMalformedFraming,
-                YamlSequenceNode sequence => sequence.Children.Any(ContainsMalformedExpressionFraming),
-                YamlMappingNode mapping => mapping.Children.Values.Any(ContainsMalformedExpressionFraming),
+                return;
+            }
+
+            foreach (var valueNode in mapping.Children.Values)
+            {
+                if (TryScalar(valueNode, out var value))
+                {
+                    TrackEvaluatedScalar(workflow, field, value);
+                }
+            }
+        }
+
+        private static void TrackEvaluatedScalar(
+            WorkflowDocument? workflow,
+            EvaluatedScalarField field,
+            string? value)
+        {
+            if (workflow is null || value is null)
+            {
+                return;
+            }
+
+            // GitHub Actions "Contexts reference: Context availability" defines these
+            // modeled keys. Static trigger filters and workflow/job names stay outside.
+            var isEvaluatedField = field switch
+            {
+                EvaluatedScalarField.WorkflowRunName or
+                EvaluatedScalarField.WorkflowEnvironmentValue or
+                EvaluatedScalarField.JobCondition or
+                EvaluatedScalarField.JobRunsOn or
+                EvaluatedScalarField.JobTimeoutMinutes or
+                EvaluatedScalarField.JobEnvironmentValue or
+                EvaluatedScalarField.ReusableWorkflowInputValue or
+                EvaluatedScalarField.ReusableWorkflowSecretValue or
+                EvaluatedScalarField.StepName or
+                EvaluatedScalarField.StepRun or
+                EvaluatedScalarField.StepCondition or
+                EvaluatedScalarField.StepShell or
+                EvaluatedScalarField.StepWorkingDirectory or
+                EvaluatedScalarField.StepTimeoutMinutes or
+                EvaluatedScalarField.StepContinueOnError or
+                EvaluatedScalarField.StepEnvironmentValue or
+                EvaluatedScalarField.ActionInputValue => true,
                 _ => false
             };
+            workflow.HasMalformedExpressionFraming |= isEvaluatedField &&
+                AnalyzeExpressionReferences(value).HasMalformedFraming;
         }
 
         private static bool TryGetScalar(YamlMappingNode mapping, string name, out string value)
