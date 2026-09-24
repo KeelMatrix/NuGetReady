@@ -85,6 +85,16 @@ internal static class WorkflowPolicyInspector
         "statuses",
         "vulnerability-alerts"
     };
+    private static readonly HashSet<string> CredentialBindingNames = new(StringComparer.Ordinal)
+    {
+        "NUGET_API_KEY",
+        "API_KEY",
+        "ACCESS_TOKEN",
+        "AUTHORIZATION",
+        "PASSWORD",
+        "SECRET",
+        "CREDENTIAL"
+    };
 
     public static IReadOnlyList<Failure> Inspect(
         string repositoryPath,
@@ -491,11 +501,11 @@ internal static class WorkflowPolicyInspector
         InspectValidationJob(repositoryPath, workflow, validationJob, producerJob, useCandidateToolArtifactSource, failures);
         InspectCredentialBearingJob(publishJob, primaryArtifact, failures);
 
-        if (ContainsLongLivedCredential(workflow.Environment) ||
-            workflow.Jobs.Any(job => ContainsLongLivedCredential(job.Environment) ||
+        if (ContainsLongLivedCredentialValue(workflow.Environment) ||
+            workflow.Jobs.Any(job => ContainsLongLivedCredentialValue(job.Environment) ||
                                      job.Steps.Any(step => ContainsLongLivedCredential(step.Run) ||
-                                                           ContainsLongLivedCredential(step.Environment) ||
-                                                           ContainsLongLivedCredential(step.With))))
+                                                           ContainsLongLivedCredentialValue(step.Environment) ||
+                                                           ContainsLongLivedCredentialValue(step.With))))
         {
             failures.Add(new Failure("workflow-policy", "Release workflow contains a long-lived NuGet API-key publication path."));
         }
@@ -552,10 +562,10 @@ internal static class WorkflowPolicyInspector
             failures.Add(new Failure("workflow-policy", "The artifact-producer job must not receive an OIDC token or repository write capability."));
         }
 
-        if (ContainsLongLivedCredential(producerJob.Environment) ||
+        if (ContainsLongLivedCredentialValue(producerJob.Environment) ||
             producerJob.Steps.Any(step => ContainsLongLivedCredential(step.Run) ||
-                                             ContainsLongLivedCredential(step.Environment) ||
-                                             ContainsLongLivedCredential(step.With)))
+                                             ContainsLongLivedCredentialValue(step.Environment) ||
+                                             ContainsLongLivedCredentialValue(step.With)))
         {
             failures.Add(new Failure("workflow-policy", "The artifact-producer job must not receive a long-lived NuGet publishing credential."));
         }
@@ -623,10 +633,10 @@ internal static class WorkflowPolicyInspector
             failures.Add(new Failure("workflow-policy", "The validation job must not receive an OIDC token or repository write capability."));
         }
 
-        if (ContainsLongLivedCredential(validationJob.Environment) ||
+        if (ContainsLongLivedCredentialValue(validationJob.Environment) ||
             validationJob.Steps.Any(step => ContainsLongLivedCredential(step.Run) ||
-                                               ContainsLongLivedCredential(step.Environment) ||
-                                               ContainsLongLivedCredential(step.With)))
+                                               ContainsLongLivedCredentialValue(step.Environment) ||
+                                               ContainsLongLivedCredentialValue(step.With)))
         {
             failures.Add(new Failure("workflow-policy", "The validation job must not receive a long-lived NuGet publishing credential."));
         }
@@ -1785,7 +1795,18 @@ internal static class WorkflowPolicyInspector
 
     private static bool ContainsLongLivedCredential(IReadOnlyDictionary<string, string> environment)
     {
+        return environment.Any(pair => IsCredentialBindingName(pair.Key) || ContainsLongLivedCredential(pair.Value));
+    }
+
+    private static bool ContainsLongLivedCredentialValue(IReadOnlyDictionary<string, string> environment)
+    {
         return environment.Any(pair => ContainsLongLivedCredential(pair.Value));
+    }
+
+    private static bool IsCredentialBindingName(string name)
+    {
+        var canonicalName = name.Trim().Replace('-', '_').ToUpperInvariant();
+        return CredentialBindingNames.Contains(canonicalName);
     }
 
     private static bool HasPublicationCapability(WorkflowDocument workflow, WorkflowJob job)

@@ -48,7 +48,8 @@ public sealed class CliContractTests
         Assert.Contains("capability-and-reachability boundary", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("dependency and artifact-producer job", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("Omitted effective permissions", CliParser.HelpText, StringComparison.Ordinal);
-        Assert.Contains("credential-free, read-only CI stays outside", CliParser.HelpText, StringComparison.Ordinal);
+        Assert.Contains("NUGET_API_KEY, API_KEY, ACCESS_TOKEN, AUTHORIZATION, PASSWORD, SECRET, and CREDENTIAL", CliParser.HelpText, StringComparison.Ordinal);
+        Assert.Contains("without a recognized credential binding stays outside", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("error/exit 2", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("warnings never create release confidence", CliParser.HelpText, StringComparison.Ordinal);
     }

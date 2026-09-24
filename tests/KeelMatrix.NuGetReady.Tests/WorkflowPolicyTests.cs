@@ -900,6 +900,231 @@ public sealed class WorkflowPolicyTests
     }
 
     [Theory]
+    [InlineData("env", "NUGET_API_KEY", "literal-credential")]
+    [InlineData("env", "NUGET_API_KEY", "${{ vars.NUGET_API_KEY }}")]
+    [InlineData("with", "api-key", "literal-credential")]
+    [InlineData("with", "api-key", "${{ vars.NUGET_API_KEY }}")]
+    public void Unknown_action_with_credential_shaped_binding_is_blocking(
+        string bindingMap,
+        string bindingName,
+        string bindingValue)
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", $"""
+            name: continuous integration
+            on:
+              pull_request:
+            permissions:
+              contents: read
+            jobs:
+              build:
+                steps:
+                  - uses: owner/repository/action@v1
+                    {bindingMap}:
+                      {bindingName}: {bindingValue}
+            """);
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        AssertLimitedUnproven(inspection);
+        Assert.Contains(inspection.Failures, failure => failure.Message.Contains("remote action", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void Credential_shaped_binding_probes_block_the_complete_readiness_result()
+    {
+        using var corpus = PackedCorpus.Create();
+        var package = corpus.Pack("Standard/Standard.csproj");
+        var config = new NuGetReadyConfig
+        {
+            SchemaVersion = 1,
+            Packages =
+            [
+                new PackageExpectation
+                {
+                    Id = "Fixture.Standard",
+                    Kind = "library",
+                    Version = "1.0.0",
+                    Artifacts = [Path.GetFileName(package), Path.GetFileName(Path.ChangeExtension(package, ".snupkg"))]
+                }
+            ]
+        };
+        var probes = new[]
+        {
+            (Name: "literal environment", Map: "env", Binding: "NUGET_API_KEY", Value: "literal-credential"),
+            (Name: "vars environment", Map: "env", Binding: "NUGET_API_KEY", Value: "${{ vars.NUGET_API_KEY }}"),
+            (Name: "literal action input", Map: "with", Binding: "api-key", Value: "literal-credential"),
+            (Name: "vars action input", Map: "with", Binding: "api-key", Value: "${{ vars.NUGET_API_KEY }}")
+        };
+
+        foreach (var probe in probes)
+        {
+            using var repository = WorkflowRepository.Create("ci.yml", $"""
+                name: continuous integration
+                on:
+                  pull_request:
+                permissions:
+                  contents: read
+                jobs:
+                  build:
+                    steps:
+                      - uses: owner/repository/action@v1
+                        {probe.Map}:
+                          {probe.Binding}: {probe.Value}
+                """);
+
+            var report = CheckRunner.Run(
+                config,
+                corpus.OutputPath,
+                repository.Root.FullName,
+                TimeSpan.FromMinutes(2),
+                new ConsumerRehearsalOptions(PublicFeedPath: corpus.OutputPath));
+
+            Assert.True(
+                report.Status == "error" && report.ExitCode == 2,
+                $"Probe '{probe.Name}' returned status={report.Status}, exitCode={report.ExitCode}.");
+            Assert.Equal("error", report.Checks.Single(check => check.Id == "workflow-policy").Status);
+            Assert.Contains(report.Failures, failure => failure.IsError && failure.Message.Contains("remote action", StringComparison.OrdinalIgnoreCase));
+        }
+    }
+
+    [Theory]
+    [InlineData("NUGET_API_KEY")]
+    [InlineData("API_KEY")]
+    [InlineData("api-key")]
+    [InlineData("ACCESS_TOKEN")]
+    [InlineData("authorization")]
+    [InlineData("PASSWORD")]
+    [InlineData("secret")]
+    [InlineData("CREDENTIAL")]
+    public void Bounded_credential_binding_name_family_enters_publication_policy(string bindingName)
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", $"""
+            name: continuous integration
+            on:
+              pull_request:
+            permissions:
+              contents: read
+            jobs:
+              build:
+                steps:
+                  - uses: owner/repository/action@v1
+                    with:
+                      {bindingName}: literal-credential
+            """);
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        AssertLimitedUnproven(inspection);
+    }
+
+    [Theory]
+    [InlineData("workflow")]
+    [InlineData("job")]
+    [InlineData("step")]
+    public void Credential_shaped_environment_names_are_detected_at_each_scope(string scope)
+    {
+        var workflow = scope switch
+        {
+            "workflow" => """
+                name: continuous integration
+                on:
+                  pull_request:
+                permissions: {}
+                env:
+                  ACCESS_TOKEN: literal-credential
+                jobs:
+                  build:
+                    steps:
+                      - uses: owner/repository/action@v1
+                """,
+            "job" => """
+                name: continuous integration
+                on:
+                  pull_request:
+                permissions: {}
+                jobs:
+                  build:
+                    env:
+                      ACCESS_TOKEN: literal-credential
+                    steps:
+                      - uses: owner/repository/action@v1
+                """,
+            _ => """
+                name: continuous integration
+                on:
+                  pull_request:
+                permissions: {}
+                jobs:
+                  build:
+                    steps:
+                      - uses: owner/repository/action@v1
+                        env:
+                          ACCESS_TOKEN: literal-credential
+                """
+        };
+        using var repository = WorkflowRepository.Create("ci.yml", workflow);
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        AssertLimitedUnproven(inspection);
+    }
+
+    [Theory]
+    [InlineData("with", "literal-credential")]
+    [InlineData("with", "${{ vars.ACCESS_TOKEN }}")]
+    [InlineData("secrets", "literal-credential")]
+    [InlineData("secrets", "${{ vars.ACCESS_TOKEN }}")]
+    public void Credential_shaped_reusable_workflow_bindings_are_blocking(string bindingMap, string bindingValue)
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", $"""
+            name: continuous integration
+            on:
+              pull_request:
+            permissions:
+              contents: read
+            jobs:
+              build:
+                uses: owner/repository/.github/workflows/build.yml@v1
+                {bindingMap}:
+                  ACCESS_TOKEN: {bindingValue}
+            """);
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        AssertLimitedUnproven(inspection);
+        Assert.Contains(inspection.Failures, failure => failure.Message.Contains("reusable workflow", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void Credential_name_near_misses_keep_read_only_ci_outside_release_policy()
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", """
+            name: continuous integration
+            on:
+              pull_request:
+            permissions:
+              contents: read
+            jobs:
+              build:
+                steps:
+                  - uses: owner/repository/action@v1
+                    with:
+                      nuget-api-key-file: artifacts/key.txt
+                      api-key-path: artifacts/key.txt
+                      access-tokenizer: enabled
+                      authorization-policy: read-only
+                      passwordless: enabled
+                      secret-sauce: none
+                      credential-helper: disabled
+            """);
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        Assert.False(inspection.Evaluated);
+        Assert.Empty(inspection.Failures);
+    }
+
+    [Theory]
     [InlineData("id-token: write", null)]
     [InlineData("contents: write", null)]
     [InlineData(null, "PUBLISH_TOKEN: ${{ secrets.NUGET_API_KEY }}")]
