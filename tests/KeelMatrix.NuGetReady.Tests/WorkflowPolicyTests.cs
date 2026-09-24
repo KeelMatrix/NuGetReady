@@ -1697,6 +1697,125 @@ public sealed class WorkflowPolicyTests
     }
 
     [Fact]
+    public void Every_supported_write_permission_enters_closed_world_evaluation_at_workflow_and_job_scope()
+    {
+        foreach (var permission in WritableGitHubPermissions)
+        {
+            foreach (var scope in new[] { "workflow", "job" })
+            {
+                var workflowPermissions = scope == "workflow"
+                    ? $"permissions:\n  {permission}: write"
+                    : "permissions: {}";
+                var jobPermissions = scope == "job"
+                    ? $"    permissions:\n      {permission}: write\n"
+                    : string.Empty;
+                using var repository = WorkflowRepository.Create("ci.yml", $$"""
+                    name: continuous integration
+                    on:
+                      pull_request:
+                    {{workflowPermissions}}
+                    jobs:
+                      build:
+                        runs-on: ubuntu-latest
+                    {{jobPermissions}}    steps:
+                          - run: dotnet build
+                    """);
+
+                var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+                Assert.True(
+                    inspection.Evaluated && inspection.Failures.Any(failure => failure.IsError),
+                    $"Permission '{permission}: write' at {scope} scope unexpectedly bypassed closed-world evaluation.");
+            }
+        }
+    }
+
+    [Fact]
+    public void Unknown_permission_names_and_values_enter_closed_world_evaluation()
+    {
+        var cases = new[]
+        {
+            (Name: "unknown workflow permission", WorkflowPermissions: "future-permission: read", JobPermissions: string.Empty),
+            (Name: "unknown job permission", WorkflowPermissions: "{}", JobPermissions: "future-permission: read"),
+            (Name: "internal sentinel spelling as a mapping key", WorkflowPermissions: "__all__: read-all", JobPermissions: string.Empty),
+            (Name: "mis-cased permission name", WorkflowPermissions: "Contents: read", JobPermissions: string.Empty),
+            (Name: "unknown workflow value", WorkflowPermissions: "contents: future", JobPermissions: string.Empty),
+            (Name: "unknown job value", WorkflowPermissions: "{}", JobPermissions: "contents: future"),
+            (Name: "invalid id-token read value", WorkflowPermissions: "id-token: read", JobPermissions: string.Empty),
+            (Name: "invalid vulnerability-alerts write value", WorkflowPermissions: "{}", JobPermissions: "vulnerability-alerts: write")
+        };
+
+        foreach (var testCase in cases)
+        {
+            var workflowPermissions = testCase.WorkflowPermissions == "{}"
+                ? "permissions: {}"
+                : $"permissions:\n  {testCase.WorkflowPermissions}";
+            var jobPermissions = string.IsNullOrEmpty(testCase.JobPermissions)
+                ? string.Empty
+                : $"    permissions:\n      {testCase.JobPermissions}\n";
+            using var repository = WorkflowRepository.Create("ci.yml", $$"""
+                name: continuous integration
+                on:
+                  pull_request:
+                {{workflowPermissions}}
+                jobs:
+                  build:
+                    runs-on: ubuntu-latest
+                {{jobPermissions}}    steps:
+                      - run: dotnet build
+                """);
+
+            var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+            Assert.True(
+                inspection.Evaluated && inspection.Failures.Any(failure => failure.IsError),
+                $"Case '{testCase.Name}' unexpectedly bypassed closed-world evaluation.");
+        }
+    }
+
+    [Fact]
+    public void Producer_and_validator_reject_every_supported_write_permission()
+    {
+        foreach (var job in new[] { "produce", "validate" })
+        {
+            foreach (var permission in WritableGitHubPermissions)
+            {
+                var workflow = Mutate(
+                    ReleaseWorkflow,
+                    $"  {job}:",
+                    $"  {job}:\n    permissions:\n      {permission}: write");
+                using var repository = WorkflowRepository.Create("release.yml", workflow);
+
+                var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+                Assert.True(
+                    findings.Any(finding => !finding.IsError && finding.Message.Contains("write capability", StringComparison.OrdinalIgnoreCase)),
+                    $"Job '{job}' unexpectedly accepted '{permission}: write': {string.Join(" | ", findings.Select(finding => finding.Message))}");
+            }
+        }
+    }
+
+    [Fact]
+    public void Producer_and_validator_treat_unknown_permissions_as_unproven()
+    {
+        foreach (var job in new[] { "produce", "validate" })
+        {
+            foreach (var permission in new[] { "future-permission: read", "contents: future" })
+            {
+                var workflow = Mutate(
+                    ReleaseWorkflow,
+                    $"  {job}:",
+                    $"  {job}:\n    permissions:\n      {permission}");
+                using var repository = WorkflowRepository.Create("release.yml", workflow);
+
+                Assert.Contains(
+                    WorkflowPolicyInspector.Inspect(repository.Root.FullName),
+                    finding => finding.IsError && finding.Message.Contains("permission", StringComparison.OrdinalIgnoreCase));
+            }
+        }
+    }
+
+    [Fact]
     public void Omitted_permissions_with_github_token_are_limited_unproven()
     {
         using var repository = WorkflowRepository.Create("ci.yml", """
@@ -1937,6 +2056,25 @@ public sealed class WorkflowPolicyTests
 
     private const string ToolInstallCommand = "dotnet tool install KeelMatrix.NuGetReady --version 0.1.0 --tool-path /tmp/nugetready-tool --source https://api.nuget.org/v3/index.json --no-cache --verbosity minimal";
     private const string ValidationCommand = "/tmp/nugetready-tool/nugetready check --config nugetready.json --artifacts /tmp/nugetready-artifacts --format json";
+
+    private static readonly string[] WritableGitHubPermissions =
+    [
+        "actions",
+        "artifact-metadata",
+        "attestations",
+        "checks",
+        "code-quality",
+        "contents",
+        "deployments",
+        "discussions",
+        "id-token",
+        "issues",
+        "packages",
+        "pages",
+        "pull-requests",
+        "security-events",
+        "statuses"
+    ];
 
     private const string ReleaseWorkflow = """
         name: release

@@ -23,6 +23,7 @@ internal static class WorkflowPolicyInspector
     private const string InstalledToolDirectory = "/tmp/nugetready-tool";
     private const string CandidateToolConfigPath = "/tmp/nugetready-tool.config";
     private const string NuGetOrgSource = "https://api.nuget.org/v3/index.json";
+    private const string PermissionAllSentinel = "\0all";
     private const string InstalledValidationCommand = "/tmp/nugetready-tool/nugetready check --config nugetready.json --artifacts /tmp/nugetready-artifacts --format json";
     private const string ValidationAcquisitionResolverCommand = """
         New-Item -ItemType Directory -Path /tmp/nugetready-acquisition -Force | Out-Null
@@ -64,6 +65,25 @@ internal static class WorkflowPolicyInspector
         "-p:SymbolPackageFormat=snupkg", "-p:ImportDirectoryBuildTargets=false",
         "-p:ImportDirectoryTargets=false", "--output", "artifacts/release", "--nologo",
         "-p:UseSharedCompilation=false"
+    };
+    private static readonly HashSet<string> SupportedGitHubPermissionNames = new(StringComparer.Ordinal)
+    {
+        "actions",
+        "artifact-metadata",
+        "attestations",
+        "checks",
+        "code-quality",
+        "contents",
+        "deployments",
+        "discussions",
+        "id-token",
+        "issues",
+        "packages",
+        "pages",
+        "pull-requests",
+        "security-events",
+        "statuses",
+        "vulnerability-alerts"
     };
 
     public static IReadOnlyList<Failure> Inspect(
@@ -409,6 +429,10 @@ internal static class WorkflowPolicyInspector
         {
             failures.Add(Unsupported("The release workflow omits permissions, so its effective GitHub token scope depends on external defaults and is unsupported/unproven."));
         }
+        else if (ClassifyPermissions(workflow.Permissions) == PermissionSetClassification.Unsupported)
+        {
+            failures.Add(Unsupported("The release workflow contains an unknown or unsupported permission name or value."));
+        }
         else if (!HasExactPermissions(workflow.Permissions, ("contents", "read")))
         {
             failures.Add(new Failure("workflow-policy", "The supported release profile requires workflow permissions to be exactly contents: read."));
@@ -457,7 +481,13 @@ internal static class WorkflowPolicyInspector
             failures.Add(Unsupported("The supported publish job timeout-minutes value must be the literal 10."));
         }
 
-        if (!publishJob.PermissionsSpecified || !HasExactPermissions(publishJob.Permissions, ("contents", "read"), ("id-token", "write")))
+        if (publishJob.PermissionsSpecified &&
+            ClassifyPermissions(publishJob.Permissions) == PermissionSetClassification.Unsupported &&
+            !HasExactPermissions(publishJob.Permissions, ("contents", "read"), ("id-token", "read")))
+        {
+            failures.Add(Unsupported("The publish job contains an unknown or unsupported permission name or value."));
+        }
+        else if (!publishJob.PermissionsSpecified || !HasExactPermissions(publishJob.Permissions, ("contents", "read"), ("id-token", "write")))
         {
             failures.Add(new Failure("workflow-policy", "The publish job permissions must be exactly contents: read and id-token: write."));
         }
@@ -553,7 +583,12 @@ internal static class WorkflowPolicyInspector
         }
 
         var effectivePermissions = producerJob.PermissionsSpecified ? producerJob.Permissions : workflow.Permissions;
-        if (IsWritePermission(effectivePermissions, "id-token") || IsWriteAll(effectivePermissions) || HasOverbroadPublicationPermission(effectivePermissions))
+        var permissionClassification = ClassifyPermissions(effectivePermissions);
+        if (permissionClassification == PermissionSetClassification.Unsupported)
+        {
+            failures.Add(Unsupported("The artifact-producer job has an unknown or unsupported effective permission name or value."));
+        }
+        else if (permissionClassification == PermissionSetClassification.WriteCapable)
         {
             failures.Add(new Failure("workflow-policy", "The artifact-producer job must not receive an OIDC token or repository write capability."));
         }
@@ -619,7 +654,12 @@ internal static class WorkflowPolicyInspector
         }
 
         var effectivePermissions = validationJob.PermissionsSpecified ? validationJob.Permissions : workflow.Permissions;
-        if (IsWritePermission(effectivePermissions, "id-token") || IsWriteAll(effectivePermissions) || HasOverbroadPublicationPermission(effectivePermissions))
+        var permissionClassification = ClassifyPermissions(effectivePermissions);
+        if (permissionClassification == PermissionSetClassification.Unsupported)
+        {
+            failures.Add(Unsupported("The validation job has an unknown or unsupported effective permission name or value."));
+        }
+        else if (permissionClassification == PermissionSetClassification.WriteCapable)
         {
             failures.Add(new Failure("workflow-policy", "The validation job must not receive an OIDC token or repository write capability."));
         }
@@ -782,7 +822,9 @@ internal static class WorkflowPolicyInspector
 
     private static bool HasExactPermissions(Dictionary<string, string> actual, params (string Name, string Value)[] expected)
     {
-        return HasExactInputs(actual, expected);
+        return actual.Count == expected.Length && expected.All(item =>
+            actual.Any(pair => pair.Key.Equals(item.Name, StringComparison.Ordinal) &&
+                               pair.Value.Trim().Equals(item.Value, StringComparison.Ordinal)));
     }
 
     private static bool HasExactInputs(Dictionary<string, string> actual, params (string Name, string Value)[] expected)
@@ -1819,9 +1861,7 @@ internal static class WorkflowPolicyInspector
 
     private static bool HasPublicationCapability(Dictionary<string, string> permissions)
     {
-        return IsWritePermission(permissions, "id-token") ||
-               IsWriteAll(permissions) ||
-               HasOverbroadPublicationPermission(permissions);
+        return ClassifyPermissions(permissions) != PermissionSetClassification.ReadOnly;
     }
 
     private static Dictionary<string, string> MergeEnvironment(
@@ -1844,25 +1884,80 @@ internal static class WorkflowPolicyInspector
         return run is not null && (run.Contains("*.nupkg", StringComparison.OrdinalIgnoreCase) || run.Contains("*.snupkg", StringComparison.OrdinalIgnoreCase));
     }
 
-    private static bool IsWriteAll(Dictionary<string, string> permissions)
+    private static PermissionSetClassification ClassifyPermissions(Dictionary<string, string> permissions)
     {
-        return permissions.TryGetValue("__all__", out var value) && value.Equals("write-all", StringComparison.OrdinalIgnoreCase);
+        var writeCapable = false;
+        foreach (var permission in permissions)
+        {
+            if (permission.Key.Equals(PermissionAllSentinel, StringComparison.Ordinal))
+            {
+                if (permission.Value.Equals("write-all", StringComparison.Ordinal))
+                {
+                    writeCapable = true;
+                    continue;
+                }
+
+                if (permission.Value.Equals("read-all", StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                return PermissionSetClassification.Unsupported;
+            }
+
+            if (!SupportedGitHubPermissionNames.Contains(permission.Key))
+            {
+                return PermissionSetClassification.Unsupported;
+            }
+
+            if (permission.Value.Equals("none", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            if (permission.Key.Equals("id-token", StringComparison.Ordinal))
+            {
+                if (!permission.Value.Equals("write", StringComparison.Ordinal))
+                {
+                    return PermissionSetClassification.Unsupported;
+                }
+
+                writeCapable = true;
+                continue;
+            }
+
+            if (permission.Key.Equals("vulnerability-alerts", StringComparison.Ordinal))
+            {
+                if (!permission.Value.Equals("read", StringComparison.Ordinal))
+                {
+                    return PermissionSetClassification.Unsupported;
+                }
+
+                continue;
+            }
+
+            if (permission.Value.Equals("read", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            if (permission.Value.Equals("write", StringComparison.Ordinal))
+            {
+                writeCapable = true;
+                continue;
+            }
+
+            return PermissionSetClassification.Unsupported;
+        }
+
+        return writeCapable ? PermissionSetClassification.WriteCapable : PermissionSetClassification.ReadOnly;
     }
 
-    private static bool IsWritePermission(Dictionary<string, string> permissions, string name)
+    private enum PermissionSetClassification
     {
-        return permissions.TryGetValue(name, out var value) && value.Equals("write", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static bool HasOverbroadPublicationPermission(Dictionary<string, string> permissions)
-    {
-        return permissions.Any(permission =>
-            (permission.Key.Equals("contents", StringComparison.OrdinalIgnoreCase) ||
-             permission.Key.Equals("actions", StringComparison.OrdinalIgnoreCase) ||
-             permission.Key.Equals("packages", StringComparison.OrdinalIgnoreCase) ||
-             permission.Key.Equals("pull-requests", StringComparison.OrdinalIgnoreCase) ||
-             permission.Key.Equals("issues", StringComparison.OrdinalIgnoreCase)) &&
-            permission.Value.Equals("write", StringComparison.OrdinalIgnoreCase));
+        ReadOnly,
+        WriteCapable,
+        Unsupported
     }
 
     private static string NormalizeCondition(string? condition)
@@ -3322,7 +3417,7 @@ internal static class WorkflowPolicyInspector
                 var value = scalar.Value ?? string.Empty;
                 if (value is "read-all" or "write-all")
                 {
-                    destination["__all__"] = value;
+                    destination[PermissionAllSentinel] = value;
                     return true;
                 }
                 return false;
