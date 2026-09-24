@@ -3697,7 +3697,10 @@ internal static class WorkflowPolicyInspector
                             break;
                         case "runs-on":
                             job.RunsOn = ReadRequiredScalar(property.Value, workflow, job);
-                            TrackEvaluatedScalar(workflow, EvaluatedScalarField.JobRunsOn, job.RunsOn);
+                            TrackEvaluatedScalarLeaves(
+                                property.Value,
+                                workflow,
+                                EvaluatedScalarField.JobRunsOn);
                             break;
                         case "timeout-minutes":
                             job.TimeoutMinutes = ReadRequiredScalar(property.Value, workflow, job);

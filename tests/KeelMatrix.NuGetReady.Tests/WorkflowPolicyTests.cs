@@ -2157,6 +2157,136 @@ public sealed class WorkflowPolicyTests
         }
     }
 
+    [Fact]
+    public void Runs_on_scalar_sequence_and_mapping_expression_framing_controls_complete_readiness_result()
+    {
+        using var corpus = PackedCorpus.Create();
+        var package = corpus.Pack("Standard/Standard.csproj");
+        var symbolPackage = Path.ChangeExtension(package, ".snupkg");
+        var config = new NuGetReadyConfig
+        {
+            SchemaVersion = 1,
+            Packages =
+            [
+                new PackageExpectation
+                {
+                    Id = "Fixture.Standard",
+                    Kind = "library",
+                    Version = "1.0.0",
+                    Artifacts = [Path.GetFileName(package), Path.GetFileName(symbolPackage)]
+                }
+            ]
+        };
+        var releaseWorkflow = Mutate(
+            ReleaseWorkflow,
+            "KeelMatrix.NuGetReady.1.0.0.nupkg",
+            Path.GetFileName(package));
+        releaseWorkflow = Mutate(
+            releaseWorkflow,
+            "KeelMatrix.NuGetReady.1.0.0.snupkg",
+            Path.GetFileName(symbolPackage));
+        const string ciWorkflow = """
+            name: CI Probe
+            on:
+              push:
+                branches: [main]
+            permissions:
+              contents: read
+            jobs:
+              build:
+                runs-on: ubuntu-latest
+                steps:
+                  - uses: actions/checkout@v6
+            """;
+        var cases = new[]
+        {
+            (
+                Name: "scalar-malformed",
+                RunsOn: "runs-on: '${{ matrix.channel'",
+                ExpectedStatus: "error",
+                ExpectedExitCode: 2),
+            (
+                Name: "scalar-complete",
+                RunsOn: "runs-on: '${{ matrix.channel }}'",
+                ExpectedStatus: "pass",
+                ExpectedExitCode: 0),
+            (
+                Name: "sequence-malformed",
+                RunsOn: """
+                    runs-on:
+                      - self-hosted
+                      - '${{ matrix.channel'
+                    """,
+                ExpectedStatus: "error",
+                ExpectedExitCode: 2),
+            (
+                Name: "sequence-complete",
+                RunsOn: """
+                    runs-on:
+                      - self-hosted
+                      - '${{ matrix.channel }}'
+                    """,
+                ExpectedStatus: "pass",
+                ExpectedExitCode: 0),
+            (
+                Name: "mapping-malformed-nested-label",
+                RunsOn: """
+                    runs-on:
+                      group: '${{ vars.RUNNER_GROUP }}'
+                      labels:
+                        - self-hosted
+                        - '${{ matrix.channel'
+                    """,
+                ExpectedStatus: "error",
+                ExpectedExitCode: 2),
+            (
+                Name: "mapping-complete",
+                RunsOn: """
+                    runs-on:
+                      group: '${{ vars.RUNNER_GROUP }}'
+                      labels:
+                        - self-hosted
+                        - '${{ matrix.channel }}'
+                    """,
+                ExpectedStatus: "pass",
+                ExpectedExitCode: 0)
+        };
+        var outcomes = new List<string>();
+
+        foreach (var testCase in cases)
+        {
+            using var repository = WorkflowRepository.Create("release.yml", releaseWorkflow);
+            repository.WriteWorkflow(
+                "ci.yml",
+                Mutate(
+                    ciWorkflow,
+                    "runs-on: ubuntu-latest",
+                    testCase.RunsOn.Replace("\n", "\n    ", StringComparison.Ordinal)));
+            var configPath = Path.Combine(repository.Root.FullName, "nugetready.json");
+            repository.WriteFile("nugetready.json", System.Text.Json.JsonSerializer.Serialize(config));
+
+            var report = CheckRunner.Run(
+                config,
+                corpus.OutputPath,
+                repository.Root.FullName,
+                TimeSpan.FromMinutes(2),
+                new ConsumerRehearsalOptions(PublicFeedPath: corpus.OutputPath),
+                configPath);
+            var workflowPolicyStatus = report.Checks.Single(check => check.Id == "workflow-policy").Status;
+
+            outcomes.Add(
+                $"{testCase.Name}: overall={report.Status}; workflow-policy={workflowPolicyStatus}; exit={report.ExitCode}; " +
+                $"expected={testCase.ExpectedStatus}/{testCase.ExpectedExitCode}");
+        }
+
+        Console.WriteLine(string.Join(Environment.NewLine, outcomes));
+        Assert.True(
+            outcomes.All(outcome =>
+                outcome.Contains("overall=error; workflow-policy=error; exit=2; expected=error/2", StringComparison.Ordinal) ||
+                outcome.Contains("overall=pass; workflow-policy=pass; exit=0; expected=pass/0", StringComparison.Ordinal)),
+            string.Join(Environment.NewLine, outcomes));
+    }
+
     [Theory]
     [InlineData("branches", "${{feature")]
     [InlineData("tags", "${{feature")]
