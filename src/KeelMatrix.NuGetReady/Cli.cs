@@ -70,6 +70,7 @@ internal static partial class CliParser
           --timeout <duration>  Bounded operation timeout (for example 30s or 00:05:00)
 
         Check statuses are pass, warn, fail, error, not-run, and not-applicable.
+        Supported hosts are Windows, Linux, and macOS. The installed tool targets net8.0 and requires the .NET 8 runtime. Library packages under rehearsal may target other frameworks: every declared library target framework is built, runnable frameworks are also executed, and non-runnable library target frameworks are build-only.
         Each package expects exactly one primary .nupkg and at most one associated .snupkg; duplicate primary identities fail closed.
         Consumer provenance checks the library package cache or installed tool store's versioned .nupkg/.nupkg.sha512, package identity, and expanded payload, including XML documentation; tool asset roots are derived from tools/<tfm>/any and unsupported layouts are unproven.
         Workflow-policy pass applies only to the closed-world 0.1.0 release profile with separate unconditional ubuntu-latest producer, fresh-runner validator, and publisher jobs.

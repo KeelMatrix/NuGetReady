@@ -8,6 +8,12 @@ NuGetReady is a .NET tool that checks the exact NuGet artifacts you built and re
 dotnet tool install --global KeelMatrix.NuGetReady
 ```
 
+## Support and Requirements
+
+NuGetReady runs on Windows, Linux, and macOS. The installed tool targets `net8.0` and requires the .NET 8 runtime.
+
+Library packages under rehearsal may target frameworks other than .NET 8. NuGetReady builds a consumer for every declared library target framework, runs the consumer when that framework is runnable on the host, and treats non-runnable library target frameworks as build-only.
+
 ## Quick Start
 
 After `dotnet pack`, run:

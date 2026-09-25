@@ -30,6 +30,14 @@ public sealed class CliContractTests
     }
 
     [Fact]
+    public void Help_documents_supported_hosts_and_runtime_requirements()
+    {
+        Assert.Contains("Windows, Linux, and macOS", CliParser.HelpText, StringComparison.Ordinal);
+        Assert.Contains("targets net8.0 and requires the .NET 8 runtime", CliParser.HelpText, StringComparison.Ordinal);
+        Assert.Contains("non-runnable library target frameworks are build-only", CliParser.HelpText, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Help_documents_the_conservative_workflow_soundness_boundary()
     {
         Assert.Contains("closed-world 0.1.0 release profile", CliParser.HelpText, StringComparison.Ordinal);

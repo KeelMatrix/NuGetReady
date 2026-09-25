@@ -8,6 +8,12 @@
 dotnet tool install --global KeelMatrix.NuGetReady
 ```
 
+## Support and Requirements
+
+NuGetReady runs on Windows, Linux, and macOS. The installed tool targets `net8.0` and requires the .NET 8 runtime.
+
+Library packages under rehearsal may target frameworks other than .NET 8. NuGetReady builds a consumer for every declared library target framework, runs the consumer when that framework is runnable on the host, and treats non-runnable library target frameworks as build-only.
+
 ## Quick Start
 
 ```bash
@@ -42,7 +48,7 @@ NuGetReady validates exact expected `.nupkg`/`.snupkg` names, requiring exactly 
 
 Supported package kinds are `library`, `multiTargetLibrary`, and `dotnetTool`. Tool expectations may declare a command and safe smoke arguments. Analyzer-only packages are not supported in this version; build assets are consumed as part of the library rehearsal.
 
-The configuration contains no publishing credentials. The check never publishes packages. Consumer builds and tool smoke commands execute package code or build assets with the caller's permissions, so inspect packages and run rehearsals with appropriate permissions. Non-runnable library target frameworks are build-only.
+The configuration contains no publishing credentials. The check never publishes packages. Consumer builds and tool smoke commands execute package code or build assets with the caller's permissions, so inspect packages and run rehearsals with appropriate permissions.
 
 ## Supported Release Workflow Profile
 
