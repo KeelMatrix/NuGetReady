@@ -325,7 +325,7 @@ public sealed class WorkflowPolicyTests
 
         var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
 
-        Assert.Contains(findings, finding => finding.IsError && finding.Message.Contains("unsupported", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(findings, finding => finding.IsError && finding.Message.Contains("could not be parsed", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]
@@ -3550,6 +3550,107 @@ public sealed class WorkflowPolicyTests
     }
 
     [Theory]
+    [InlineData("KEELMATRIX_NO_TELEMETRY", "keelmatrix_no_telemetry")]
+    [InlineData("DOTNET_CLI_TELEMETRY_OPTOUT", "dotnet_cli_telemetry_optout")]
+    [InlineData("NUGET_PACKAGES", "nuget_packages")]
+    public void Required_runtime_environment_names_are_case_sensitive(string canonicalName, string caseVariant)
+    {
+        using var repository = WorkflowRepository.Create(
+            "release.yml",
+            Mutate(ReleaseWorkflow, canonicalName, caseVariant));
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+        Assert.Contains(findings, finding => finding.IsError);
+    }
+
+    [Fact]
+    public void Publish_credential_environment_name_is_case_sensitive()
+    {
+        using var repository = WorkflowRepository.Create(
+            "release.yml",
+            Mutate(
+                ReleaseWorkflow,
+                "NUGET_API_KEY: ${{ steps.nuget-login.outputs.NUGET_API_KEY }}",
+                "nuget_api_key: ${{ steps.nuget-login.outputs.NUGET_API_KEY }}"));
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+        Assert.Contains(findings, finding => finding.IsError);
+    }
+
+    [Fact]
+    public void Case_variant_environment_override_is_not_merged_as_a_linux_binding()
+    {
+        using var repository = WorkflowRepository.Create(
+            "release.yml",
+            Mutate(
+                ReleaseWorkflow,
+                "NUGET_PACKAGES: /tmp/nugetready-packages\n",
+                "NUGET_PACKAGES: /tmp/nugetready-packages\n              nuget_packages: /tmp/nugetready-packages\n"));
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+        Assert.Contains(findings, finding => finding.IsError);
+    }
+
+    [Theory]
+    [InlineData("dotnet restore Example.sln --configfile NuGet.config --nologo -p:NuGetAuditMode=all -p:NuGetAuditLevel=low -p:TreatWarningsAsErrors=true", "'dotnet' restore Example.sln --configfile NuGet.config --nologo -p:NuGetAuditMode=all -p:NuGetAuditLevel=low -p:TreatWarningsAsErrors=true")]
+    [InlineData("dotnet restore Example.sln --configfile NuGet.config --nologo -p:NuGetAuditMode=all -p:NuGetAuditLevel=low -p:TreatWarningsAsErrors=true", "dotnet restore ' Example.sln ' --configfile NuGet.config --nologo -p:NuGetAuditMode=all -p:NuGetAuditLevel=low -p:TreatWarningsAsErrors=true")]
+    [InlineData("dotnet format Example.sln --verify-no-changes --no-restore --verbosity minimal", "'dotnet' format Example.sln --verify-no-changes --no-restore --verbosity minimal")]
+    [InlineData("dotnet build Example.sln --configuration Release --no-restore --nologo -p:UseSharedCompilation=false", "dotnet build ' Example.sln ' --configuration Release --no-restore --nologo -p:UseSharedCompilation=false")]
+    [InlineData("dotnet test Example.sln --configuration Release --no-build --no-restore --nologo --logger \"console;verbosity=minimal\"", "dotnet test Example.sln --configuration Release --no-build --no-restore --nologo --logger \"console;verbosity=minimal\" \"\"")]
+    [InlineData("dotnet pack src/Example/Example.csproj --configuration Release --no-build --no-restore --include-symbols -p:SymbolPackageFormat=snupkg -p:ImportDirectoryBuildTargets=false -p:ImportDirectoryTargets=false --output artifacts/release --nologo -p:UseSharedCompilation=false", "dotnet pack (src/Example/Example.csproj) --configuration Release --no-build --no-restore --include-symbols -p:SymbolPackageFormat=snupkg -p:ImportDirectoryBuildTargets=false -p:ImportDirectoryTargets=false --output artifacts/release --nologo -p:UseSharedCompilation=false")]
+    [InlineData(ToolInstallCommand, "'dotnet' tool install KeelMatrix.NuGetReady --version 0.1.0 --tool-path /tmp/nugetready-tool --source https://api.nuget.org/v3/index.json --no-cache --verbosity minimal")]
+    [InlineData(ValidationCommand, "'/tmp/nugetready-tool/nugetready' check --config nugetready.json --artifacts /tmp/nugetready-artifacts --format json")]
+    public void Unsupported_command_quoting_or_empty_arguments_never_remain_certifiable(string command, string replacement)
+    {
+        using var repository = WorkflowRepository.Create(
+            "release.yml",
+            ReplaceRunWithBlockScalar(ReleaseWorkflow, command, replacement));
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+        Assert.Contains(findings, finding => finding.IsError && finding.Message.Contains("profile", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Theory]
+    [InlineData("automation.yml", "on: [push")]
+    [InlineData("automation.yml", "name: first\nname: second")]
+    [InlineData("automation.yml", "- not-a-workflow\n- still-not-a-workflow")]
+    [InlineData("automation.yml", "name: first\n---\nname: second")]
+    public void Invalid_workflow_input_is_blocking_even_with_a_neutral_filename(string fileName, string invalidContent)
+    {
+        using var repository = WorkflowRepository.Create("release.yml", ReleaseWorkflow);
+        File.Delete(Path.Combine(repository.Root.FullName, ".github", "workflows", "release.yml"));
+        repository.WriteWorkflow(fileName, invalidContent);
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        Assert.True(inspection.Evaluated);
+        var failure = Assert.Single(inspection.Failures);
+        Assert.True(failure.IsError);
+        Assert.Contains($".github/workflows/{fileName}", failure.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("second", failure.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("automation.yml")]
+    [InlineData("broken-release.yml")]
+    public void Invalid_workflow_input_is_blocking_beside_a_valid_release_workflow(string fileName)
+    {
+        using var repository = WorkflowRepository.Create("release.yml", ReleaseWorkflow);
+        repository.WriteWorkflow(fileName, "on: [push");
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        Assert.True(inspection.Evaluated);
+        Assert.Contains(inspection.Failures, failure =>
+            failure.IsError &&
+            failure.Message.Contains($".github/workflows/{fileName}", StringComparison.Ordinal));
+    }
+
+    [Theory]
     [InlineData("dotnet build KeelMatrix.NuGetReady.sln -t:Publish")]
     [InlineData("dotnet msbuild publish.proj -t:Publish")]
     [InlineData("dotnet tool run arbitrary-tool")]
@@ -4310,6 +4411,19 @@ public sealed class WorkflowPolicyTests
         workflow = workflow.Replace("\r\n", "\n", StringComparison.Ordinal);
         Assert.Contains(original, workflow, StringComparison.Ordinal);
         return workflow.Replace(original, replacement, StringComparison.Ordinal);
+    }
+
+    private static string ReplaceRunWithBlockScalar(string workflow, string command, string replacement)
+    {
+        workflow = workflow.Replace("\r\n", "\n", StringComparison.Ordinal);
+        var originalLine = workflow
+            .Split('\n')
+            .Single(line => line.Trim().Equals($"run: {command}", StringComparison.Ordinal));
+        var indentation = originalLine[..(originalLine.Length - originalLine.TrimStart().Length)];
+        return workflow.Replace(
+            originalLine,
+            $"{indentation}run: |\n{indentation}  {replacement}",
+            StringComparison.Ordinal);
     }
 
     private static void AssertLimitedUnproven(WorkflowInspectionResult inspection)

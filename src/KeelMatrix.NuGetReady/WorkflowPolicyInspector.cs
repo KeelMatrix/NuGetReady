@@ -12,6 +12,8 @@ internal sealed record WorkflowInspectionResult(IReadOnlyList<Failure> Failures,
 
 internal static class WorkflowPolicyInspector
 {
+    private readonly record struct ExactCommandToken(string Value, bool IsQuoted, char Quote);
+
     private readonly record struct ExpressionReferenceAnalysis(
         bool HasCredentialReference,
         bool HasMalformedFraming);
@@ -62,7 +64,7 @@ internal static class WorkflowPolicyInspector
         </configuration>
         '@ | Set-Content -LiteralPath /tmp/nugetready-tool.config -Encoding utf8NoBOM
         """;
-    private static readonly string[] InstalledValidationTokens = TokenizeCommandLine(InstalledValidationCommand);
+    private static readonly string[] InstalledValidationTokens = TokenizeCommandLineForDiscovery(InstalledValidationCommand);
     private static readonly string[] ExactPackArguments =
     {
         "--configuration", "Release", "--no-build", "--no-restore", "--include-symbols",
@@ -189,6 +191,16 @@ internal static class WorkflowPolicyInspector
             }
 
             var workflow = SupportedYaml.Parse(content);
+            if (workflow.HasParseFailure)
+            {
+                evaluated = true;
+                failures.Add(new Failure(
+                    "workflow-policy",
+                    $"Workflow input '{relativePath}' could not be parsed as a single YAML workflow document.",
+                    IsError: true));
+                continue;
+            }
+
             if (!LooksLikeReleaseWorkflow(repositoryPath, path, workflow))
             {
                 continue;
@@ -839,7 +851,7 @@ internal static class WorkflowPolicyInspector
 
     private static bool HasSupportedJobEnvironment(Dictionary<string, string> environment)
     {
-        var allowed = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        var allowed = new Dictionary<string, string>(StringComparer.Ordinal)
         {
             ["KEELMATRIX_NO_TELEMETRY"] = "1",
             ["DOTNET_CLI_TELEMETRY_OPTOUT"] = "1",
@@ -945,23 +957,24 @@ internal static class WorkflowPolicyInspector
     private static bool TryMatchRestoreStep(string repositoryPath, WorkflowStep step, out string solutionPath)
     {
         solutionPath = string.Empty;
-        if (!TryGetDirectCommandTokens(step, out var tokens) ||
+        if (!TryGetExactCommandTokens(step, out var tokens) ||
             tokens.Length != 9 ||
-            !tokens[0].Equals("dotnet", StringComparison.Ordinal) ||
-            !tokens[1].Equals("restore", StringComparison.Ordinal) ||
-            !IsLiteralRepositoryPath(tokens[2], "sln", "slnx") ||
-            GetExactRepositoryPath(repositoryPath, tokens[2], expectDirectory: false, out _) != RepositoryPathStatus.Exact ||
-            !tokens[3].Equals("--configfile", StringComparison.Ordinal) ||
-            !tokens[4].Equals("NuGet.config", StringComparison.Ordinal) ||
-            !tokens[5].Equals("--nologo", StringComparison.Ordinal) ||
-            !tokens[6].Equals("-p:NuGetAuditMode=all", StringComparison.Ordinal) ||
-            !tokens[7].Equals("-p:NuGetAuditLevel=low", StringComparison.Ordinal) ||
-            !tokens[8].Equals("-p:TreatWarningsAsErrors=true", StringComparison.Ordinal))
+            tokens.Any(token => token.IsQuoted) ||
+            !tokens[0].Value.Equals("dotnet", StringComparison.Ordinal) ||
+            !tokens[1].Value.Equals("restore", StringComparison.Ordinal) ||
+            !IsLiteralRepositoryPath(tokens[2].Value, "sln", "slnx") ||
+            GetExactRepositoryPath(repositoryPath, tokens[2].Value, expectDirectory: false, out _) != RepositoryPathStatus.Exact ||
+            !tokens[3].Value.Equals("--configfile", StringComparison.Ordinal) ||
+            !tokens[4].Value.Equals("NuGet.config", StringComparison.Ordinal) ||
+            !tokens[5].Value.Equals("--nologo", StringComparison.Ordinal) ||
+            !tokens[6].Value.Equals("-p:NuGetAuditMode=all", StringComparison.Ordinal) ||
+            !tokens[7].Value.Equals("-p:NuGetAuditLevel=low", StringComparison.Ordinal) ||
+            !tokens[8].Value.Equals("-p:TreatWarningsAsErrors=true", StringComparison.Ordinal))
         {
             return false;
         }
 
-        solutionPath = tokens[2];
+        solutionPath = tokens[2].Value;
         return true;
     }
 
@@ -988,17 +1001,18 @@ internal static class WorkflowPolicyInspector
 
     private static bool IsExactPackStep(string repositoryPath, WorkflowStep step)
     {
-        if (!TryGetDirectCommandTokens(step, out var tokens) ||
+        if (!TryGetExactCommandTokens(step, out var tokens) ||
             tokens.Length != 15 ||
-            !tokens[0].Equals("dotnet", StringComparison.Ordinal) ||
-            !tokens[1].Equals("pack", StringComparison.Ordinal) ||
-            !IsLiteralRepositoryPath(tokens[2], "csproj") ||
-            GetExactRepositoryPath(repositoryPath, tokens[2], expectDirectory: false, out _) != RepositoryPathStatus.Exact)
+            tokens.Any(token => token.IsQuoted) ||
+            !tokens[0].Value.Equals("dotnet", StringComparison.Ordinal) ||
+            !tokens[1].Value.Equals("pack", StringComparison.Ordinal) ||
+            !IsLiteralRepositoryPath(tokens[2].Value, "csproj") ||
+            GetExactRepositoryPath(repositoryPath, tokens[2].Value, expectDirectory: false, out _) != RepositoryPathStatus.Exact)
         {
             return false;
         }
 
-        return tokens.Skip(3).SequenceEqual(ExactPackArguments, StringComparer.Ordinal);
+        return tokens.Skip(3).Select(token => token.Value).SequenceEqual(ExactPackArguments, StringComparer.Ordinal);
     }
 
     private static bool IsExactToolInstallStep(WorkflowStep step, bool useCandidateToolArtifactSource)
@@ -1064,9 +1078,9 @@ internal static class WorkflowPolicyInspector
                step.PresentKeys.All(key => key is "name" or "shell" or "run");
     }
 
-    private static bool TryGetDirectCommandTokens(WorkflowStep step, out string[] tokens)
+    private static bool TryGetExactCommandTokens(WorkflowStep step, out ExactCommandToken[] tokens)
     {
-        tokens = Array.Empty<string>();
+        tokens = Array.Empty<ExactCommandToken>();
         if (!IsDefinitelyEnabled(step.Condition) ||
             step.HasUninspectableStructure ||
             !string.Equals(step.Shell, "pwsh", StringComparison.Ordinal) ||
@@ -1085,8 +1099,7 @@ internal static class WorkflowPolicyInspector
             return false;
         }
 
-        tokens = TokenizeCommandLine(command);
-        return tokens.Length > 0;
+        return TryTokenizeExactCommandLine(command, out tokens);
     }
 
     private static bool HasUnquotedCommandSeparator(string command)
@@ -1117,10 +1130,99 @@ internal static class WorkflowPolicyInspector
         return quote != '\0';
     }
 
+    private static bool TryTokenizeExactCommandLine(
+        string command,
+        out ExactCommandToken[] tokens)
+    {
+        var parsed = new List<ExactCommandToken>();
+        var value = new StringBuilder();
+        var quote = '\0';
+        var quoteCharacter = '\0';
+        var tokenStarted = false;
+        var tokenContainsUnquotedText = false;
+
+        void AddToken()
+        {
+            if (!tokenStarted)
+            {
+                return;
+            }
+
+            parsed.Add(new ExactCommandToken(value.ToString(), quoteCharacter != '\0', quoteCharacter));
+            value.Clear();
+            quoteCharacter = '\0';
+            tokenStarted = false;
+            tokenContainsUnquotedText = false;
+        }
+
+        foreach (var character in command)
+        {
+            if (quote != '\0')
+            {
+                if (character == '`')
+                {
+                    tokens = Array.Empty<ExactCommandToken>();
+                    return false;
+                }
+
+                if (character == quote)
+                {
+                    quote = '\0';
+                }
+                else
+                {
+                    value.Append(character);
+                }
+
+                continue;
+            }
+
+            if (character is '\'' or '"')
+            {
+                if (tokenContainsUnquotedText || quoteCharacter != '\0')
+                {
+                    tokens = Array.Empty<ExactCommandToken>();
+                    return false;
+                }
+
+                quote = character;
+                quoteCharacter = character;
+                tokenStarted = true;
+                continue;
+            }
+
+            if (char.IsWhiteSpace(character))
+            {
+                AddToken();
+                continue;
+            }
+
+            if (character is ';' or '|' or '&' or '`' or '(' or ')' or ',' or '<' or '>')
+            {
+                tokens = Array.Empty<ExactCommandToken>();
+                return false;
+            }
+
+            value.Append(character);
+            tokenStarted = true;
+            tokenContainsUnquotedText = true;
+        }
+
+        if (quote != '\0')
+        {
+            tokens = Array.Empty<ExactCommandToken>();
+            return false;
+        }
+
+        AddToken();
+        tokens = parsed.ToArray();
+        return tokens.Length > 0;
+    }
+
     private static bool HasExactDirectCommand(WorkflowStep step, params string[] expectedTokens)
     {
-        return TryGetDirectCommandTokens(step, out var tokens) &&
-               tokens.SequenceEqual(expectedTokens, StringComparer.Ordinal);
+        return TryGetExactCommandTokens(step, out var tokens) &&
+               ExactCommandTokensMatch(tokens, expectedTokens);
     }
 
     private static bool HasExactDirectCommandInWorkingDirectory(
@@ -1147,8 +1249,41 @@ internal static class WorkflowPolicyInspector
             return false;
         }
 
-        var tokens = TokenizeCommandLine(command);
-        return tokens.SequenceEqual(expectedTokens, StringComparer.Ordinal);
+        return TryTokenizeExactCommandLine(command, out var tokens) &&
+               ExactCommandTokensMatch(tokens, expectedTokens);
+    }
+
+    private static bool ExactCommandTokensMatch(
+        IReadOnlyList<ExactCommandToken> actual,
+        IReadOnlyList<string> expected)
+    {
+        if (actual.Count != expected.Count)
+        {
+            return false;
+        }
+
+        for (var index = 0; index < expected.Count; index++)
+        {
+            if (!string.Equals(actual[index].Value, expected[index], StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            var requiresDoubleQuotes = expected[index].Contains(';');
+            if (requiresDoubleQuotes)
+            {
+                if (!actual[index].IsQuoted || actual[index].Quote != '"')
+                {
+                    return false;
+                }
+            }
+            else if (actual[index].IsQuoted)
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private static bool IsLiteralRepositoryPath(string value, params string[] extensions)
@@ -2156,7 +2291,7 @@ internal static class WorkflowPolicyInspector
     private static Dictionary<string, string> MergeEnvironment(
         params IReadOnlyDictionary<string, string>[] scopes)
     {
-        var effective = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var effective = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (var scope in scopes)
         {
             foreach (var pair in scope)
@@ -2515,7 +2650,7 @@ internal static class WorkflowPolicyInspector
 
     private static CommandAnalysis AnalyzeCommandLine(string line, HashSet<string>? safePowerShellFunctions = null)
     {
-        var tokens = TokenizeCommandLine(line);
+        var tokens = TokenizeCommandLineForDiscovery(line);
         if (tokens.Length == 0)
         {
             return CommandAnalysis.Empty;
@@ -3035,7 +3170,7 @@ internal static class WorkflowPolicyInspector
                normalized.EndsWith(".bat", StringComparison.OrdinalIgnoreCase);
     }
 
-    private static string[] TokenizeCommandLine(string line)
+    private static string[] TokenizeCommandLineForDiscovery(string line)
     {
         var tokens = new List<string>();
         var token = new StringBuilder();
@@ -3064,7 +3199,7 @@ internal static class WorkflowPolicyInspector
             {
                 if (token.Length > 0)
                 {
-                    var cleaned = CleanCommandToken(token.ToString());
+                    var cleaned = CleanDiscoveryToken(token.ToString());
                     if (cleaned.Length > 0)
                     {
                         tokens.Add(cleaned);
@@ -3081,7 +3216,7 @@ internal static class WorkflowPolicyInspector
 
         if (token.Length > 0)
         {
-            var cleaned = CleanCommandToken(token.ToString());
+            var cleaned = CleanDiscoveryToken(token.ToString());
             if (cleaned.Length > 0)
             {
                 tokens.Add(cleaned);
@@ -3091,7 +3226,7 @@ internal static class WorkflowPolicyInspector
         return tokens.ToArray();
     }
 
-    private static string CleanCommandToken(string token)
+    private static string CleanDiscoveryToken(string token)
     {
         return token.Trim().Trim('`', ',', ';', '|', '&', '(', ')').Trim();
     }
@@ -3103,7 +3238,7 @@ internal static class WorkflowPolicyInspector
 
     private static bool HasTelemetrySuppression(WorkflowDocument workflow, WorkflowJob job)
     {
-        var inheritedEnvironment = new Dictionary<string, string>(workflow.Environment, StringComparer.OrdinalIgnoreCase);
+        var inheritedEnvironment = new Dictionary<string, string>(workflow.Environment, StringComparer.Ordinal);
         ApplyEnvironment(inheritedEnvironment, job.Environment);
 
         var relevantSteps = job.Steps
@@ -3116,7 +3251,7 @@ internal static class WorkflowPolicyInspector
 
         return relevantSteps.All(step =>
         {
-            var effectiveEnvironment = new Dictionary<string, string>(inheritedEnvironment, StringComparer.OrdinalIgnoreCase);
+            var effectiveEnvironment = new Dictionary<string, string>(inheritedEnvironment, StringComparer.Ordinal);
             ApplyEnvironment(effectiveEnvironment, step.Environment);
             return HasTelemetrySuppression(effectiveEnvironment);
         });
@@ -3164,6 +3299,7 @@ internal static class WorkflowPolicyInspector
         public bool HasPublicationShapedTrigger { get; set; }
         public bool HasPublicationInput { get; set; }
         public bool HasMalformedExpressionFraming { get; set; }
+        public bool HasParseFailure { get; set; }
         public bool HasUninspectableStructure { get; set; }
         public bool HasUninspectableControlStructure { get; set; }
         public bool HasUninspectableCredentialBinding { get; set; }
@@ -3173,7 +3309,7 @@ internal static class WorkflowPolicyInspector
         public bool HasOtherTrigger { get; set; }
         public bool PermissionsSpecified { get; set; }
         public Dictionary<string, string> Permissions { get; } = new(StringComparer.OrdinalIgnoreCase);
-        public Dictionary<string, string> Environment { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public Dictionary<string, string> Environment { get; } = new(StringComparer.Ordinal);
         public HashSet<string> PresentKeys { get; } = new(StringComparer.OrdinalIgnoreCase);
         public List<string> TagPatterns { get; } = new();
         public List<WorkflowJob> Jobs { get; } = new();
@@ -3196,7 +3332,7 @@ internal static class WorkflowPolicyInspector
         public HashSet<string> PresentKeys { get; } = new(StringComparer.OrdinalIgnoreCase);
         public HashSet<string> DependsOn { get; } = new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, string> Permissions { get; } = new(StringComparer.OrdinalIgnoreCase);
-        public Dictionary<string, string> Environment { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public Dictionary<string, string> Environment { get; } = new(StringComparer.Ordinal);
         public Dictionary<string, string> Inputs { get; } = new(StringComparer.OrdinalIgnoreCase);
         public List<WorkflowStep> Steps { get; } = new();
     }
@@ -3215,7 +3351,7 @@ internal static class WorkflowPolicyInspector
         public bool PermissionsSpecified { get; set; }
         public HashSet<string> PresentKeys { get; } = new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, string> Permissions { get; } = new(StringComparer.OrdinalIgnoreCase);
-        public Dictionary<string, string> Environment { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public Dictionary<string, string> Environment { get; } = new(StringComparer.Ordinal);
         public Dictionary<string, string> With { get; } = new(StringComparer.OrdinalIgnoreCase);
     }
 
@@ -3304,11 +3440,13 @@ internal static class WorkflowPolicyInspector
             var workflow = new WorkflowDocument();
             if (!TryLoadRoot(content, out var root, out var unsupported) || root is null)
             {
+                workflow.HasParseFailure = true;
                 workflow.HasUninspectableStructure = true;
                 workflow.HasUninspectableControlStructure = true;
                 return workflow;
             }
 
+            workflow.HasParseFailure = HasDuplicateMappingKeys(root);
             workflow.HasUninspectableStructure = unsupported;
             foreach (var pair in root.Children)
             {
@@ -3390,6 +3528,35 @@ internal static class WorkflowPolicyInspector
             return workflow;
         }
 
+        private static bool HasDuplicateMappingKeys(YamlNode node)
+        {
+            if (node is YamlMappingNode mapping)
+            {
+                var keys = new HashSet<string>(StringComparer.Ordinal);
+                foreach (var pair in mapping.Children)
+                {
+                    if (TryScalar(pair.Key, out var key) && !keys.Add(key))
+                    {
+                        return true;
+                    }
+
+                    if (HasDuplicateMappingKeys(pair.Key) || HasDuplicateMappingKeys(pair.Value))
+                    {
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+
+            if (node is YamlSequenceNode sequence)
+            {
+                return sequence.Children.Any(HasDuplicateMappingKeys);
+            }
+
+            return false;
+        }
+
         private static bool TryLoadRoot(string content, out YamlMappingNode? root, out bool unsupported)
         {
             root = null;
@@ -3413,6 +3580,10 @@ internal static class WorkflowPolicyInspector
                 return false;
             }
             catch (ArgumentException)
+            {
+                return false;
+            }
+            catch (InvalidOperationException)
             {
                 return false;
             }

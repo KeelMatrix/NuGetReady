@@ -53,6 +53,11 @@ public sealed class CliContractTests
         Assert.Contains("fixed runner-controlled", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("exact cross-platform casing", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("exact repository-root nugetready.json", CliParser.HelpText, StringComparison.Ordinal);
+        Assert.Contains("case-sensitive runtime identity", CliParser.HelpText, StringComparison.Ordinal);
+        Assert.Contains("credential-name normalization does not prove a process binding", CliParser.HelpText, StringComparison.Ordinal);
+        Assert.Contains("preserve command position, quoting, literal argument bytes, empty arguments, and operators", CliParser.HelpText, StringComparison.Ordinal);
+        Assert.Contains("malformed YAML, duplicate keys, invalid roots, or multiple documents are error/exit 2", CliParser.HelpText, StringComparison.Ordinal);
+        Assert.Contains("not-applicable requires successfully inspected non-applicability", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("capability-and-reachability boundary", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("dependency and artifact-producer job", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("Omitted effective permissions", CliParser.HelpText, StringComparison.Ordinal);
@@ -84,5 +89,48 @@ public sealed class CliContractTests
         var exception = Assert.Throws<CliInputException>(() => CliParser.Parse(new[] { "check", "--format", "json", "--config" }));
 
         Assert.Equal(OutputFormat.Json, exception.Format);
+    }
+
+    [Theory]
+    [InlineData("automation.yml")]
+    [InlineData("broken-release.yml")]
+    public void Parsed_workflow_input_errors_are_public_blocking_results(string workflowFileName)
+    {
+        using var fixture = PackageFixture.Create();
+        fixture.AddPackage("Example.Core.1.2.3.nupkg", "Example.Core", "1.2.3");
+        using var repository = WorkflowRepository.Create(workflowFileName, "on: [push\nsecret: SUPER_SECRET_SENTINEL");
+        var config = new NuGetReadyConfig
+        {
+            SchemaVersion = 1,
+            Packages =
+            [
+                new PackageExpectation
+                {
+                    Id = "Example.Core",
+                    Kind = "library",
+                    Version = "1.2.3",
+                    Artifacts = ["Example.Core.1.2.3.nupkg"]
+                }
+            ]
+        };
+        var configPath = Path.Combine(repository.Root.FullName, "nugetready.json");
+        File.WriteAllText(configPath, System.Text.Json.JsonSerializer.Serialize(config));
+
+        var report = CheckRunner.Run(
+            config,
+            fixture.ArtifactsPath,
+            repository.Root.FullName,
+            TimeSpan.FromSeconds(1),
+            configPath: configPath);
+        var text = ReportWriter.RenderText(report);
+        var json = ReportWriter.RenderJson(report);
+
+        Assert.Equal("error", report.Status);
+        Assert.Equal(2, report.ExitCode);
+        Assert.Equal("error", report.Checks.Single(check => check.Id == "workflow-policy").Status);
+        Assert.Contains($".github/workflows/{workflowFileName}", text, StringComparison.Ordinal);
+        Assert.Contains($".github/workflows/{workflowFileName}", json, StringComparison.Ordinal);
+        Assert.DoesNotContain("SUPER_SECRET_SENTINEL", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("SUPER_SECRET_SENTINEL", json, StringComparison.Ordinal);
     }
 }
