@@ -157,7 +157,7 @@ public sealed class BoundedProcessTests
         var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(1);
         while (DateTime.UtcNow < deadline)
         {
-            if (kill(pid, 0) != 0)
+            if (!IsLiveProcess(pid))
             {
                 return true;
             }
@@ -165,7 +165,43 @@ public sealed class BoundedProcessTests
             Thread.Sleep(25);
         }
 
-        return kill(pid, 0) != 0;
+        return !IsLiveProcess(pid);
+    }
+
+    private static bool IsLiveProcess(int pid)
+    {
+        if (kill(pid, 0) != 0)
+        {
+            return false;
+        }
+
+        try
+        {
+            using var process = Process.Start(new ProcessStartInfo
+            {
+                FileName = "/bin/ps",
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                ArgumentList = { "-o", "state=", "-p", pid.ToString(System.Globalization.CultureInfo.InvariantCulture) }
+            });
+            if (process is null)
+            {
+                return true;
+            }
+
+            var state = process.StandardOutput.ReadToEnd().Trim();
+            if (!process.WaitForExit(1000) || process.ExitCode != 0)
+            {
+                return true;
+            }
+
+            return state.IndexOf('Z') < 0;
+        }
+        catch (Exception exception) when (exception is InvalidOperationException or System.ComponentModel.Win32Exception)
+        {
+            return true;
+        }
     }
 
     [DllImport("libc", SetLastError = true)]

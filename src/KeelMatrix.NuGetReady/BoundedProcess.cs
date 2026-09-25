@@ -250,6 +250,7 @@ internal static class BoundedProcess
                 return true;
             }
 
+            _ = kill(-processGroupId, SigKill);
             Thread.Sleep(10);
         }
 
