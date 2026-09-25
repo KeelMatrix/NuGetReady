@@ -10,27 +10,29 @@ public sealed class BoundedProcessTests
     {
         var (fileName, arguments, pidFile) = CreatePipeHoldingProcess();
         var stopwatch = Stopwatch.StartNew();
+        var timeout = IsSlowProcessHost ? TimeSpan.FromSeconds(1) : TimeSpan.FromMilliseconds(150);
 
         var result = await BoundedProcess.RunAsync(
             fileName,
             arguments,
             Environment.CurrentDirectory,
             new Dictionary<string, string?>(),
-            TimeSpan.FromMilliseconds(150));
+            timeout);
 
         stopwatch.Stop();
 
         Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(2), $"Process lifecycle took {stopwatch.Elapsed}.");
         Assert.True(result.TimedOut);
         Assert.True(result.CleanupConfirmed);
-        AssertUnixDescendantsTerminated(pidFile);
+        AssertDescendantsTerminated(pidFile, expectedPidCount: OperatingSystem.IsWindows() ? 1 : 2);
     }
 
     [Fact]
     public async Task Cancellation_terminates_the_complete_process_lifecycle()
     {
         var (fileName, arguments, pidFile) = CreatePipeHoldingProcess();
-        using var cancellation = new CancellationTokenSource(TimeSpan.FromMilliseconds(150));
+        var cancellationDelay = IsSlowProcessHost ? TimeSpan.FromSeconds(1) : TimeSpan.FromMilliseconds(150);
+        using var cancellation = new CancellationTokenSource(cancellationDelay);
 
         try
         {
@@ -44,24 +46,19 @@ public sealed class BoundedProcessTests
         }
         finally
         {
-            AssertUnixDescendantsTerminated(pidFile);
+            AssertDescendantsTerminated(pidFile, expectedPidCount: OperatingSystem.IsWindows() ? 1 : 2);
         }
     }
 
     [Fact]
     public async Task Successful_parent_exit_with_redirected_descendant_is_cleaned_up()
     {
-        if (OperatingSystem.IsWindows())
-        {
-            return;
-        }
-
-        var pidFile = Path.Combine(Path.GetTempPath(), $"nugetready-success-pids-{Guid.NewGuid():N}.txt");
+        var (fileName, arguments, pidFile) = CreateSuccessfulParentExitProcess();
         try
         {
             var result = await BoundedProcess.RunAsync(
-                "sh",
-                ["-c", "sleep 30 >/dev/null 2>&1 & child=$!; printf '%s\\n' \"$child\" > \"$1\"; exit 0", "nugetready-test", pidFile],
+                fileName,
+                arguments,
                 Environment.CurrentDirectory,
                 new Dictionary<string, string?>(),
                 TimeSpan.FromSeconds(2));
@@ -70,15 +67,7 @@ public sealed class BoundedProcessTests
             Assert.Equal(0, result.ExitCode);
             Assert.True(result.CleanupConfirmed);
 
-            var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(2);
-            while (!File.Exists(pidFile) && DateTime.UtcNow < deadline)
-            {
-                await Task.Delay(25);
-            }
-
-            Assert.True(File.Exists(pidFile), "The successful shell did not record its descendant PID.");
-            var pid = int.Parse(File.ReadAllText(pidFile).Trim(), System.Globalization.CultureInfo.InvariantCulture);
-            Assert.True(WaitForExit(pid), $"Unix descendant PID {pid} survived successful-completion cleanup.");
+            AssertDescendantsTerminated(pidFile, expectedPidCount: 1);
         }
         finally
         {
@@ -86,6 +75,8 @@ public sealed class BoundedProcessTests
             {
                 File.Delete(pidFile);
             }
+
+            DeleteWindowsFixtureArtifacts(pidFile);
         }
     }
 
@@ -93,10 +84,11 @@ public sealed class BoundedProcessTests
     {
         if (OperatingSystem.IsWindows())
         {
+            var windowsPidFile = Path.Combine(Path.GetTempPath(), $"nugetready-process-pids-{Guid.NewGuid():N}.txt");
             return (
-                "cmd.exe",
-                ["/c", "start \"\" /b powershell.exe -NoProfile -Command Start-Sleep -Seconds 30 & exit /b 0"],
-                null);
+                "pwsh.exe",
+                CreateWindowsProcessArguments(windowsPidFile, redirectOutput: false),
+                windowsPidFile);
         }
 
         var pidFile = Path.Combine(Path.GetTempPath(), $"nugetready-process-pids-{Guid.NewGuid():N}.txt");
@@ -106,13 +98,68 @@ public sealed class BoundedProcessTests
             pidFile);
     }
 
-    private static void AssertUnixDescendantsTerminated(string? pidFile)
+    private static (string FileName, IReadOnlyList<string> Arguments, string PidFile) CreateSuccessfulParentExitProcess()
+    {
+        var pidFile = Path.Combine(Path.GetTempPath(), $"nugetready-success-pids-{Guid.NewGuid():N}.txt");
+        if (OperatingSystem.IsWindows())
+        {
+            return (
+                "pwsh.exe",
+                CreateWindowsProcessArguments(pidFile, redirectOutput: true),
+                pidFile);
+        }
+
+        return (
+            "sh",
+            ["-c", "sleep 30 >/dev/null 2>&1 & child=$!; printf '%s\\n' \"$child\" > \"$1\"; exit 0", "nugetready-test", pidFile],
+            pidFile);
+    }
+
+    private static IReadOnlyList<string> CreateWindowsProcessArguments(string pidFile, bool redirectOutput)
+    {
+        var descendantScript = $"[System.IO.File]::WriteAllText('{EscapePowerShellLiteral(pidFile)}', [string]$PID); Start-Sleep -Seconds 30";
+        var encodedDescendantScript = Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes(descendantScript));
+        var standardOutputFile = pidFile + ".stdout";
+        var standardErrorFile = pidFile + ".stderr";
+        var processScript = redirectOutput
+            ? $"$child = Start-Process -FilePath 'pwsh.exe' -ArgumentList @('-NoProfile', '-EncodedCommand', '{encodedDescendantScript}') -RedirectStandardOutput '{EscapePowerShellLiteral(standardOutputFile)}' -RedirectStandardError '{EscapePowerShellLiteral(standardErrorFile)}' -PassThru; [System.IO.File]::WriteAllText('{EscapePowerShellLiteral(pidFile)}', [string]$child.Id); exit 0"
+            : descendantScript;
+        var encodedProcessScript = Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes(processScript));
+        return ["-NoProfile", "-EncodedCommand", encodedProcessScript];
+    }
+
+    private static void DeleteWindowsFixtureArtifacts(string? pidFile)
+    {
+        if (OperatingSystem.IsWindows() && pidFile is not null)
+        {
+            foreach (var suffix in new[] { ".stdout", ".stderr" })
+            {
+                var path = pidFile + suffix;
+                if (File.Exists(path))
+                {
+                    File.Delete(path);
+                }
+            }
+        }
+    }
+
+    private static string EscapePowerShellLiteral(string value) => value.Replace("'", "''", StringComparison.Ordinal);
+
+    private static bool IsSlowProcessHost => OperatingSystem.IsWindows() || Environment.GetEnvironmentVariable("WSL_INTEROP") is not null;
+
+    private static void AssertDescendantsTerminated(string? pidFile, int expectedPidCount)
     {
         if (OperatingSystem.IsWindows())
         {
+            AssertWindowsDescendantsTerminated(pidFile, expectedPidCount);
             return;
         }
 
+        AssertUnixDescendantsTerminated(pidFile, expectedPidCount);
+    }
+
+    private static void AssertUnixDescendantsTerminated(string? pidFile, int expectedPidCount)
+    {
         Assert.NotNull(pidFile);
         try
         {
@@ -137,7 +184,7 @@ public sealed class BoundedProcessTests
                 .SelectMany(line => line.Split(' ', StringSplitOptions.RemoveEmptyEntries))
                 .Select(value => int.Parse(value, System.Globalization.CultureInfo.InvariantCulture))
                 .ToArray();
-            Assert.Equal(2, pids.Length);
+            Assert.Equal(expectedPidCount, pids.Length);
             foreach (var pid in pids)
             {
                 Assert.True(WaitForExit(pid), $"Unix descendant PID {pid} survived cleanup.");
@@ -149,6 +196,51 @@ public sealed class BoundedProcessTests
             {
                 File.Delete(pidFile);
             }
+
+            DeleteWindowsFixtureArtifacts(pidFile);
+        }
+    }
+
+    private static void AssertWindowsDescendantsTerminated(string? pidFile, int expectedPidCount)
+    {
+        Assert.NotNull(pidFile);
+        try
+        {
+            var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(2);
+            string[]? lines = null;
+            while (DateTime.UtcNow < deadline)
+            {
+                if (File.Exists(pidFile))
+                {
+                    lines = File.ReadAllLines(pidFile);
+                    if (lines.Any(line => !string.IsNullOrWhiteSpace(line)))
+                    {
+                        break;
+                    }
+                }
+
+                Thread.Sleep(25);
+            }
+
+            Assert.NotNull(lines);
+            var pids = lines!
+                .SelectMany(line => line.Split(' ', StringSplitOptions.RemoveEmptyEntries))
+                .Select(value => int.Parse(value, System.Globalization.CultureInfo.InvariantCulture))
+                .ToArray();
+            Assert.Equal(expectedPidCount, pids.Length);
+            foreach (var pid in pids)
+            {
+                Assert.True(WaitForExit(pid), $"Windows descendant PID {pid} survived cleanup.");
+            }
+        }
+        finally
+        {
+            if (File.Exists(pidFile))
+            {
+                File.Delete(pidFile);
+            }
+
+            DeleteWindowsFixtureArtifacts(pidFile);
         }
     }
 
@@ -169,6 +261,11 @@ public sealed class BoundedProcessTests
     }
 
     private static bool IsLiveProcess(int pid)
+    {
+        return OperatingSystem.IsWindows() ? IsLiveWindowsProcess(pid) : IsLiveUnixProcess(pid);
+    }
+
+    private static bool IsLiveUnixProcess(int pid)
     {
         if (kill(pid, 0) != 0)
         {
@@ -204,6 +301,44 @@ public sealed class BoundedProcessTests
         }
     }
 
+    private static bool IsLiveWindowsProcess(int pid)
+    {
+        var handle = OpenProcess(ProcessQueryLimitedInformation, false, checked((uint)pid));
+        if (handle == IntPtr.Zero)
+        {
+            return Marshal.GetLastWin32Error() != ErrorInvalidParameter;
+        }
+
+        try
+        {
+            if (!GetExitCodeProcess(handle, out var exitCode))
+            {
+                return true;
+            }
+
+            return exitCode == StillActive;
+        }
+        finally
+        {
+            _ = CloseHandle(handle);
+        }
+    }
+
+    private const uint ProcessQueryLimitedInformation = 0x1000;
+    private const uint StillActive = 259;
+    private const int ErrorInvalidParameter = 87;
+
     [DllImport("libc", SetLastError = true)]
     private static extern int kill(int processId, int signal);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr OpenProcess(uint desiredAccess, [MarshalAs(UnmanagedType.Bool)] bool inheritHandle, uint processId);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetExitCodeProcess(IntPtr process, out uint exitCode);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CloseHandle(IntPtr handle);
 }

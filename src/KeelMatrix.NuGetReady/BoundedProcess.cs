@@ -105,7 +105,9 @@ internal static class BoundedProcess
             var completeLifecycle = Task.WhenAll(waitForExit, standardOutput, standardError);
             var timeoutTask = Task.Delay(timeout, CancellationToken.None);
             var cancellationTask = Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
-            var completed = await Task.WhenAny(completeLifecycle, timeoutTask, cancellationTask).ConfigureAwait(false);
+            var completed = OperatingSystem.IsWindows()
+                ? await Task.WhenAny(completeLifecycle, waitForExit, timeoutTask, cancellationTask).ConfigureAwait(false)
+                : await Task.WhenAny(completeLifecycle, timeoutTask, cancellationTask).ConfigureAwait(false);
 
             if (completed == cancellationTask)
             {
@@ -121,9 +123,13 @@ internal static class BoundedProcess
                 await DrainAfterTerminationAsync(completeLifecycle, lifecycleCancellation).ConfigureAwait(false);
             }
 
-            if (!timedOut && completed == completeLifecycle)
+            if (!timedOut && (completed == completeLifecycle || (OperatingSystem.IsWindows() && completed == waitForExit)))
             {
                 cleanupConfirmed = Terminate(process, processJob, useUnixProcessGroup);
+                if (completed == waitForExit)
+                {
+                    await DrainAfterTerminationAsync(completeLifecycle, lifecycleCancellation).ConfigureAwait(false);
+                }
             }
 
             if (completeLifecycle.IsCompletedSuccessfully)
