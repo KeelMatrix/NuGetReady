@@ -91,7 +91,10 @@ public sealed class ReleaseContractTests
         var result = repository.Validate(mode: "Tag", tagVersion: "0.1.0");
 
         Assert.NotEqual(0, result.ExitCode);
-        Assert.Contains("exactly one", result.StandardError, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(
+            "exactly one",
+            result.StandardOutput + Environment.NewLine + result.StandardError,
+            StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]

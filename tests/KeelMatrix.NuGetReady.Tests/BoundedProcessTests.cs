@@ -111,7 +111,7 @@ public sealed class BoundedProcessTests
 
         return (
             "sh",
-            ["-c", "sleep 30 >/dev/null 2>&1 & child=$!; printf '%s\\n' \"$child\" > \"$1\"; exit 0", "nugetready-test", pidFile],
+            ["-c", "sleep 30 >/dev/null 2>&1 & child=$!; printf '%s %s\\n' \"$$\" \"$child\" > \"$1\"; exit 0", "nugetready-test", pidFile],
             pidFile);
     }
 

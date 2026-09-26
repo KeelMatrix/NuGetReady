@@ -736,6 +736,13 @@ internal static class ConsumerRehearsal
             return ConsumerTargetFrameworkSupport.Unsupported;
         }
 
+        if (parsed.HasPlatform &&
+            string.Equals(parsed.Platform, "windows", StringComparison.OrdinalIgnoreCase) &&
+            !OperatingSystem.IsWindows())
+        {
+            return ConsumerTargetFrameworkSupport.Unsupported;
+        }
+
         if (string.Equals(parsed.Framework, FrameworkConstants.FrameworkIdentifiers.NetStandard, StringComparison.OrdinalIgnoreCase) ||
             string.Equals(parsed.Framework, FrameworkConstants.FrameworkIdentifiers.Net, StringComparison.OrdinalIgnoreCase))
         {
