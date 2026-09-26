@@ -12,6 +12,131 @@ public sealed class ConsumerRehearsalTests
         this.testOutput = testOutput;
     }
 
+    [Theory]
+    [InlineData("net8.0", "Runnable")]
+    [InlineData("netstandard2.0", "BuildOnly")]
+    [InlineData("net48", "BuildOnly")]
+    [InlineData("net481", "BuildOnly")]
+    [InlineData("net8.0-windows", "Runnable")]
+    [InlineData("net8.0-android", "Unsupported")]
+    public void Framework_support_model_is_explicit_and_framework_aware(string framework, string expectedName)
+    {
+        var expected = Enum.Parse<ConsumerRehearsal.ConsumerTargetFrameworkSupport>(expectedName);
+        if (framework is "net48" or "net481")
+        {
+            expected = OperatingSystem.IsWindows()
+                ? ConsumerRehearsal.ConsumerTargetFrameworkSupport.BuildOnly
+                : ConsumerRehearsal.ConsumerTargetFrameworkSupport.Unsupported;
+        }
+
+        if (framework == "net8.0-windows" && !OperatingSystem.IsWindows())
+        {
+            expected = ConsumerRehearsal.ConsumerTargetFrameworkSupport.Unsupported;
+        }
+
+        Assert.Equal(expected, ConsumerRehearsal.GetConsumerTargetFrameworkSupport(framework));
+    }
+
+    [Theory]
+    [InlineData(0, false)]
+    [InlineData(1, false)]
+    [InlineData(1, true)]
+    public void Unconfirmed_cleanup_is_always_an_infrastructure_error(int exitCode, bool timedOut)
+    {
+        var outcome = ConsumerRehearsal.ClassifyProcessResult(
+            new ProcessResult(true, exitCode, timedOut, string.Empty, string.Empty, CleanupConfirmed: false),
+            ConsumerRehearsal.ProcessPhase.Build);
+
+        Assert.False(outcome.Passed);
+        Assert.True(outcome.IsError);
+        Assert.Contains("unproven", outcome.Diagnostic, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Obsolete_first_public_type_is_not_selected_for_the_consumer_probe()
+    {
+        using var corpus = PackedCorpus.Create();
+        var package = corpus.Pack("Documentation/Documentation.csproj");
+        var outcomes = ConsumerRehearsal.RunDetailed(
+            Config(new PackageExpectation
+            {
+                Id = "Fixture.Documentation",
+                Kind = "library",
+                Version = "1.0.0",
+                Artifacts = Artifacts(package)
+            }),
+            corpus.OutputPath,
+            TimeSpan.FromMinutes(2),
+            new ConsumerRehearsalOptions(PublicFeedPath: corpus.OutputPath));
+
+        Assert.Single(outcomes);
+        Assert.Equal("pass", outcomes[0].Result.Status);
+    }
+
+    [Theory]
+    [InlineData("net48")]
+    [InlineData("net481")]
+    public void Framework_aware_consumer_rehearsal_does_not_treat_net_framework_as_modern_dotnet(string framework)
+    {
+        using var corpus = PackedCorpus.Create();
+        var package = corpus.Pack("Standard/Standard.csproj");
+        var frameworkPackage = ArchiveMutator.ReplaceEntryPaths(
+            package,
+            path => path.Replace("lib/net8.0/", $"lib/{framework}/", StringComparison.OrdinalIgnoreCase),
+            $"Fixture.Standard.{framework}.nupkg");
+        var artifacts = Directory.CreateDirectory(Path.Combine(corpus.Root.FullName, framework));
+        File.Copy(frameworkPackage, Path.Combine(artifacts.FullName, "Fixture.Standard.1.0.0.nupkg"));
+
+        var outcomes = ConsumerRehearsal.RunDetailed(
+            Config(new PackageExpectation
+            {
+                Id = "Fixture.Standard",
+                Kind = "library",
+                Version = "1.0.0",
+                Artifacts = ["Fixture.Standard.1.0.0.nupkg"]
+            }),
+            artifacts.FullName,
+            TimeSpan.FromSeconds(30),
+            new ConsumerRehearsalOptions(PublicFeedPath: Directory.CreateDirectory(Path.Combine(corpus.Root.FullName, $"{framework}-feed")).FullName));
+
+        Assert.Single(outcomes);
+        Assert.NotEqual("fail", outcomes[0].Result.Status);
+    }
+
+    [Fact]
+    public void Unavailable_sdk_is_an_infrastructure_error_before_package_failure_classification()
+    {
+        using var corpus = PackedCorpus.Create();
+        var package = corpus.Pack("Standard/Standard.csproj");
+        static Task<ProcessResult> MissingSdk(
+            string fileName,
+            IReadOnlyList<string> arguments,
+            string workingDirectory,
+            IReadOnlyDictionary<string, string?> environment,
+            TimeSpan timeout) => Task.FromResult(new ProcessResult(
+                Started: true,
+                ExitCode: 1,
+                TimedOut: false,
+                StandardOutput: string.Empty,
+                StandardError: "No .NET SDKs were found.",
+                CleanupConfirmed: true));
+
+        var outcomes = ConsumerRehearsal.RunDetailed(
+            Config(new PackageExpectation
+            {
+                Id = "Fixture.Standard",
+                Kind = "library",
+                Version = "1.0.0",
+                Artifacts = Artifacts(package)
+            }),
+            corpus.OutputPath,
+            TimeSpan.FromSeconds(30),
+            new ConsumerRehearsalOptions(ProcessRunner: MissingSdk));
+
+        Assert.Equal("error", outcomes.Single().Result.Status);
+        Assert.Contains("tooling", outcomes.Single().Diagnostic, StringComparison.OrdinalIgnoreCase);
+    }
+
     [Fact]
     public void Packed_library_multitarget_build_assets_and_tool_rehearse_in_isolation()
     {

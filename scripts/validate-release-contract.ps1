@@ -75,9 +75,15 @@ function Get-HeadingSections {
     param([string[]]$Lines)
 
     $sections = [System.Collections.Generic.List[object]]::new()
+    $inFence = $false
     for ($index = 0; $index -lt $Lines.Count; $index++) {
-        if ($Lines[$index] -match '^\s*##\s+\[(?<label>[^\]]+)\](?:\s+-\s*(?<date>\d{4}-\d{2}-\d{2}))?\s*$') {
-            $sections.Add([pscustomobject]@{
+        if ($Lines[$index] -match '^\s*(```|~~~)') {
+            $inFence = -not $inFence
+            continue
+        }
+
+        if (-not $inFence -and $Lines[$index] -match '^\s*##\s+\[(?<label>[^\]]+)\](?:\s+-\s*(?<date>\d{4}-\d{2}-\d{2}))?\s*$') {
+            $null = $sections.Add([pscustomobject]@{
                     Index = $index
                     Label = $Matches.label.Trim()
                     Date = if ($Matches.ContainsKey("date")) { $Matches.date } else { $null }
@@ -108,6 +114,59 @@ function Get-SectionLines {
     }
 
     return @($Lines[($Section.Index + 1)..($next - 1)])
+}
+
+function Get-RealReleaseContent {
+    param([string[]]$Lines)
+
+    $categories = [System.Collections.Generic.List[string]]::new()
+    $hasAddedEntry = $false
+    $currentCategory = $null
+    $inFence = $false
+    foreach ($line in $Lines) {
+        if ($line -match '^\s*(```|~~~)') {
+            $inFence = -not $inFence
+            continue
+        }
+
+        if ($inFence) {
+            continue
+        }
+
+        if ($line -match '^\s*###\s+(?<category>.+?)\s*$') {
+            $currentCategory = $Matches.category.Trim()
+            $null = $categories.Add($currentCategory)
+            continue
+        }
+
+        if ($currentCategory -eq "Added" -and $line -match '^\s*[-*+]\s+\S') {
+            $hasAddedEntry = $true
+        }
+    }
+
+    return [pscustomobject]@{
+        Categories = @($categories)
+        HasAddedEntry = $hasAddedEntry
+    }
+}
+
+function Get-RealBulletEntries {
+    param([string[]]$Lines)
+
+    $entries = [System.Collections.Generic.List[string]]::new()
+    $inFence = $false
+    foreach ($line in $Lines) {
+        if ($line -match '^\s*(```|~~~)') {
+            $inFence = -not $inFence
+            continue
+        }
+
+        if (-not $inFence -and $line -match '^\s*[-*+]\s+(?<text>\S.*)$') {
+            $null = $entries.Add($Matches.text.Trim())
+        }
+    }
+
+    return @($entries)
 }
 
 $root = (Resolve-Path -LiteralPath $RepositoryRoot).Path
@@ -296,7 +355,24 @@ $changelog = Read-RequiredFile $changelogPath
 $changelogLines = $changelog -split '\r?\n'
 $sections = @(Get-HeadingSections -Lines $changelogLines)
 $unreleased = $sections | Where-Object { $_.Label -ieq "Unreleased" } | Select-Object -First 1
-$release = $sections | Where-Object { $_.Label -eq $targetVersion } | Select-Object -First 1
+$targetReleases = @($sections | Where-Object { $_.Label -eq $targetVersion })
+if ($targetReleases.Count -gt 1) {
+    Fail-Contract "CHANGELOG.md must contain exactly one real [$targetVersion] release section; found $($targetReleases.Count)."
+}
+
+foreach ($section in $sections | Where-Object { -not [string]::IsNullOrWhiteSpace($_.Date) }) {
+    $parsedDate = [datetime]::MinValue
+    if (-not [datetime]::TryParseExact(
+            $section.Date,
+            "yyyy-MM-dd",
+            [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::None,
+            [ref]$parsedDate)) {
+        Fail-Contract "CHANGELOG.md release [$($section.Label)] must use a real ISO calendar date; '$($section.Date)' is invalid."
+    }
+}
+
+$release = $targetReleases | Select-Object -First 1
 
 if ($Mode -eq "PreRelease") {
     if ($null -eq $unreleased) {
@@ -304,7 +380,8 @@ if ($Mode -eq "PreRelease") {
     }
 
     $unreleasedLines = @(Get-SectionLines -Lines $changelogLines -Section $unreleased -Sections $sections)
-    $hasUnreleasedEntry = @($unreleasedLines | Where-Object { $_ -match '^\s*[-*+]\s+\S' }).Count -gt 0
+    $realUnreleasedEntries = @(Get-RealBulletEntries -Lines $unreleasedLines)
+    $hasUnreleasedEntry = $realUnreleasedEntries.Count -gt 0
     $hasFinalizedRelease = $null -ne $release -and -not [string]::IsNullOrWhiteSpace($release.Date)
     if (-not $hasUnreleasedEntry -and -not $hasFinalizedRelease) {
         Fail-Contract "CHANGELOG.md must contain planned [Unreleased] entries or a dated [$targetVersion] release for a pre-release candidate."
@@ -327,8 +404,9 @@ if ($releaseBody -match '(?i)\b(planned|unreleased|tbd|pending|coming\s+soon|not
     Fail-Contract "CHANGELOG.md release [$targetVersion] contains pre-release wording."
 }
 
-$releaseCategories = @($releaseLines | Where-Object { $_ -match '^\s*###\s+(?<category>.+?)\s*$' } | ForEach-Object { $Matches.category.Trim() })
-if ($releaseCategories.Count -eq 0 -or -not ($releaseCategories -contains "Added")) {
+$releaseContent = Get-RealReleaseContent -Lines $releaseLines
+$releaseCategories = @($releaseContent.Categories)
+if ($releaseCategories.Count -eq 0 -or -not ($releaseCategories -contains "Added") -or -not $releaseContent.HasAddedEntry) {
     Fail-Contract "The first public release [$targetVersion] must contain an Added section."
 }
 foreach ($category in $releaseCategories) {

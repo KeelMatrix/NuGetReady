@@ -19,7 +19,9 @@ internal static class ArchiveInspector
         using var reader = new PackageArchiveReader(path);
         var nuspec = reader.NuspecReader;
         var identity = nuspec.GetIdentity();
-        var files = reader.GetFiles()
+        var rawFiles = ArchiveInspectionLimits.GetFiles(reader);
+        ArchiveInspectionLimits.ValidateExpandedPayload(reader, rawFiles);
+        var files = rawFiles
             .Select(Normalize)
             .OrderBy(file => file, StringComparer.Ordinal)
             .ToArray();
@@ -206,7 +208,9 @@ internal static class ArchiveInspector
                 mainReader = new PackageArchiveReader(mainPackagePath);
             }
 
-            var mainFiles = mainReader?.GetFiles()
+            var mainFiles = mainReader is null
+                ? null
+                : ArchiveInspectionLimits.GetFiles(mainReader)
                 .Select(Normalize)
                 .ToHashSet(StringComparer.OrdinalIgnoreCase);
             foreach (var pdbFile in pdbFiles)
@@ -214,8 +218,7 @@ internal static class ArchiveInspector
                 try
                 {
                     using var source = symbolReader.GetStream(pdbFile);
-                    using var stream = new MemoryStream();
-                    source.CopyTo(stream);
+                    using var stream = new MemoryStream(ArchiveInspectionLimits.ReadBounded(source), writable: false);
                     stream.Position = 0;
                     using var provider = System.Reflection.Metadata.MetadataReaderProvider.FromPortablePdbStream(stream);
                     var metadata = provider.GetMetadataReader();
@@ -274,8 +277,7 @@ internal static class ArchiveInspector
         List<Failure> failures)
     {
         using var source = mainReader.GetStream(assemblyPath);
-        using var assemblyStream = new MemoryStream();
-        source.CopyTo(assemblyStream);
+        using var assemblyStream = new MemoryStream(ArchiveInspectionLimits.ReadBounded(source), writable: false);
         assemblyStream.Position = 0;
         using var peReader = new PEReader(assemblyStream);
         var debugEntries = peReader.ReadDebugDirectory();

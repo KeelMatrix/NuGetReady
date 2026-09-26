@@ -22,9 +22,9 @@ public sealed class BoundedProcessTests
         stopwatch.Stop();
 
         Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(2), $"Process lifecycle took {stopwatch.Elapsed}.");
-        Assert.True(result.TimedOut);
-        Assert.True(result.CleanupConfirmed);
-        AssertDescendantsTerminated(pidFile, expectedPidCount: OperatingSystem.IsWindows() ? 1 : 2);
+        Assert.True(result.TimedOut, $"stdout={result.StandardOutput}; stderr={result.StandardError}; cleanup={result.CleanupConfirmed}");
+        Assert.True(result.CleanupConfirmed, $"stdout={result.StandardOutput}; stderr={result.StandardError}");
+        AssertDescendantsTerminated(pidFile, expectedPidCount: 2);
     }
 
     [Fact]
@@ -46,7 +46,7 @@ public sealed class BoundedProcessTests
         }
         finally
         {
-            AssertDescendantsTerminated(pidFile, expectedPidCount: OperatingSystem.IsWindows() ? 1 : 2);
+            AssertDescendantsTerminated(pidFile, expectedPidCount: 2);
         }
     }
 
@@ -63,11 +63,11 @@ public sealed class BoundedProcessTests
                 new Dictionary<string, string?>(),
                 TimeSpan.FromSeconds(2));
 
-            Assert.False(result.TimedOut);
-            Assert.Equal(0, result.ExitCode);
+            Assert.False(result.TimedOut, $"stdout={result.StandardOutput}; stderr={result.StandardError}; cleanup={result.CleanupConfirmed}");
+            Assert.True(result.ExitCode == 0, result.StandardError);
             Assert.True(result.CleanupConfirmed);
 
-            AssertDescendantsTerminated(pidFile, expectedPidCount: 1);
+            AssertDescendantsTerminated(pidFile, expectedPidCount: 2);
         }
         finally
         {
@@ -87,7 +87,7 @@ public sealed class BoundedProcessTests
             var windowsPidFile = Path.Combine(Path.GetTempPath(), $"nugetready-process-pids-{Guid.NewGuid():N}.txt");
             return (
                 "pwsh.exe",
-                CreateWindowsProcessArguments(windowsPidFile, redirectOutput: false),
+                CreateWindowsProcessArguments(windowsPidFile, redirectOutput: false, keepParentAlive: true),
                 windowsPidFile);
         }
 
@@ -105,7 +105,7 @@ public sealed class BoundedProcessTests
         {
             return (
                 "pwsh.exe",
-                CreateWindowsProcessArguments(pidFile, redirectOutput: true),
+                CreateWindowsProcessArguments(pidFile, redirectOutput: true, keepParentAlive: false),
                 pidFile);
         }
 
@@ -115,15 +115,19 @@ public sealed class BoundedProcessTests
             pidFile);
     }
 
-    private static IReadOnlyList<string> CreateWindowsProcessArguments(string pidFile, bool redirectOutput)
+    private static IReadOnlyList<string> CreateWindowsProcessArguments(string pidFile, bool redirectOutput, bool keepParentAlive)
     {
-        var descendantScript = $"[System.IO.File]::WriteAllText('{EscapePowerShellLiteral(pidFile)}', [string]$PID); Start-Sleep -Seconds 30";
-        var encodedDescendantScript = Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes(descendantScript));
+        var grandchildScript = "Start-Sleep -Seconds 30";
+        var encodedGrandchildScript = Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes(grandchildScript));
+        var childScript = $"[System.IO.File]::WriteAllText('{EscapePowerShellLiteral(pidFile)}', [string]$PID + ' '); $grandchild = Start-Process -FilePath 'pwsh.exe' -ArgumentList @('-NoProfile', '-EncodedCommand', '{encodedGrandchildScript}') -PassThru; [System.IO.File]::AppendAllText('{EscapePowerShellLiteral(pidFile)}', [string]$grandchild.Id + ' '); Start-Sleep -Seconds 30";
+        var encodedChildScript = Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes(childScript));
         var standardOutputFile = pidFile + ".stdout";
         var standardErrorFile = pidFile + ".stderr";
+        var waitForDescendants = $"for ($i = 0; $i -lt 200 -and ((-not (Test-Path '{EscapePowerShellLiteral(pidFile)}')) -or ((Get-Content '{EscapePowerShellLiteral(pidFile)}' -Raw).Trim().Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries).Count -lt 2)); $i++) {{ Start-Sleep -Milliseconds 10 }}";
+        var holdParent = keepParentAlive ? "; Start-Sleep -Seconds 30" : string.Empty;
         var processScript = redirectOutput
-            ? $"$child = Start-Process -FilePath 'pwsh.exe' -ArgumentList @('-NoProfile', '-EncodedCommand', '{encodedDescendantScript}') -RedirectStandardOutput '{EscapePowerShellLiteral(standardOutputFile)}' -RedirectStandardError '{EscapePowerShellLiteral(standardErrorFile)}' -PassThru; [System.IO.File]::WriteAllText('{EscapePowerShellLiteral(pidFile)}', [string]$child.Id); exit 0"
-            : descendantScript;
+            ? $"Start-Process -FilePath 'pwsh.exe' -ArgumentList @('-NoProfile', '-EncodedCommand', '{encodedChildScript}') -RedirectStandardOutput '{EscapePowerShellLiteral(standardOutputFile)}' -RedirectStandardError '{EscapePowerShellLiteral(standardErrorFile)}' -PassThru | Out-Null; {waitForDescendants}{holdParent}; exit 0"
+            : $"$psi = [System.Diagnostics.ProcessStartInfo]::new(); $psi.FileName = 'pwsh.exe'; $psi.UseShellExecute = $false; $psi.ArgumentList.Add('-NoProfile'); $psi.ArgumentList.Add('-EncodedCommand'); $psi.ArgumentList.Add('{encodedChildScript}'); [System.Diagnostics.Process]::Start($psi) | Out-Null; {waitForDescendants}{holdParent}; exit 0";
         var encodedProcessScript = Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes(processScript));
         return ["-NoProfile", "-EncodedCommand", encodedProcessScript];
     }

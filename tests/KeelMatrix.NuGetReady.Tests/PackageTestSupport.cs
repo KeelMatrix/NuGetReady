@@ -143,6 +143,31 @@ internal sealed partial class PackedCorpus : IDisposable
 
 internal static class ArchiveMutator
 {
+    public static string AddGeneratedEntries(string packagePath, int count, string outputName)
+    {
+        var outputPath = Path.Combine(Path.GetDirectoryName(packagePath)!, outputName);
+        using (var input = ZipFile.OpenRead(packagePath))
+        using (var output = ZipFile.Open(outputPath, ZipArchiveMode.Create))
+        {
+            foreach (var entry in input.Entries)
+            {
+                var destination = output.CreateEntry(entry.FullName, CompressionLevel.NoCompression);
+                using var destinationStream = destination.Open();
+                using var sourceStream = entry.Open();
+                sourceStream.CopyTo(destinationStream);
+            }
+
+            for (var index = 0; index < count; index++)
+            {
+                var entry = output.CreateEntry($"payload/{index}.bin", CompressionLevel.NoCompression);
+                using var stream = entry.Open();
+                stream.WriteByte(1);
+            }
+        }
+
+        return outputPath;
+    }
+
     public static string ReplaceNuspecText(string packagePath, Func<string, string> replacement, string? outputName = null)
     {
         var outputPath = Path.Combine(Path.GetDirectoryName(packagePath)!, outputName ?? Path.GetFileNameWithoutExtension(packagePath) + ".mutated.nupkg");

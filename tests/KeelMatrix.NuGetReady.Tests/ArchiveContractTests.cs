@@ -422,6 +422,30 @@ public sealed class ArchiveContractTests
     }
 
     [Fact]
+    public void Archive_entry_limit_is_rejected_before_consumer_execution()
+    {
+        using var fixture = PackageFixture.Create();
+        var original = fixture.AddPackage("Example.Core.1.2.3.nupkg", "Example.Core", "1.2.3");
+        var oversized = ArchiveMutator.AddGeneratedEntries(
+            original,
+            ArchiveInspectionLimits.MaxEntryCount,
+            "Example.Core.too-many-entries.nupkg");
+        File.Delete(original);
+        using var repository = WorkflowRepository.Create("ci.yml", "name: CI");
+
+        var report = CheckRunner.Run(
+            Config("Example.Core", "library", "1.2.3", Path.GetFileName(oversized)),
+            fixture.ArtifactsPath,
+            repository.Root.FullName,
+            TimeSpan.FromSeconds(1));
+
+        Assert.Equal(2, report.ExitCode);
+        Assert.Equal("error", report.Status);
+        Assert.Contains(report.Failures, failure => failure.CheckId == "archive-parse" && failure.IsError);
+        Assert.Equal("not-run", report.Checks.Single(check => check.Id == "consumer-rehearsal").Status);
+    }
+
+    [Fact]
     public void Text_and_json_reports_are_byte_stable()
     {
         using var fixture = PackageFixture.Create();

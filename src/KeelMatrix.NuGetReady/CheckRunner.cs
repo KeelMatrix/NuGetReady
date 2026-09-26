@@ -129,6 +129,13 @@ internal static class CheckRunner
                     package,
                     expected));
             }
+            catch (ArchiveLimitExceededException exception)
+            {
+                failures["archive-parse"].Add(FailureContext.ForArchive(
+                    new Failure("archive-parse", exception.Message, true),
+                    package,
+                    expected));
+            }
             catch (Exception)
             {
                 failures["archive-parse"].Add(FailureContext.ForArchive(

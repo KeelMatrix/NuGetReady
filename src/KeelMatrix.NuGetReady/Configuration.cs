@@ -120,6 +120,12 @@ internal static partial class ConfigurationLoader
             throw new NuGetReadyInputException("Configuration must declare between 1 and 100 packages.");
         }
 
+        if (config.WorkflowPolicy?.ExpectedNuGetUsername is { } expectedUsername &&
+            (string.IsNullOrWhiteSpace(expectedUsername) || expectedUsername.Length > 100 || expectedUsername.Any(char.IsControl) || expectedUsername.Any(char.IsWhiteSpace)))
+        {
+            throw new NuGetReadyInputException("WorkflowPolicy.ExpectedNuGetUsername must be a non-empty literal username without whitespace.");
+        }
+
         var artifactNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var packageIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var package in config.Packages)

@@ -64,6 +64,79 @@ public sealed class ReleaseContractTests
     }
 
     [Fact]
+    public void Invalid_calendar_release_date_is_rejected()
+    {
+        using var repository = SyntheticReleaseRepository.Create(
+            SyntheticReleaseRepository.FinalizedChangelog.Replace("2026-09-16", "2026-99-99", StringComparison.Ordinal));
+
+        var result = repository.Validate(mode: "Tag", tagVersion: "0.1.0");
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("date", result.StandardError, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Duplicate_target_release_sections_are_rejected()
+    {
+        using var repository = SyntheticReleaseRepository.Create(
+            SyntheticReleaseRepository.FinalizedChangelog + """
+
+            ## [0.1.0] - 2026-09-17
+
+            ### Added
+
+            - Duplicate release entry.
+            """);
+
+        var result = repository.Validate(mode: "Tag", tagVersion: "0.1.0");
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("exactly one", result.StandardError, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Empty_target_release_is_rejected()
+    {
+        using var repository = SyntheticReleaseRepository.Create(
+            SyntheticReleaseRepository.FinalizedChangelog.Replace(
+                "### Added\n\n- Initial package capabilities.\n- Release documentation.",
+                "### Added",
+                StringComparison.Ordinal));
+
+        var result = repository.Validate(mode: "Tag", tagVersion: "0.1.0");
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("Added section", result.StandardError, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Fenced_example_release_heading_does_not_satisfy_tag_mode()
+    {
+        using var repository = SyntheticReleaseRepository.Create("""
+            # Changelog
+
+            ## [Unreleased]
+
+            ### Added
+
+            - Initial package capabilities.
+
+            ```markdown
+            ## [0.1.0] - 2026-09-16
+
+            ### Added
+
+            - Example only.
+            ```
+            """);
+
+        var result = repository.Validate(mode: "Tag", tagVersion: "0.1.0");
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("does not contain", result.StandardError, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public void A_mismatched_install_command_is_rejected()
     {
         using var repository = SyntheticReleaseRepository.Create(readme: """
@@ -114,8 +187,8 @@ public sealed class ReleaseContractTests
         var tagResult = repository.Validate(mode: "Tag", tagVersion: "v0.1.0");
         var prereleaseResult = repository.Validate(mode: "PreRelease", tagVersion: null);
 
-        Assert.Equal(0, tagResult.ExitCode);
-        Assert.Equal(0, prereleaseResult.ExitCode);
+        Assert.True(tagResult.ExitCode == 0, tagResult.StandardOutput + Environment.NewLine + tagResult.StandardError);
+        Assert.True(prereleaseResult.ExitCode == 0, prereleaseResult.StandardOutput + Environment.NewLine + prereleaseResult.StandardError);
         Assert.Contains("Release contract passed", tagResult.StandardOutput, StringComparison.OrdinalIgnoreCase);
     }
 

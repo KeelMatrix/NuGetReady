@@ -10,9 +10,9 @@ dotnet tool install --global KeelMatrix.NuGetReady
 
 ## Support and Requirements
 
-NuGetReady runs on Windows, Linux, and macOS. The installed tool targets `net8.0` and requires the .NET 8 runtime.
+NuGetReady runs on Windows, Linux, and macOS. The installed tool targets `net8.0` and requires the .NET 8 runtime. Consumer rehearsal also requires a compatible .NET SDK because restore, build, and tool installation are SDK operations; missing SDKs, runtimes, target packs, or required workloads produce `error`/exit code `2`.
 
-Library packages under rehearsal may target frameworks other than .NET 8. NuGetReady builds a consumer for every declared library target framework, runs the consumer when that framework is runnable on the host, and treats non-runnable library target frameworks as build-only.
+The supported consumer framework matrix is explicit: `net5.0` and later unqualified modern .NET targets are restored, built, and executed; Windows-specific modern targets such as `net8.0-windows` are supported only on Windows; `.NET Standard` targets are restored and built only; and .NET Framework targets such as `net48` and `net481` are restored and built only on Windows. Other or platform-incompatible targets are reported as unsupported infrastructure (`error`/exit code `2`). A build-only result proves compilation and package consumption, not successful execution.
 
 ## Quick Start
 
@@ -44,7 +44,28 @@ The default configuration file is `nugetready.json` in the current directory. Th
 }
 ```
 
-NuGetReady validates exact expected `.nupkg`/`.snupkg` names, requiring exactly one primary `.nupkg` per package expectation and at most one associated `.snupkg`. Duplicate primary package identities are rejected as an ambiguous artifact set instead of being silently selected. It also checks package identity/version, authors, description, tags, license, README, icon, repository metadata, dependency groups, related-package versions, library/tool layout and command metadata, portable symbols, and sensitive/internal archive entries. It creates a temporary local feed, controlled `NuGet.config`, a separate package cache for each consumer, and bounded consumer processes. Inherited fallback folders and restore-source overrides are disabled; library package caches and installed tool stores are checked for the versioned canonical `.nupkg`, package-specific provenance sidecar, matching identity, and every extracted payload file—including XML documentation—against the supplied artifact before the consumer is built. Tool asset selection is derived from `tools/<tfm>/any` roots; unsupported or empty selections fail as unproven. Package-under-test IDs are source-mapped to the local feed and public dependencies may resolve from the configured public source. Library consumers are restored and built against a public type from every declared `lib/` or `ref/` target framework; runnable target frameworks also execute the generated consumer. Reports are deterministic in text or versioned JSON format.
+An optional workflow policy setting can require a particular publisher account without imposing a company-owned account on customers:
+
+```json
+{
+  "schemaVersion": 1,
+  "workflowPolicy": { "expectedNuGetUsername": "customer-maintainer" },
+  "packages": [
+    {
+      "id": "Example.Core",
+      "kind": "library",
+      "version": "1.2.3",
+      "artifacts": ["Example.Core.1.2.3.nupkg"]
+    }
+  ]
+}
+```
+
+When omitted, the supported workflow profile requires a non-empty literal `NuGet/login@v1` username and accepts the repository owner's account. Expressions, missing or empty values, and a mismatch with `expectedNuGetUsername` are unsupported.
+
+NuGetReady validates exact expected `.nupkg`/`.snupkg` names, requiring exactly one primary `.nupkg` per package expectation and at most one associated `.snupkg`. Duplicate primary package identities are rejected as an ambiguous artifact set instead of being silently selected. It also checks package identity/version, authors, description, tags, license, README, icon, repository metadata, dependency groups, related-package versions, library/tool layout and command metadata, portable symbols, and sensitive/internal archive entries. It creates a temporary local feed, controlled `NuGet.config`, a separate package cache for each consumer, and bounded consumer processes. Inherited fallback folders and restore-source overrides are disabled; library package caches and installed tool stores are checked for the versioned canonical `.nupkg`, package-specific provenance sidecar, matching identity, and every extracted payload file—including XML documentation—against the supplied artifact before the consumer is built. Tool asset selection is derived from `tools/<tfm>/any` roots; unsupported or empty selections fail as unproven. Package-under-test IDs are source-mapped to the local feed and public dependencies may resolve from the configured public source. Library consumers are restored and built against a non-obsolete public type from every declared `lib/` or `ref/` target framework; runnable target frameworks also execute the generated consumer. Reports are deterministic in text or versioned JSON format.
+
+Archive inspection bounds the archive to 4,096 entries, 32 MiB expanded per entry, and 256 MiB expanded in aggregate. Limits are enforced while streams are read, and provenance comparisons use streaming hashes/comparisons. These limits protect inspection resource use; NuGetReady is not a malware sandbox.
 
 Supported package kinds are `library`, `multiTargetLibrary`, and `dotnetTool`. Tool expectations may declare a command and safe smoke arguments. Analyzer-only packages are not supported in this version; build assets are consumed as part of the library rehearsal.
 
@@ -108,7 +129,7 @@ NuGetReady uses `KeelMatrix.Telemetry` 0.1.1 for shared activation and at-most-w
 - Rebuild the package when its filename version and nuspec version disagree.
 - The rehearsal uses a fresh per-consumer package cache and HTTP cache on every run; inherited fallback folders and restore overrides are ignored, library cache and installed-tool-store `.nupkg`/`.nupkg.sha512` provenance is checked, and extracted payload bytes (including XML documentation) are checked against the supplied artifact. A tool package without a supported `tools/<tfm>/any` layout is reported as unproven rather than passing.
 - Each package expectation must list exactly one primary `.nupkg` and may list one associated `.snupkg`; two primary archives with the same package identity/version fail the artifact-set check.
-- Treat a package parsing, filesystem, restore, or process-timeout error as an infrastructure/input failure, not as a passing rehearsal.
+- Treat a package parsing, archive-limit, filesystem, unavailable SDK/runtime/workload, restore, unsupported-framework, or process-lifecycle error as an infrastructure/input failure with exit code `2`, not as a package failure or passing rehearsal. A bounded child process with unconfirmed cleanup is likewise reported as `error`/exit `2`.
 
 Workflow-policy details and the capability/reachability boundary are maintained in [Supported Release Workflow Profile](#supported-release-workflow-profile). When a config is below a repository root, NuGetReady looks for `.git` or `.github` above the config so root workflows are not silently skipped.
 

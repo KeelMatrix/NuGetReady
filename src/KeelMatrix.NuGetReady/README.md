@@ -10,9 +10,9 @@ dotnet tool install --global KeelMatrix.NuGetReady
 
 ## Support and Requirements
 
-NuGetReady runs on Windows, Linux, and macOS. The installed tool targets `net8.0` and requires the .NET 8 runtime.
+NuGetReady runs on Windows, Linux, and macOS. The installed tool targets `net8.0` and requires the .NET 8 runtime. Consumer rehearsal also requires a compatible .NET SDK for restore, build, and tool installation; unavailable SDKs, runtimes, target packs, or workloads are `error`/exit code `2`.
 
-Library packages under rehearsal may target frameworks other than .NET 8. NuGetReady builds a consumer for every declared library target framework, runs the consumer when that framework is runnable on the host, and treats non-runnable library target frameworks as build-only.
+The supported matrix is explicit: `net5.0` and later unqualified modern .NET targets run on the host; Windows-specific modern targets run only on Windows; `.NET Standard` targets are build-only; and .NET Framework targets such as `net48` and `net481` are build-only on Windows. Other or platform-incompatible targets are unsupported infrastructure (`error`/exit code `2`). Build-only validation proves compilation and package consumption, not execution.
 
 ## Quick Start
 
@@ -22,7 +22,9 @@ After `dotnet pack`, run:
 nugetready check --artifacts ./artifacts/packages
 ```
 
-The default configuration is `nugetready.json` in the current directory. It declares each package ID, kind, version, exact primary `.nupkg`, optional `.snupkg`, and tool smoke command. NuGetReady rejects missing, extra, ambiguous, or filename/version-mismatched artifacts, inspects their metadata and layout, and rehearses them through an isolated local feed and fresh package caches. Reports use the stable states `pass`, `warn`, `fail`, `error`, `not-run`, and `not-applicable`; a blocked check never appears as `pass`. Workflow input is parsed before release relevance filtering, so malformed or incomplete YAML produces `error`/exit `2` with a safe relative workflow location; `not-applicable` means successfully inspected input was proven unrelated.
+The default configuration is `nugetready.json` in the current directory. It declares each package ID, kind, version, exact primary `.nupkg`, optional `.snupkg`, and tool smoke command. An optional `workflowPolicy.expectedNuGetUsername` requires one configured literal publisher username; otherwise the checker accepts any non-empty literal `NuGet/login@v1` username. NuGetReady rejects missing, extra, ambiguous, or filename/version-mismatched artifacts, inspects their metadata and layout, and rehearses them through an isolated local feed and fresh package caches. Reports use the stable states `pass`, `warn`, `fail`, `error`, `not-run`, and `not-applicable`; a blocked check never appears as `pass`. Workflow input is parsed before release relevance filtering, so malformed or incomplete YAML produces `error`/exit `2` with a safe relative workflow location; `not-applicable` means successfully inspected input was proven unrelated.
+
+Archive inspection is bounded to 4,096 entries, 32 MiB expanded per entry, and 256 MiB expanded in aggregate. Limits are enforced while reading and package provenance is compared using streaming operations. This is resource protection for inspection, not a malware sandbox.
 
 ## Supported Workflow Profile
 

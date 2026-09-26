@@ -2,6 +2,7 @@ using System.Reflection;
 using System.Reflection.Metadata;
 using System.Reflection.PortableExecutable;
 using System.Xml.Linq;
+using NuGet.Frameworks;
 using NuGet.Packaging;
 
 namespace KeelMatrix.NuGetReady;
@@ -159,6 +160,10 @@ internal static class ConsumerRehearsal
         {
             return Failure(package, "The package contains an invalid library assembly.", false);
         }
+        catch (ArchiveLimitExceededException exception)
+        {
+            return Failure(package, exception.Message, true);
+        }
         catch (InvalidDataException)
         {
             return Failure(package, "The package does not contain a usable public library contract.", false);
@@ -211,7 +216,16 @@ internal static class ConsumerRehearsal
     {
         var projectPath = Path.Combine(packageRoot, "Consumer.csproj");
         var sourcePath = Path.Combine(packageRoot, "Program.cs");
-        var outputType = IsRunnableConsumerTargetFramework(target.Framework) ? "Exe" : "Library";
+        var frameworkSupport = GetConsumerTargetFrameworkSupport(target.Framework);
+        if (frameworkSupport == ConsumerTargetFrameworkSupport.Unsupported)
+        {
+            return new TargetRehearsalOutcome(
+                false,
+                true,
+                $"Target framework '{target.Framework}' is outside the supported consumer rehearsal framework matrix for this host.");
+        }
+
+        var outputType = frameworkSupport == ConsumerTargetFrameworkSupport.Runnable ? "Exe" : "Library";
         var apiTypes = string.Join(", ", target.ApiTypes.Select(type => $"typeof({type})"));
         var source = $$"""
             using System;
@@ -279,9 +293,12 @@ internal static class ConsumerRehearsal
             return buildOutcome;
         }
 
-        if (!IsRunnableConsumerTargetFramework(target.Framework))
+        if (frameworkSupport != ConsumerTargetFrameworkSupport.Runnable)
         {
-            return buildOutcome;
+            return buildOutcome with
+            {
+                Diagnostic = "Build-only validation completed; execution is not part of the supported contract for this target framework."
+            };
         }
 
         var outputAssembly = Path.Combine(packageRoot, "bin", "Release", target.Framework, "Consumer.dll");
@@ -381,7 +398,7 @@ internal static class ConsumerRehearsal
         "metadata is invalid"
     };
 
-    private enum ProcessPhase
+    internal enum ProcessPhase
     {
         Restore,
         Build,
@@ -406,15 +423,27 @@ internal static class ConsumerRehearsal
         "could not resolve host",
         "the remote name could not be resolved",
         "network is unreachable",
+        "no .net sdks were found",
+        "a compatible installed .net sdk",
+        "it was not possible to find any compatible framework version",
+        "the framework 'microsoft.",
+        "netsdk",
+        "msb4236",
+        "workload",
         "permission denied",
         "access to the path",
         "disk full",
         "not enough space"
     };
 
-    private static TargetRehearsalOutcome ClassifyProcessResult(ProcessResult result, ProcessPhase phase)
+    internal static TargetRehearsalOutcome ClassifyProcessResult(ProcessResult result, ProcessPhase phase)
     {
         var diagnostic = Combine(result);
+        if (result.Started && !result.CleanupConfirmed)
+        {
+            return new TargetRehearsalOutcome(false, true, "The child process lifecycle completed without confirmed process-tree cleanup; the rehearsal result is unproven.");
+        }
+
         if (result.TimedOut && !result.CleanupConfirmed)
         {
             return new TargetRehearsalOutcome(false, true, "The bounded child process timed out and its process-group cleanup could not be confirmed.");
@@ -523,7 +552,9 @@ internal static class ConsumerRehearsal
     private static LibraryTarget[] ReadLibraryTargets(string packagePath)
     {
         using var reader = new PackageArchiveReader(packagePath);
-        var assemblyPaths = reader.GetFiles()
+        var rawFiles = ArchiveInspectionLimits.GetFiles(reader);
+        ArchiveInspectionLimits.ValidateExpandedPayload(reader, rawFiles);
+        var assemblyPaths = rawFiles
             .Select(NormalizeArchivePath)
             .Select(path => (Path: path, Parts: path.Split('/')))
             .Where(item => item.Parts.Length == 3 &&
@@ -550,7 +581,8 @@ internal static class ConsumerRehearsal
             var publicTypes = new List<string>();
             foreach (var asset in targetGroup)
             {
-                using var stream = reader.GetStream(asset.Path);
+                using var rawStream = reader.GetStream(asset.Path);
+                using var stream = new MemoryStream(ArchiveInspectionLimits.ReadBounded(rawStream), writable: false);
                 var publicType = ReadPublicType(stream);
                 if (publicType is not null && (referenceAssets.Length == 0 || asset.Parts[0].Equals("ref", StringComparison.OrdinalIgnoreCase)))
                 {
@@ -576,10 +608,7 @@ internal static class ConsumerRehearsal
 
     private static string? ReadPublicType(Stream stream)
     {
-        using var image = new MemoryStream();
-        stream.CopyTo(image);
-        image.Position = 0;
-        using var peReader = new PEReader(image);
+        using var peReader = new PEReader(stream, PEStreamOptions.LeaveOpen);
         if (!peReader.HasMetadata)
         {
             throw new BadImageFormatException("The library asset does not contain managed assembly metadata.");
@@ -592,10 +621,53 @@ internal static class ConsumerRehearsal
             .Select(definition => (definition, Name: metadata.GetString(definition.Name)))
             .Where(item => item.Name is not "<Module>" && !item.Name.Contains('<', StringComparison.Ordinal))
             .Where(item => IsSupportedTypeName(item.Name))
+            .Where(item => !HasObsoleteAttribute(metadata, item.definition))
             .OrderBy(item => metadata.GetString(item.definition.Namespace), StringComparer.Ordinal)
             .ThenBy(item => item.Name, StringComparer.Ordinal)
             .Select(item => FormatTypeName(metadata, item.definition, item.Name))
             .FirstOrDefault();
+    }
+
+    private static bool HasObsoleteAttribute(MetadataReader metadata, TypeDefinition definition)
+    {
+        foreach (var attributeHandle in definition.GetCustomAttributes())
+        {
+            var constructor = metadata.GetCustomAttribute(attributeHandle).Constructor;
+            EntityHandle typeHandle = constructor.Kind switch
+            {
+                HandleKind.MemberReference => metadata.GetMemberReference((MemberReferenceHandle)constructor).Parent,
+                HandleKind.MethodDefinition => metadata.GetMethodDefinition((MethodDefinitionHandle)constructor).GetDeclaringType(),
+                _ => default
+            };
+
+            if (typeHandle.IsNil)
+            {
+                continue;
+            }
+
+            var (namespaceName, typeName) = typeHandle.Kind switch
+            {
+                HandleKind.TypeDefinition => GetTypeName(metadata.GetTypeDefinition((TypeDefinitionHandle)typeHandle), metadata),
+                HandleKind.TypeReference => GetTypeName(metadata.GetTypeReference((TypeReferenceHandle)typeHandle), metadata),
+                _ => (string.Empty, string.Empty)
+            };
+            if (namespaceName == "System" && typeName == "ObsoleteAttribute")
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static (string Namespace, string Name) GetTypeName(TypeDefinition definition, MetadataReader metadata)
+    {
+        return (metadata.GetString(definition.Namespace), metadata.GetString(definition.Name));
+    }
+
+    private static (string Namespace, string Name) GetTypeName(TypeReference reference, MetadataReader metadata)
+    {
+        return (metadata.GetString(reference.Namespace), metadata.GetString(reference.Name));
     }
 
     private static string FormatTypeName(MetadataReader metadata, TypeDefinition definition, string metadataName)
@@ -634,12 +706,52 @@ internal static class ConsumerRehearsal
         return $"@{value}";
     }
 
-    private static bool IsRunnableConsumerTargetFramework(string framework)
+    internal enum ConsumerTargetFrameworkSupport
     {
-        return framework.StartsWith("net", StringComparison.OrdinalIgnoreCase) &&
-               !framework.StartsWith("netstandard", StringComparison.OrdinalIgnoreCase) &&
-               framework.Length > 3 && char.IsDigit(framework[3]) && int.TryParse(new string(framework.Skip(3).TakeWhile(char.IsDigit).ToArray()), out var major) &&
-               major >= 5;
+        Unsupported,
+        BuildOnly,
+        Runnable
+    }
+
+    internal static ConsumerTargetFrameworkSupport GetConsumerTargetFrameworkSupport(string framework)
+    {
+        NuGetFramework parsed;
+        try
+        {
+            parsed = NuGetFramework.Parse(framework);
+        }
+        catch (FormatException)
+        {
+            return ConsumerTargetFrameworkSupport.Unsupported;
+        }
+
+        if (parsed.IsUnsupported)
+        {
+            return ConsumerTargetFrameworkSupport.Unsupported;
+        }
+
+        if (parsed.HasPlatform &&
+            !string.Equals(parsed.Platform, "windows", StringComparison.OrdinalIgnoreCase))
+        {
+            return ConsumerTargetFrameworkSupport.Unsupported;
+        }
+
+        if (string.Equals(parsed.Framework, FrameworkConstants.FrameworkIdentifiers.NetStandard, StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(parsed.Framework, FrameworkConstants.FrameworkIdentifiers.Net, StringComparison.OrdinalIgnoreCase))
+        {
+            return OperatingSystem.IsWindows() ||
+                   string.Equals(parsed.Framework, FrameworkConstants.FrameworkIdentifiers.NetStandard, StringComparison.OrdinalIgnoreCase)
+                ? ConsumerTargetFrameworkSupport.BuildOnly
+                : ConsumerTargetFrameworkSupport.Unsupported;
+        }
+
+        if (string.Equals(parsed.Framework, FrameworkConstants.FrameworkIdentifiers.NetCoreApp, StringComparison.OrdinalIgnoreCase) &&
+            parsed.Version.Major >= 5)
+        {
+            return ConsumerTargetFrameworkSupport.Runnable;
+        }
+
+        return ConsumerTargetFrameworkSupport.Unsupported;
     }
 
     private static string NormalizeArchivePath(string path)
@@ -690,6 +802,8 @@ internal static class ConsumerRehearsal
         {
             using var reader = new PackageArchiveReader(packagePath);
             var expectedIdentity = reader.GetIdentity();
+            var rawFiles = ArchiveInspectionLimits.GetFiles(reader);
+            ArchiveInspectionLimits.ValidateExpandedPayload(reader, rawFiles);
             var expectedVersion = VersionText.Normalize(package.Version!);
             if (!expectedIdentity.Id.Equals(package.Id, StringComparison.OrdinalIgnoreCase) ||
                 !string.Equals(expectedIdentity.Version.ToNormalizedString(), expectedVersion, StringComparison.OrdinalIgnoreCase))
@@ -740,7 +854,11 @@ internal static class ConsumerRehearsal
                 }
             }
 
-            var expectedHash = Convert.ToBase64String(System.Security.Cryptography.SHA512.HashData(File.ReadAllBytes(packagePath)));
+            string expectedHash;
+            using (var expectedArchive = File.OpenRead(packagePath))
+            {
+                expectedHash = ArchiveInspectionLimits.ComputeSha512(expectedArchive);
+            }
             var cachedArchives = Directory.EnumerateFiles(packageDirectory, "*", SearchOption.TopDirectoryOnly)
                 .Where(path => string.Equals(Path.GetExtension(path), ".nupkg", StringComparison.OrdinalIgnoreCase))
                 .Where(path => installedToolPath is null || string.Equals(
@@ -754,7 +872,11 @@ internal static class ConsumerRehearsal
                 return new TargetRehearsalOutcome(false, false, "The isolated package cache did not contain exactly one canonical .nupkg for the restored package.");
             }
 
-            var cachedHash = Convert.ToBase64String(System.Security.Cryptography.SHA512.HashData(File.ReadAllBytes(cachedArchives[0])));
+            string cachedHash;
+            using (var cachedArchive = File.OpenRead(cachedArchives[0]))
+            {
+                cachedHash = ArchiveInspectionLimits.ComputeSha512(cachedArchive);
+            }
             if (!string.Equals(cachedHash, expectedHash, StringComparison.Ordinal))
             {
                 return new TargetRehearsalOutcome(false, false, "The restored package hash did not match the supplied artifact.");
@@ -784,12 +906,21 @@ internal static class ConsumerRehearsal
                 }
             }
 
-            var expectedPayload = reader.GetFiles()
+            var expectedPayload = rawFiles
                 .Select(NormalizeArchivePath)
                 .Where(file => !IsGeneratedPackageEntry(file))
                 .ToHashSet(StringComparer.OrdinalIgnoreCase);
-            var restoredPayload = Directory.EnumerateFiles(packageDirectory, "*", SearchOption.AllDirectories)
-                .Select(path => NormalizeArchivePath(Path.GetRelativePath(packageDirectory, path)))
+            var restoredFiles = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var path in Directory.EnumerateFiles(packageDirectory, "*", SearchOption.AllDirectories))
+            {
+                var relativePath = NormalizeArchivePath(Path.GetRelativePath(packageDirectory, path));
+                if (!restoredFiles.TryAdd(relativePath, path))
+                {
+                    return new TargetRehearsalOutcome(false, false, "The restored package contained duplicate normalized payload paths.");
+                }
+            }
+
+            var restoredPayload = restoredFiles.Keys
                 .Where(file => !IsGeneratedToolStoreFile(file))
                 .ToHashSet(StringComparer.OrdinalIgnoreCase);
             if (!expectedPayload.SetEquals(restoredPayload))
@@ -799,17 +930,14 @@ internal static class ConsumerRehearsal
 
             foreach (var file in expectedPayload)
             {
-                var restoredFile = FindRestoredFile(packageDirectory, file);
-                if (restoredFile is null)
+                if (!restoredFiles.TryGetValue(file, out var restoredFile))
                 {
                     return new TargetRehearsalOutcome(false, false, "The restored package contents did not match the supplied artifact.");
                 }
 
                 using var stream = reader.GetStream(file);
-                using var expectedBytes = new MemoryStream();
-                stream.CopyTo(expectedBytes);
-                var restoredBytes = File.ReadAllBytes(restoredFile);
-                if (!expectedBytes.ToArray().AsSpan().SequenceEqual(restoredBytes))
+                using var restoredStream = File.OpenRead(restoredFile);
+                if (!ArchiveInspectionLimits.ContentsEqual(stream, restoredStream))
                 {
                     return new TargetRehearsalOutcome(false, false, "The restored package contents did not match the supplied artifact.");
                 }
@@ -827,18 +955,6 @@ internal static class ConsumerRehearsal
         }
     }
 
-    private static string? FindRestoredFile(string packageDirectory, string archivePath)
-    {
-        var matches = Directory.EnumerateFiles(packageDirectory, "*", SearchOption.AllDirectories)
-            .Where(path => string.Equals(
-                NormalizeArchivePath(Path.GetRelativePath(packageDirectory, path)),
-                archivePath,
-                StringComparison.OrdinalIgnoreCase))
-            .OrderBy(path => path, StringComparer.Ordinal)
-            .ToArray();
-        return matches.Length == 1 ? matches[0] : null;
-    }
-
     private static TargetRehearsalOutcome VerifyInstalledToolPackage(PackageExpectation package, string packagePath, string toolPath)
     {
         return VerifyRestoredPackage(package, packagePath, new Dictionary<string, string?>(), toolPath);
@@ -846,7 +962,7 @@ internal static class ConsumerRehearsal
 
     private static string[] ReadToolAssetRoots(PackageArchiveReader reader)
     {
-        return reader.GetFiles()
+        return ArchiveInspectionLimits.GetFiles(reader)
             .Select(NormalizeArchivePath)
             .Select(path => (Path: path, Parts: path.Split('/')))
             .Where(item => item.Parts.Length >= 4 &&
@@ -862,7 +978,7 @@ internal static class ConsumerRehearsal
 
     private static string? ReadNuspecHash(PackageArchiveReader reader)
     {
-        var nuspec = reader.GetFiles()
+        var nuspec = ArchiveInspectionLimits.GetFiles(reader)
             .Select(NormalizeArchivePath)
             .SingleOrDefault(file => file.EndsWith(".nuspec", StringComparison.OrdinalIgnoreCase));
         if (nuspec is null)
@@ -871,7 +987,7 @@ internal static class ConsumerRehearsal
         }
 
         using var stream = reader.GetStream(nuspec);
-        return Convert.ToBase64String(System.Security.Cryptography.SHA512.HashData(stream));
+        return Convert.ToBase64String(System.Security.Cryptography.SHA512.HashData(ArchiveInspectionLimits.ReadBounded(stream)));
     }
 
     private static bool HashSidecarMatches(string actualHash, string? expectedHash)

@@ -528,7 +528,11 @@ internal static class WorkflowPolicyInspector
 
         InspectProducerJob(repositoryPath, workflow, producerJob, expectedArtifacts, failures);
         InspectValidationJob(repositoryPath, workflow, validationJob, producerJob, useCandidateToolArtifactSource, failures);
-        InspectCredentialBearingJob(publishJob, primaryArtifact, failures);
+        InspectCredentialBearingJob(
+            publishJob,
+            primaryArtifact,
+            config?.WorkflowPolicy?.ExpectedNuGetUsername,
+            failures);
 
         if (ContainsLongLivedCredentialValue(workflow.Environment) ||
             workflow.Jobs.Any(job => ContainsLongLivedCredentialValue(job.Environment) ||
@@ -684,6 +688,7 @@ internal static class WorkflowPolicyInspector
     private static void InspectCredentialBearingJob(
         WorkflowJob publishJob,
         string primaryArtifact,
+        string? expectedNuGetUsername,
         List<Failure> failures)
     {
         var steps = publishJob.Steps;
@@ -708,11 +713,22 @@ internal static class WorkflowPolicyInspector
         }
 
         var login = steps[1];
+        login.With.TryGetValue("user", out var actualUsername);
+        var hasLiteralUsername = login.With.Count == 1 &&
+                                 actualUsername is not null &&
+                                 !string.IsNullOrWhiteSpace(actualUsername) &&
+                                 !ContainsExpression(actualUsername) &&
+                                 !actualUsername.Any(char.IsControl) &&
+                                 !actualUsername.Any(char.IsWhiteSpace);
         if (!UsesExactly(login, "NuGet/login@v1") || !IsSimpleActionStep(login, allowId: true) ||
             !string.Equals(login.Id, "nuget-login", StringComparison.Ordinal) ||
-            !HasExactInputs(login.With, ("user", "dmitriyzen")))
+            !hasLiteralUsername)
         {
-            failures.Add(Unsupported("The second publish step must be the unconditional NuGet/login@v1 Trusted Publishing login with id nuget-login."));
+            failures.Add(Unsupported("The second publish step must be the unconditional NuGet/login@v1 Trusted Publishing login with id nuget-login and a non-empty literal customer username."));
+        }
+        else if (expectedNuGetUsername is not null && !string.Equals(actualUsername, expectedNuGetUsername, StringComparison.Ordinal))
+        {
+            failures.Add(new Failure("workflow-policy", "The NuGet/login username does not match WorkflowPolicy.ExpectedNuGetUsername."));
         }
 
         var push = steps[2];

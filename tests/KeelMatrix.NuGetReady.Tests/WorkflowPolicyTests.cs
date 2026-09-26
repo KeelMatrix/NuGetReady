@@ -23,6 +23,57 @@ public sealed class WorkflowPolicyTests
     }
 
     [Fact]
+    public void Customer_workflow_with_a_different_literal_publisher_username_is_supported()
+    {
+        using var repository = WorkflowRepository.Create(
+            "release.yml",
+            Mutate(ReleaseWorkflow, "user: dmitriyzen", "user: customer-maintainer"));
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+        Assert.Empty(findings);
+    }
+
+    [Theory]
+    [InlineData("user: ''")]
+    [InlineData(null)]
+    [InlineData("user: ${{ vars.NUGET_USERNAME }}")]
+    public void Missing_empty_or_dynamic_publisher_username_is_unproven(string? loginInput)
+    {
+        using var repository = WorkflowRepository.Create(
+            "release.yml",
+            loginInput is null
+                ? Mutate(ReleaseWorkflow, "          user: dmitriyzen\n", string.Empty)
+                : Mutate(ReleaseWorkflow, "user: dmitriyzen", loginInput));
+
+        var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
+
+        Assert.Contains(findings, finding =>
+            finding.IsError && finding.Message.Contains("literal", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void Explicit_expected_publisher_username_rejects_a_mismatch()
+    {
+        using var repository = WorkflowRepository.Create(
+            "release.yml",
+            Mutate(ReleaseWorkflow, "user: dmitriyzen", "user: customer-maintainer"));
+        repository.WriteFile(
+            "nugetready.json",
+            File.ReadAllText(Path.Combine(repository.Root.FullName, "nugetready.json"))
+                .Replace("\"packages\":", "\"workflowPolicy\": { \"expectedNuGetUsername\": \"other-maintainer\" },\n  \"packages\":", StringComparison.Ordinal));
+
+        var configPath = Path.Combine(repository.Root.FullName, "nugetready.json");
+        var findings = WorkflowPolicyInspector.Inspect(
+            repository.Root.FullName,
+            ConfigurationLoader.Load(configPath),
+            configPath);
+
+        Assert.Contains(findings, finding =>
+            finding.Message.Contains("ExpectedNuGetUsername", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public void Broad_version_tag_without_release_identity_binding_is_blocking()
     {
         using var repository = WorkflowRepository.Create(

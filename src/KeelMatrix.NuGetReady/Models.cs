@@ -20,6 +20,13 @@ internal sealed class NuGetReadyConfig
     public int SchemaVersion { get; set; }
 
     public List<PackageExpectation>? Packages { get; set; }
+
+    public WorkflowPolicyConfig? WorkflowPolicy { get; set; }
+}
+
+internal sealed class WorkflowPolicyConfig
+{
+    public string? ExpectedNuGetUsername { get; set; }
 }
 
 internal sealed class PackageExpectation

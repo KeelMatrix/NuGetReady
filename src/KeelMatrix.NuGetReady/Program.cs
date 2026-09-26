@@ -4,9 +4,14 @@ public static class Program
 {
     public static int Main(string[] args)
     {
-        if (args is ["--internal-unix-supervisor", var payload])
+        if (args is ["--internal-unix-supervisor", var unixPayload])
         {
-            return UnixProcessSupervisor.Run(payload);
+            return UnixProcessSupervisor.Run(unixPayload);
+        }
+
+        if (args is ["--internal-windows-supervisor", var windowsPayload])
+        {
+            return WindowsProcessSupervisor.Run(windowsPayload);
         }
 
         return NuGetReadyApplication.Run(args, new NuGetReadyTelemetry());
