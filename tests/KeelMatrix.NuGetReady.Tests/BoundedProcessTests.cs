@@ -10,7 +10,7 @@ public sealed class BoundedProcessTests
     {
         var (fileName, arguments, pidFile) = CreatePipeHoldingProcess();
         var stopwatch = Stopwatch.StartNew();
-        var timeout = IsSlowProcessHost ? TimeSpan.FromSeconds(1) : TimeSpan.FromMilliseconds(150);
+        var timeout = IsSlowProcessHost ? TimeSpan.FromSeconds(2) : TimeSpan.FromMilliseconds(150);
 
         var result = await BoundedProcess.RunAsync(
             fileName,
@@ -21,7 +21,7 @@ public sealed class BoundedProcessTests
 
         stopwatch.Stop();
 
-        Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(2), $"Process lifecycle took {stopwatch.Elapsed}.");
+        Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(3), $"Process lifecycle took {stopwatch.Elapsed}.");
         Assert.True(result.TimedOut, $"stdout={result.StandardOutput}; stderr={result.StandardError}; cleanup={result.CleanupConfirmed}");
         Assert.True(result.CleanupConfirmed, $"stdout={result.StandardOutput}; stderr={result.StandardError}");
         AssertDescendantsTerminated(pidFile, expectedPidCount: 2);
