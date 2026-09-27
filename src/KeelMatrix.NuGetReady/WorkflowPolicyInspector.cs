@@ -31,6 +31,10 @@ internal static class WorkflowPolicyInspector
     private const string NuGetOrgSource = "https://api.nuget.org/v3/index.json";
     private const string PermissionAllSentinel = "\0all";
     private const string InstalledValidationCommand = "/tmp/nugetready-tool/nugetready check --config nugetready.json --artifacts /tmp/nugetready-artifacts --format json";
+    private const string TagReleaseContractCommand = """
+        pwsh -NoProfile -File scripts/validate-release-contract.ps1 -RepositoryRoot $env:GITHUB_WORKSPACE -Mode Tag -ExpectedVersion 0.1.0 -TagVersion $env:GITHUB_REF_NAME
+        if ($LASTEXITCODE -ne 0) { throw "Tag contract validation failed." }
+        """;
     private const string ValidationAcquisitionResolverCommand = """
         New-Item -ItemType Directory -Path /tmp/nugetready-acquisition -Force | Out-Null
         @'
@@ -616,7 +620,7 @@ internal static class WorkflowPolicyInspector
 
         if (!HasExactProducerSequence(repositoryPath, producerJob.Steps, expectedArtifacts))
         {
-            failures.Add(Unsupported("The artifact-producer job must use the exact ordered closed command profile and every referenced repository path must exist with exact cross-platform casing: checkout, SDK setup, restore, format, build, test, pack, and immediate exact artifact upload."));
+            failures.Add(Unsupported("The artifact-producer job must use the exact ordered closed command profile and every referenced repository path must exist with exact cross-platform casing: checkout, SDK setup, restore, format, build, test, optional Tag-mode release-contract validation, pack, and immediate exact artifact upload."));
         }
     }
 
@@ -900,15 +904,30 @@ internal static class WorkflowPolicyInspector
         IReadOnlyList<WorkflowStep> steps,
         IReadOnlyList<string> expectedArtifacts)
     {
-        return steps.Count == 8 &&
-               IsExactCheckoutStep(steps[0]) &&
-               IsExactProducerSetupDotNetStep(steps[1]) &&
-               TryMatchRestoreStep(repositoryPath, steps[2], out var solutionPath) &&
-               IsExactFormatStep(steps[3], solutionPath) &&
-               IsExactBuildStep(steps[4], solutionPath) &&
-               IsExactTestStep(steps[5], solutionPath) &&
-               IsExactPackStep(repositoryPath, steps[6]) &&
-               IsExactUploadStep(steps[7], expectedArtifacts);
+        if (steps.Count is not (8 or 9) ||
+            !IsExactCheckoutStep(steps[0]) ||
+            !IsExactProducerSetupDotNetStep(steps[1]) ||
+            !TryMatchRestoreStep(repositoryPath, steps[2], out var solutionPath) ||
+            !IsExactFormatStep(steps[3], solutionPath) ||
+            !IsExactBuildStep(steps[4], solutionPath) ||
+            !IsExactTestStep(steps[5], solutionPath))
+        {
+            return false;
+        }
+
+        var packIndex = 6;
+        if (steps.Count == 9)
+        {
+            if (!IsExactTagReleaseContractStep(steps[6]))
+            {
+                return false;
+            }
+
+            packIndex++;
+        }
+
+        return IsExactPackStep(repositoryPath, steps[packIndex]) &&
+               IsExactUploadStep(steps[packIndex + 1], expectedArtifacts);
     }
 
     private static bool HasExactValidationSequence(
@@ -1090,6 +1109,15 @@ internal static class WorkflowPolicyInspector
         return IsDefinitelyEnabled(step.Condition) &&
                string.Equals(step.Shell, "pwsh", StringComparison.Ordinal) &&
                string.Equals(step.Run?.Trim(), InstalledValidationCommand, StringComparison.Ordinal) &&
+               step.Environment.Count == 0 &&
+               step.PresentKeys.All(key => key is "name" or "shell" or "run");
+    }
+
+    private static bool IsExactTagReleaseContractStep(WorkflowStep step)
+    {
+        return IsDefinitelyEnabled(step.Condition) &&
+               string.Equals(step.Shell, "pwsh", StringComparison.Ordinal) &&
+               string.Equals(step.Run?.Trim(), TagReleaseContractCommand.Trim(), StringComparison.Ordinal) &&
                step.Environment.Count == 0 &&
                step.PresentKeys.All(key => key is "name" or "shell" or "run");
     }
@@ -1582,6 +1610,7 @@ internal static class WorkflowPolicyInspector
         }
 
         if (IsExactProfileValidationStep(step) ||
+            IsExactTagReleaseContractStep(step) ||
             IsExactCandidateToolSourceConfigurationStep(step) ||
             IsExactValidationAcquisitionResolverStep(step) ||
             IsExactToolInstallStep(step, useCandidateToolArtifactSource: true) ||

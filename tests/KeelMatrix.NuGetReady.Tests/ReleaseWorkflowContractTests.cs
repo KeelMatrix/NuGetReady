@@ -20,7 +20,22 @@ public sealed class ReleaseWorkflowContractTests
 
         Assert.Contains("tags:\n      - 'v0.1.0'", workflow, StringComparison.Ordinal);
         Assert.DoesNotContain("v*.*.*", workflow, StringComparison.Ordinal);
-        Assert.Contains("Run release tests and validate the tag contract", workflow, StringComparison.Ordinal);
+        Assert.Contains("Run release tests", workflow, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Tag_release_workflow_runs_the_repository_validator_before_packing()
+    {
+        var root = FindRepositoryRoot();
+        var workflow = File.ReadAllText(Path.Combine(root, ".github", "workflows", "release.yml"));
+        const string validatorCommand = "pwsh -NoProfile -File scripts/validate-release-contract.ps1 -RepositoryRoot $env:GITHUB_WORKSPACE -Mode Tag -ExpectedVersion 0.1.0 -TagVersion $env:GITHUB_REF_NAME";
+
+        Assert.Contains("Validate the tag contract (Tag mode)", workflow, StringComparison.Ordinal);
+        Assert.Contains(validatorCommand, workflow, StringComparison.Ordinal);
+        Assert.Contains("if ($LASTEXITCODE -ne 0) { throw \"Tag contract validation failed.\" }", workflow, StringComparison.Ordinal);
+        Assert.True(
+            workflow.IndexOf(validatorCommand, StringComparison.Ordinal) <
+            workflow.IndexOf("Pack the exact release artifacts", StringComparison.Ordinal));
     }
 
     [Fact]

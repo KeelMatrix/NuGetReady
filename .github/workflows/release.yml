@@ -45,9 +45,15 @@ jobs:
         shell: pwsh
         run: dotnet build KeelMatrix.NuGetReady.sln --configuration Release --no-restore --nologo -p:UseSharedCompilation=false
 
-      - name: Run release tests and validate the tag contract
+      - name: Run release tests
         shell: pwsh
         run: dotnet test KeelMatrix.NuGetReady.sln --configuration Release --no-build --no-restore --nologo --logger "console;verbosity=minimal"
+
+      - name: Validate the tag contract (Tag mode)
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File scripts/validate-release-contract.ps1 -RepositoryRoot $env:GITHUB_WORKSPACE -Mode Tag -ExpectedVersion 0.1.0 -TagVersion $env:GITHUB_REF_NAME
+          if ($LASTEXITCODE -ne 0) { throw "Tag contract validation failed." }
 
       - name: Pack the exact release artifacts
         shell: pwsh
