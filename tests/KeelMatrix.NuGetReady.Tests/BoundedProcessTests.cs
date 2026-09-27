@@ -31,8 +31,8 @@ public sealed class BoundedProcessTests
     public async Task Cancellation_terminates_the_complete_process_lifecycle()
     {
         var (fileName, arguments, pidFile) = CreatePipeHoldingProcess();
-        var cancellationDelay = IsSlowProcessHost ? TimeSpan.FromSeconds(1) : TimeSpan.FromMilliseconds(150);
-        using var cancellation = new CancellationTokenSource(cancellationDelay);
+        using var cancellation = new CancellationTokenSource();
+        var cancellationTrigger = CancelWhenDescendantsAreRecordedAsync(pidFile, cancellation);
 
         try
         {
@@ -46,8 +46,39 @@ public sealed class BoundedProcessTests
         }
         finally
         {
+            await cancellationTrigger;
             AssertDescendantsTerminated(pidFile, expectedPidCount: 2);
         }
+    }
+
+    private static async Task CancelWhenDescendantsAreRecordedAsync(string? pidFile, CancellationTokenSource cancellation)
+    {
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(30);
+        while (DateTime.UtcNow < deadline)
+        {
+            if (pidFile is not null && File.Exists(pidFile))
+            {
+                try
+                {
+                    var pidCount = File.ReadAllText(pidFile)
+                        .Split(' ', StringSplitOptions.RemoveEmptyEntries)
+                        .Length;
+                    if (pidCount >= 2)
+                    {
+                        cancellation.Cancel();
+                        return;
+                    }
+                }
+                catch (IOException)
+                {
+                    // The fixture may still be appending the second PID.
+                }
+            }
+
+            await Task.Delay(TimeSpan.FromMilliseconds(25));
+        }
+
+        cancellation.Cancel();
     }
 
     [Fact]
