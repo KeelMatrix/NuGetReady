@@ -732,7 +732,7 @@ internal static class UnixProcessSupervisor
     private static bool ReapDescendants()
     {
         var deadline = DateTime.UtcNow + (OperatingSystem.IsMacOS()
-            ? TimeSpan.FromSeconds(2)
+            ? TimeSpan.FromSeconds(5)
             : TimeSpan.FromMilliseconds(250));
         while (DateTime.UtcNow < deadline)
         {
@@ -756,7 +756,7 @@ internal static class UnixProcessSupervisor
     {
         _ = kill(-processGroupId, SigKill);
         var deadline = DateTime.UtcNow + (OperatingSystem.IsMacOS()
-            ? TimeSpan.FromSeconds(2)
+            ? TimeSpan.FromSeconds(5)
             : TimeSpan.FromMilliseconds(250));
         while (DateTime.UtcNow < deadline)
         {
