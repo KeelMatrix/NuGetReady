@@ -631,6 +631,12 @@ internal static class UnixProcessSupervisor
                 return 125;
             }
 
+            var processGroupId = getpgid(child);
+            if (processGroupId <= 0 || processGroupId == getpgrp())
+            {
+                return 125;
+            }
+
             SignalReady();
             var status = 0;
             if (waitpid(child, out status, 0) < 0)
@@ -641,7 +647,7 @@ internal static class UnixProcessSupervisor
             // The target has its own process group. Kill and verify that group before
             // claiming cleanup; on Linux also require the subreaper to have no adopted
             // child remaining, which keeps detached/reparented descendants unproven.
-            var descendantsClean = KillAndVerifyProcessGroup(child);
+            var descendantsClean = KillAndVerifyProcessGroup(processGroupId);
             if (!descendantsClean)
             {
                 return 125;
@@ -692,6 +698,12 @@ internal static class UnixProcessSupervisor
 
     [DllImport("libc", SetLastError = true)]
     private static extern int setsid();
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int getpgrp();
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int getpgid(int processId);
 
     private const short PosixSpawnSetProcessGroup = 0x2;
     private const int PosixSpawnAttributeStorageSize = 512;
@@ -776,11 +788,6 @@ internal static class UnixProcessSupervisor
             if (groupProbe != 0)
             {
                 var groupError = Marshal.GetLastWin32Error();
-                if (OperatingSystem.IsMacOS() && groupError != NoSuchProcessError)
-                {
-                    Console.Error.WriteLine($"macOS process-group cleanup probe failed for group {processGroupId}: errno={groupError}");
-                }
-
                 return groupError == NoSuchProcessError &&
                     (!OperatingSystem.IsLinux() || ReapDescendants());
             }
@@ -798,15 +805,8 @@ internal static class UnixProcessSupervisor
             return true;
         }
 
-        var finalProbe = kill(-processGroupId, 0);
-        var finalError = Marshal.GetLastWin32Error();
-        if (OperatingSystem.IsMacOS() && (finalProbe == 0 || finalError != NoSuchProcessError))
-        {
-            Console.Error.WriteLine($"macOS process-group cleanup remained unproven for group {processGroupId}: probe={finalProbe}, errno={finalError}");
-        }
-
-        return finalProbe != 0 &&
-            finalError == NoSuchProcessError &&
+        return kill(-processGroupId, 0) != 0 &&
+            Marshal.GetLastWin32Error() == NoSuchProcessError &&
             (!OperatingSystem.IsLinux() || ReapDescendants());
     }
 
@@ -841,7 +841,6 @@ internal static class UnixProcessSupervisor
                     groupId == processGroupId &&
                     !fields[2].StartsWith('Z'))
                 {
-                    Console.Error.WriteLine($"macOS process-group cleanup still has a live member: group={processGroupId}, entry={line.Trim()}");
                     return false;
                 }
             }
@@ -850,7 +849,6 @@ internal static class UnixProcessSupervisor
         }
         catch (Exception exception) when (exception is InvalidOperationException or System.ComponentModel.Win32Exception)
         {
-            Console.Error.WriteLine($"macOS process-group cleanup inspection failed for group {processGroupId}: {exception.Message}");
             return false;
         }
     }
