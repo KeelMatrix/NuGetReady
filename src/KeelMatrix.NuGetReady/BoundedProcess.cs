@@ -760,6 +760,11 @@ internal static class UnixProcessSupervisor
             : TimeSpan.FromMilliseconds(250));
         while (DateTime.UtcNow < deadline)
         {
+            // A descendant can fork into the target group between the initial
+            // signal and the first observation. Re-issue the group kill while
+            // the bounded verification window remains open.
+            _ = kill(-processGroupId, SigKill);
+
             if (OperatingSystem.IsLinux())
             {
                 while (waitpid(-1, out _, WaitNoHang) > 0)
