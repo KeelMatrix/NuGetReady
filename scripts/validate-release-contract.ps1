@@ -12,6 +12,13 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+$repositoryRootPath = (Resolve-Path $RepositoryRoot).Path
+. (Join-Path $PSScriptRoot '../build/Invoke-NestedPwsh.ps1')
+$launchGuard = Join-Path $repositoryRootPath 'build/Test-NestedPwshLaunch.ps1'
+& $launchGuard -SelfTest
+if ($LASTEXITCODE -ne 0) { throw 'Nested PowerShell launch guard self-test failed.' }
+& $launchGuard
+if ($LASTEXITCODE -ne 0) { throw 'Nested PowerShell launch guard failed.' }
 
 function Fail-Contract {
     param([string]$Message)

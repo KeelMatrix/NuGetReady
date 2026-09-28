@@ -38,6 +38,14 @@ jobs:
         with:
           global-json-file: global.json
 
+      - name: Verify hidden child PowerShell launch guard
+        shell: pwsh
+        run: ./build/Test-NestedPwshLaunch.ps1 -SelfTest
+
+      - name: Scan repository child PowerShell launches
+        shell: pwsh
+        run: ./build/Test-NestedPwshLaunch.ps1
+
       - name: Restore and audit dependencies
         shell: pwsh
         run: |
