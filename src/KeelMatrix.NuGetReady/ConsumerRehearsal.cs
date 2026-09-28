@@ -449,7 +449,7 @@ internal static class ConsumerRehearsal
             {
                 return Failure(
                     package,
-                    "The installed tool could not be launched safely on this host because the apphost and its path-loaded dependencies cannot be bound through process creation.",
+                    "The installed tool could not be launched safely for its configured smoke command on this host because the apphost and its path-loaded dependencies cannot be bound through process creation.",
                     true,
                     string.Empty);
             }

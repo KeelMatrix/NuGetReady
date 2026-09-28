@@ -9,7 +9,7 @@ The 0.1.0 release is planned and unreleased.
 ### Added
 
 - Provides deterministic exact-artifact and package-archive readiness checks for NuGet libraries and .NET tools.
-- Rehearses isolated library restore/build against a public API for every declared target framework and .NET tool installation/smoke execution on Windows using the just-built artifacts, a temporary local feed, controlled sources, and a fresh package cache; Linux and macOS fail closed before tool smoke execution when a handle-bound launch cannot be provided.
+- Rehearses isolated library restore/build against a public API for every declared target framework and .NET tool installation/smoke execution on Windows using the just-built artifacts, a temporary local feed, controlled sources, and a fresh package cache; Linux and macOS fail closed before tool smoke execution with an infrastructure error identifying the configured smoke command when a handle-bound launch cannot be provided.
 - Supports versioned repository configuration, text and JSON reports, stable exit codes, narrow release-workflow policy checks, and explicit `not-run`/`not-applicable` states when a check cannot be evaluated.
 - Validates portable PDB identity and checksum correspondence, package-sensitive paths, file-based licenses, bounded process cleanup, deterministic diagnostics, and telemetry opt-out behavior.
 - Rejects manifest-defined sensitive-name families when protected names are extended or used as directory segments, while the separate package-content contract rejects undeclared binary and XML entries even when their names are legitimate assemblies.
@@ -34,4 +34,4 @@ The 0.1.0 release is planned and unreleased.
 ### Fixed
 
 - Pins the accepted artifact root and traversed ancestors for handle-relative enumeration, attribute inspection, archive opens, hashing, snapshot copies, and final verification, failing closed before outside-root bytes are read during rebinds.
-- Keeps tool-command validation bound to a direct non-reparse installed child and, on Windows, launches a private handle-held snapshot of the complete installed tool directory, closing apphost and dependency replacement windows through process creation. Linux and macOS return infrastructure error when their generic process-creation APIs cannot provide the same binding.
+- Keeps tool-command validation bound to a direct non-reparse installed child and, on Windows, launches a private handle-held snapshot of the complete installed tool directory, closing apphost and dependency replacement windows through process creation. Linux and macOS return an infrastructure error identifying the configured smoke command when their generic process-creation APIs cannot provide the same binding.

@@ -173,6 +173,7 @@ public sealed class ConsumerRehearsalTests
             var toolOutcome = outcomes.Single(outcome => outcome.Result.PackageId == "Fixture.Tool").Result;
             Assert.Equal("error", toolOutcome.Status);
             Assert.Contains("cannot be bound", toolOutcome.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("configured smoke command", toolOutcome.Message, StringComparison.OrdinalIgnoreCase);
         }
         Assert.Contains("net8.0", outcomes.Single(outcome => outcome.Result.PackageId == "Fixture.MultiTarget").Result.Message, StringComparison.Ordinal);
         Assert.Contains("netstandard2.1", outcomes.Single(outcome => outcome.Result.PackageId == "Fixture.MultiTarget").Result.Message, StringComparison.Ordinal);
@@ -306,6 +307,7 @@ public sealed class ConsumerRehearsalTests
             {
                 Assert.Equal("error", outcomes.Single().Result.Status);
                 Assert.Contains("cannot be bound", outcomes.Single().Result.Message, StringComparison.OrdinalIgnoreCase);
+                Assert.Contains("configured smoke command", outcomes.Single().Result.Message, StringComparison.OrdinalIgnoreCase);
             }
         }
         finally
@@ -396,6 +398,7 @@ public sealed class ConsumerRehearsalTests
             {
                 Assert.Equal("error", outcomes.Single().Result.Status);
                 Assert.Contains("cannot be bound", outcomes.Single().Result.Message, StringComparison.OrdinalIgnoreCase);
+                Assert.Contains("configured smoke command", outcomes.Single().Result.Message, StringComparison.OrdinalIgnoreCase);
             }
         }
         finally
@@ -435,6 +438,7 @@ public sealed class ConsumerRehearsalTests
         {
             Assert.Equal("error", outcomes[0].Result.Status);
             Assert.Contains("cannot be bound", outcomes[0].Result.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("configured smoke command", outcomes[0].Result.Message, StringComparison.OrdinalIgnoreCase);
         }
     }
 
@@ -543,6 +547,7 @@ public sealed class ConsumerRehearsalTests
         {
             Assert.Equal("error", outcomes[0].Result.Status);
             Assert.Contains("cannot be bound", outcomes[0].Result.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("configured smoke command", outcomes[0].Result.Message, StringComparison.OrdinalIgnoreCase);
         }
     }
 

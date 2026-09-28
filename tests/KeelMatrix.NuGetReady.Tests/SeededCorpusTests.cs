@@ -165,6 +165,10 @@ public sealed class SeededCorpusTests : IClassFixture<RealCorpusFixture>
 
         Assert.Equal(OperatingSystem.IsWindows() ? "fail" : "error", outcome.Result.Status);
         Assert.Contains("smoke", outcome.Result.Message, StringComparison.OrdinalIgnoreCase);
+        if (!OperatingSystem.IsWindows())
+        {
+            Assert.Contains("configured smoke command", outcome.Result.Message, StringComparison.OrdinalIgnoreCase);
+        }
     }
 
     [Fact]
