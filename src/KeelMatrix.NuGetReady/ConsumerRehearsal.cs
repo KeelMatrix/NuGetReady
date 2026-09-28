@@ -607,6 +607,21 @@ internal static class ConsumerRehearsal
                 using var input = file.OpenRead();
                 using var output = new FileStream(target, FileMode.CreateNew, FileAccess.Write, FileShare.None);
                 input.CopyTo(output);
+
+                // FileStream creates a non-executable destination on Unix. The
+                // verified tool child is an apphost and must retain execute
+                // permission in the private launch image.
+                if (!OperatingSystem.IsWindows() &&
+                    topLevel &&
+                    string.Equals(name, executableName, StringComparison.Ordinal))
+                {
+                    File.SetUnixFileMode(
+                        target,
+                        File.GetUnixFileMode(target) |
+                        UnixFileMode.UserExecute |
+                        UnixFileMode.GroupExecute |
+                        UnixFileMode.OtherExecute);
+                }
             }
         }
 
