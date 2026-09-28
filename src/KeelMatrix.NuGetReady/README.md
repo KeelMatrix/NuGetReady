@@ -2,7 +2,7 @@
 
 NuGetReady is a .NET tool that checks the exact NuGet artifacts you built and rehearses isolated consumer restore, build, execution, or tool installation before publication.
 
-Before inspection, counted archives are copied into one bounded temporary snapshot. The snapshot is used for archive, dependency, feed, consumer, and provenance checks; the original files are rechecked for changes afterward. Generated consumers disable ambient `Directory.Build.*` imports.
+Before inspection, the artifact tree is bounded and checked for reparse-point or containment escapes. After the exact artifact set passes, expected archives are copied into one bounded temporary snapshot. The snapshot is used for archive, dependency, feed, consumer, and provenance checks; the original files are rechecked for changes afterward. Generated consumers disable ambient `Directory.Build.*` imports.
 
 ## Install
 
@@ -26,7 +26,7 @@ nugetready check --artifacts ./artifacts/packages
 
 The default configuration is `nugetready.json` in the current directory. It declares each package ID, kind, version, exact primary `.nupkg`, optional `.snupkg`, and tool smoke command. An optional `workflowPolicy.expectedNuGetUsername` requires one configured literal publisher username; otherwise the checker accepts any non-empty literal `NuGet/login@v1` username. NuGetReady rejects missing, extra, ambiguous, or filename/version-mismatched artifacts, inspects their metadata and layout, and rehearses them through an isolated local feed and fresh package caches. Reports use the stable states `pass`, `warn`, `fail`, `error`, `not-run`, and `not-applicable`; a blocked check never appears as `pass`. Workflow input is parsed before release relevance filtering, so malformed or incomplete YAML produces `error`/exit `2` with a safe relative workflow location; `not-applicable` means successfully inspected input was proven unrelated.
 
-Archive inspection is bounded to 4,096 entries, 32 MiB expanded per entry, and 256 MiB expanded in aggregate. Limits are enforced while reading and package provenance is compared using streaming operations. This is resource protection for inspection, not a malware sandbox.
+The outer artifact tree is bounded to 4,096 entries, 32 directory levels, 4,096 path characters, 256 archives, and 1 GiB of aggregate compressed archive bytes; reparse points and containment escapes are rejected. Archive inspection is then bounded to 4,096 entries, 32 MiB expanded per entry, and 256 MiB expanded in aggregate. Limits are enforced while reading and package provenance is compared using streaming operations. This is resource protection for inspection, not a malware sandbox.
 
 ## Supported Workflow Profile
 

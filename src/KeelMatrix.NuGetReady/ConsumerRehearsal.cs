@@ -40,17 +40,47 @@ internal static class ConsumerRehearsal
         ConsumerRehearsalOptions? options = null,
         CancellationToken cancellationToken = default)
     {
-        var actualArtifacts = Directory.Exists(artifactsPath)
-            ? Directory.EnumerateFiles(artifactsPath, "*", SearchOption.AllDirectories)
-                .Where(path => path.EndsWith(".nupkg", StringComparison.OrdinalIgnoreCase) || path.EndsWith(".snupkg", StringComparison.OrdinalIgnoreCase))
-                .GroupBy(path => Path.GetFileName(path), StringComparer.OrdinalIgnoreCase)
-                .ToDictionary(
-                    group => group.Key,
-                    group => group.Select(path => Path.GetRelativePath(artifactsPath, path).Replace(Path.DirectorySeparatorChar, '/')).ToList(),
-                    StringComparer.OrdinalIgnoreCase)
-            : new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
-        using var snapshots = ArtifactSnapshotSet.Create(artifactsPath, actualArtifacts);
-        return RunDetailed(config, snapshots, actualArtifacts, timeout, options, cancellationToken);
+        Dictionary<string, List<string>> actualArtifacts;
+        try
+        {
+            actualArtifacts = ArtifactTreeScanner.Scan(artifactsPath).Artifacts;
+        }
+        catch (ArtifactTreeLimitExceededException exception)
+        {
+            return config.Packages!
+                .Select(package => Failure(package, exception.Message, isError: true))
+                .ToArray();
+        }
+        catch (IOException)
+        {
+            return config.Packages!
+                .Select(package => Failure(package, "Artifact directory could not be enumerated.", isError: true))
+                .ToArray();
+        }
+
+        try
+        {
+            using var snapshots = ArtifactSnapshotSet.Create(artifactsPath, actualArtifacts);
+            return RunDetailed(config, snapshots, actualArtifacts, timeout, options, cancellationToken);
+        }
+        catch (ArchiveLimitExceededException exception)
+        {
+            return config.Packages!
+                .Select(package => Failure(package, exception.Message, isError: true))
+                .ToArray();
+        }
+        catch (IOException)
+        {
+            return config.Packages!
+                .Select(package => Failure(package, "Artifact files could not be snapshotted for immutable inspection.", isError: true))
+                .ToArray();
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return config.Packages!
+                .Select(package => Failure(package, "Artifact files could not be snapshotted for immutable inspection.", isError: true))
+                .ToArray();
+        }
     }
 
     internal static IReadOnlyList<RehearsalOutcome> RunDetailed(

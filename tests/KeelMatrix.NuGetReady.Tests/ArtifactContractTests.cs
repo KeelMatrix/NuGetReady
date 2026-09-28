@@ -78,6 +78,83 @@ public sealed class ArtifactContractTests
         Assert.DoesNotContain(report.Checks, check => check.Status == "pass");
     }
 
+    [Fact]
+    public void Artifact_tree_archive_count_is_bounded_before_snapshotting()
+    {
+        using var fixture = PackageFixture.Create();
+        for (var index = 0; index < 257; index++)
+        {
+            File.WriteAllBytes(Path.Combine(fixture.ArtifactsPath, $"unexpected-{index}.nupkg"), [1]);
+        }
+
+        var report = CheckRunner.Run(Config("Example.Core", "Example.Core.1.2.3.nupkg"), fixture.ArtifactsPath);
+
+        Assert.Equal(2, report.ExitCode);
+        Assert.Contains(report.Failures, failure => failure.Message.Contains("archive count", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void Artifact_tree_traversal_depth_is_bounded_before_snapshotting()
+    {
+        using var fixture = PackageFixture.Create();
+        var current = fixture.ArtifactsPath;
+        for (var index = 0; index < 40; index++)
+        {
+            current = Directory.CreateDirectory(Path.Combine(current, $"level-{index}")).FullName;
+        }
+
+        File.WriteAllBytes(Path.Combine(current, "Example.Core.1.2.3.nupkg"), [1]);
+
+        var report = CheckRunner.Run(Config("Example.Core", "Example.Core.1.2.3.nupkg"), fixture.ArtifactsPath);
+
+        Assert.Equal(2, report.ExitCode);
+        Assert.Contains(report.Failures, failure => failure.Message.Contains("depth", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void Artifact_tree_filesystem_entry_count_is_bounded()
+    {
+        using var fixture = PackageFixture.Create();
+        for (var index = 0; index < ArtifactTreeLimits.MaxEntryCount + 1; index++)
+        {
+            File.WriteAllBytes(Path.Combine(fixture.ArtifactsPath, $"payload-{index}.bin"), [1]);
+        }
+
+        var exception = Assert.Throws<ArtifactTreeLimitExceededException>(() => ArtifactTreeScanner.Scan(fixture.ArtifactsPath));
+
+        Assert.Contains("entry", exception.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Artifact_tree_rejects_reparse_points_without_following_them()
+    {
+        using var fixture = PackageFixture.Create();
+        var linkPath = Path.Combine(fixture.ArtifactsPath, "linked.nupkg");
+        try
+        {
+            File.CreateSymbolicLink(linkPath, Path.Combine(fixture.Root.FullName, "outside.nupkg"));
+        }
+        catch (Exception linkException) when (linkException is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
+        {
+            return;
+        }
+
+        var limitException = Assert.Throws<ArtifactTreeLimitExceededException>(() => ArtifactTreeScanner.Scan(fixture.ArtifactsPath));
+
+        Assert.Contains("reparse", limitException.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Artifact_tree_aggregate_compressed_size_is_bounded_before_snapshotting()
+    {
+        var current = ArtifactTreeLimits.MaxTotalCompressedArchiveBytes - 1;
+
+        var exception = Assert.Throws<ArtifactTreeLimitExceededException>(
+            () => ArtifactTreeScanner.AddCompressedBytes(current, 2));
+
+        Assert.Contains("aggregate compressed", exception.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
     private static NuGetReadyConfig Config(string id, string artifact)
     {
         return new NuGetReadyConfig

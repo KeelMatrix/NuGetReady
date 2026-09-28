@@ -39,7 +39,29 @@ internal static class CheckRunner
             return BuildReport(0, 0, failures, Array.Empty<RehearsalResult>(), checkStates);
         }
 
-        var actualArtifacts = EnumerateArtifacts(artifactsPath, failures["artifact-set"]);
+        Dictionary<string, List<string>> actualArtifacts;
+        try
+        {
+            actualArtifacts = ArtifactTreeScanner.Scan(artifactsPath).Artifacts;
+        }
+        catch (ArtifactTreeLimitExceededException exception)
+        {
+            failures["artifact-set"].Add(new Failure("artifact-set", exception.Message, true));
+            MarkDownstreamChecksNotRun(checkStates);
+            return BuildReport(0, 0, failures, Array.Empty<RehearsalResult>(), checkStates);
+        }
+        catch (DirectoryNotFoundException)
+        {
+            failures["artifact-set"].Add(new Failure("artifact-set", "Artifact directory could not be enumerated.", true));
+            MarkDownstreamChecksNotRun(checkStates);
+            return BuildReport(0, 0, failures, Array.Empty<RehearsalResult>(), checkStates);
+        }
+        catch (IOException)
+        {
+            failures["artifact-set"].Add(new Failure("artifact-set", "Artifact directory could not be enumerated.", true));
+            MarkDownstreamChecksNotRun(checkStates);
+            return BuildReport(0, 0, failures, Array.Empty<RehearsalResult>(), checkStates);
+        }
         var expectedArtifacts = config.Packages!.SelectMany(package => package.Artifacts!).ToArray();
         var expectations = config.Packages!
             .SelectMany(package => package.Artifacts!.Select(artifact => (package, artifact)))
@@ -62,6 +84,48 @@ internal static class CheckRunner
             }
         }
 
+        var artifactTreeMatchesTheDeclaration = true;
+        foreach (var pair in actualArtifacts.Where(pair => pair.Value.Count > 1)
+                     .OrderBy(pair => pair.Key, StringComparer.OrdinalIgnoreCase)
+                     .ThenBy(pair => pair.Key, StringComparer.Ordinal))
+        {
+            artifactTreeMatchesTheDeclaration = false;
+            failures["artifact-set"].Add(new Failure(
+                "artifact-set",
+                $"Artifact '{pair.Key}' is ambiguous because multiple files have that name."));
+        }
+
+        foreach (var expected in expectedArtifacts)
+        {
+            if (!actualArtifacts.TryGetValue(expected, out var actualPaths))
+            {
+                artifactTreeMatchesTheDeclaration = false;
+                failures["artifact-set"].Add(new Failure("artifact-set", $"Expected artifact '{expected}' was not found."));
+                continue;
+            }
+
+            if (actualPaths.Count != 1 || actualPaths[0].Contains('/', StringComparison.Ordinal))
+            {
+                artifactTreeMatchesTheDeclaration = false;
+                failures["artifact-set"].Add(new Failure("artifact-set", $"Expected artifact '{expected}' is duplicate or not directly in the artifact directory."));
+            }
+        }
+
+        foreach (var actual in actualArtifacts.OrderBy(pair => pair.Key, StringComparer.OrdinalIgnoreCase).ThenBy(pair => pair.Key, StringComparer.Ordinal))
+        {
+            if (!expectations.ContainsKey(actual.Key))
+            {
+                artifactTreeMatchesTheDeclaration = false;
+                failures["artifact-set"].Add(new Failure("artifact-set", $"Unintended artifact '{actual.Key}' was found."));
+            }
+        }
+
+        if (!artifactTreeMatchesTheDeclaration)
+        {
+            MarkDownstreamChecksNotRun(checkStates);
+            return BuildReport(expectedArtifacts.Length, actualArtifacts.Values.Sum(paths => paths.Count), failures, Array.Empty<RehearsalResult>(), checkStates);
+        }
+
         ArtifactSnapshotSet snapshots;
         try
         {
@@ -79,38 +143,16 @@ internal static class CheckRunner
             MarkDownstreamChecksNotRun(checkStates);
             return BuildReport(expectedArtifacts.Length, actualArtifacts.Values.Sum(paths => paths.Count), failures, Array.Empty<RehearsalResult>(), checkStates);
         }
+        catch (UnauthorizedAccessException)
+        {
+            failures["artifact-set"].Add(new Failure("artifact-set", "Artifact files could not be snapshotted for immutable inspection.", true));
+            MarkDownstreamChecksNotRun(checkStates);
+            return BuildReport(expectedArtifacts.Length, actualArtifacts.Values.Sum(paths => paths.Count), failures, Array.Empty<RehearsalResult>(), checkStates);
+        }
 
         using (snapshots)
         {
             AddDuplicatePrimaryIdentityFailures(snapshots, actualArtifacts, failures["artifact-set"]);
-
-            foreach (var expected in expectedArtifacts)
-            {
-                if (!actualArtifacts.TryGetValue(expected, out var actualPaths))
-                {
-                    failures["artifact-set"].Add(new Failure("artifact-set", $"Expected artifact '{expected}' was not found."));
-                    continue;
-                }
-
-                if (actualPaths.Count != 1 || actualPaths[0].Contains('/', StringComparison.Ordinal))
-                {
-                    failures["artifact-set"].Add(new Failure("artifact-set", $"Expected artifact '{expected}' is duplicate or not directly in the artifact directory."));
-                }
-            }
-
-            foreach (var actual in actualArtifacts.OrderBy(pair => pair.Key, StringComparer.OrdinalIgnoreCase).ThenBy(pair => pair.Key, StringComparer.Ordinal))
-            {
-                if (!expectations.ContainsKey(actual.Key))
-                {
-                    failures["artifact-set"].Add(new Failure("artifact-set", $"Unintended artifact '{actual.Key}' was found."));
-                }
-            }
-
-            if (HasBlockingFailure(failures["artifact-set"]))
-            {
-                MarkDownstreamChecksNotRun(checkStates);
-                return BuildReport(expectedArtifacts.Length, actualArtifacts.Values.Sum(paths => paths.Count), failures, Array.Empty<RehearsalResult>(), checkStates);
-            }
 
             foreach (var expected in expectedArtifacts.OrderBy(name => name, StringComparer.OrdinalIgnoreCase).ThenBy(name => name, StringComparer.Ordinal))
             {
@@ -281,48 +323,6 @@ internal static class CheckRunner
     private static string FormatDiagnostic(string diagnostic)
     {
         return string.IsNullOrWhiteSpace(diagnostic) ? string.Empty : $" Diagnostic: {diagnostic}";
-    }
-
-    private static Dictionary<string, List<string>> EnumerateArtifacts(string root, List<Failure> failures)
-    {
-        var result = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
-        IEnumerable<string> files;
-        try
-        {
-            files = Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories)
-                .Where(file => file.EndsWith(".nupkg", StringComparison.OrdinalIgnoreCase) || file.EndsWith(".snupkg", StringComparison.OrdinalIgnoreCase))
-                .Select(file => Path.GetRelativePath(root, file).Replace(Path.DirectorySeparatorChar, '/'))
-                .ToArray();
-        }
-        catch (IOException)
-        {
-            failures.Add(new Failure("artifact-set", "Artifact directory could not be enumerated.", true));
-            return result;
-        }
-        catch (UnauthorizedAccessException)
-        {
-            failures.Add(new Failure("artifact-set", "Artifact directory could not be enumerated.", true));
-            return result;
-        }
-
-        foreach (var file in files.OrderBy(file => file, StringComparer.OrdinalIgnoreCase).ThenBy(file => file, StringComparer.Ordinal))
-        {
-            var name = Path.GetFileName(file);
-            if (!result.TryGetValue(name, out var paths))
-            {
-                paths = new List<string>();
-                result[name] = paths;
-            }
-
-            paths.Add(file);
-        }
-
-        foreach (var pair in result.Where(pair => pair.Value.Count > 1).OrderBy(pair => pair.Key, StringComparer.OrdinalIgnoreCase).ThenBy(pair => pair.Key, StringComparer.Ordinal))
-        {
-            failures.Add(new Failure("artifact-set", $"Artifact '{pair.Key}' is ambiguous because multiple files have that name."));
-        }
-
-        return result;
     }
 
     private static void AddDuplicatePrimaryIdentityFailures(

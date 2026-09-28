@@ -62,7 +62,9 @@ internal static class WorkflowPolicyInspector
               <package pattern="KeelMatrix.NuGetReady" />
             </packageSource>
             <packageSource key="nuget.org">
-              <package pattern="*" />
+              <package pattern="NuGet.*" />
+              <package pattern="YamlDotNet" />
+              <package pattern="KeelMatrix.Telemetry" />
             </packageSource>
           </packageSourceMapping>
         </configuration>

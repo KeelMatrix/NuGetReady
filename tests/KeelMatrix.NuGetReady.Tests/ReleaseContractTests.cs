@@ -176,6 +176,58 @@ public sealed class ReleaseContractTests
     }
 
     [Fact]
+    public void Pre_release_rejects_a_bullet_hidden_by_an_inline_comment()
+    {
+        using var repository = SyntheticReleaseRepository.Create("""
+            # Changelog
+
+            ## [Unreleased]
+
+            ### Added
+
+            - <!-- hidden release evidence -->
+            """);
+
+        var result = repository.Validate(mode: "PreRelease", tagVersion: null);
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("CHANGELOG.md must contain", result.StandardError, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Tag_mode_does_not_close_a_fence_with_a_non_whitespace_tail()
+    {
+        using var repository = SyntheticReleaseRepository.Create("""
+            # Changelog
+
+            ## [Unreleased]
+
+            ### Added
+
+            - Initial package capabilities.
+
+            ```markdown
+            ## [0.1.0] - 2026-09-16
+
+            ### Added
+
+            - Fake fenced release.
+            ``` trailing text
+
+            ## [0.1.0] - 2026-09-16
+
+            ### Added
+
+            - Initial package capabilities.
+            """);
+
+        var result = repository.Validate(mode: "Tag", tagVersion: "0.1.0");
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("does not contain", result.StandardError, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public void A_mismatched_install_command_is_rejected()
     {
         using var repository = SyntheticReleaseRepository.Create(readme: """

@@ -69,6 +69,20 @@ public sealed class ArchiveInspectionLimitTests
         Assert.Equal(1000, files.Length);
     }
 
+    [Fact]
+    public void Snapshot_hash_is_the_hash_of_the_bytes_written_to_the_snapshot()
+    {
+        using var source = new MemoryStream([1, 2, 3, 4]);
+        using var snapshot = new MemoryStream();
+        var aggregateBytes = 0L;
+
+        var snapshotHash = ArtifactSnapshotSet.CopyAndHash(source, snapshot, ref aggregateBytes);
+
+        using var hash = System.Security.Cryptography.IncrementalHash.CreateHash(System.Security.Cryptography.HashAlgorithmName.SHA512);
+        hash.AppendData(snapshot.ToArray());
+        Assert.Equal(Convert.ToBase64String(hash.GetHashAndReset()), snapshotHash);
+    }
+
     private static void WriteZeros(Stream stream, long length)
     {
         var buffer = new byte[64 * 1024];

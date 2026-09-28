@@ -73,7 +73,10 @@ public sealed class ReleaseWorkflowContractTests
         Assert.Contains("<add key=\"candidate\" value=\"/tmp/nugetready-artifacts\" />", workflow, StringComparison.Ordinal);
         Assert.Contains("<package pattern=\"KeelMatrix.NuGetReady\" />", workflow, StringComparison.Ordinal);
         Assert.Contains("<packageSource key=\"nuget.org\">", workflow, StringComparison.Ordinal);
-        Assert.Contains("<package pattern=\"*\" />", workflow, StringComparison.Ordinal);
+        Assert.DoesNotContain("<package pattern=\"*\" />", workflow, StringComparison.Ordinal);
+        Assert.Contains("<package pattern=\"NuGet.*\" />", workflow, StringComparison.Ordinal);
+        Assert.Contains("<package pattern=\"YamlDotNet\" />", workflow, StringComparison.Ordinal);
+        Assert.Contains("<package pattern=\"KeelMatrix.Telemetry\" />", workflow, StringComparison.Ordinal);
         Assert.Contains("dotnet tool install KeelMatrix.NuGetReady --version 0.1.0 --tool-path /tmp/nugetready-tool --configfile /tmp/nugetready-tool.config --no-cache --verbosity minimal", workflow, StringComparison.Ordinal);
         Assert.Contains("New-Item -ItemType Directory -Path /tmp/nugetready-acquisition -Force | Out-Null", workflow, StringComparison.Ordinal);
         Assert.Contains("Set-Content -LiteralPath /tmp/nugetready-acquisition/global.json -Encoding utf8NoBOM", workflow, StringComparison.Ordinal);
@@ -96,6 +99,7 @@ public sealed class ReleaseWorkflowContractTests
 
     [Theory]
     [InlineData("<package pattern=\"KeelMatrix.NuGetReady\" />", "<package pattern=\"*\" />")]
+    [InlineData("<package pattern=\"NuGet.*\" />", "<package pattern=\"*\" />")]
     [InlineData("<add key=\"candidate\" value=\"/tmp/nugetready-artifacts\" />", "<add key=\"candidate\" value=\"https://packages.example.invalid/v3/index.json\" />")]
     [InlineData("--configfile /tmp/nugetready-tool.config", "--add-source /tmp/nugetready-artifacts")]
     public void Candidate_tool_source_mapping_is_exact_or_blocking(string original, string replacement)

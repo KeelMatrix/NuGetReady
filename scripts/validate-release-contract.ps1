@@ -78,57 +78,82 @@ function Get-PropertyValue {
     return $node.InnerText.Trim()
 }
 
-function Get-VisibleMarkdownFlags {
+function Get-MarkdownViews {
     param([string[]]$Lines)
 
-    $visible = [bool[]]::new($Lines.Count)
+    $views = [System.Collections.Generic.List[object]]::new()
     $inComment = $false
     $fenceCharacter = $null
     $fenceLength = 0
     for ($index = 0; $index -lt $Lines.Count; $index++) {
         $line = $Lines[$index]
-        $visible[$index] = $false
-
-        if ($inComment) {
-            if ($line.Contains("-->", [StringComparison]::Ordinal)) { $inComment = $false }
-            continue
-        }
-
-        if ($line -match '^\s*<!--') {
-            if (-not $line.Contains("-->", [StringComparison]::Ordinal)) { $inComment = $true }
-            continue
-        }
-
         if ($null -ne $fenceCharacter) {
-            $closing = [Regex]::Match($line, '^( {0,3})(?<marker>`{3,}|~{3,})')
+            $closing = [Regex]::Match($line, '^( {0,3})(?<marker>`{3,}|~{3,})[ \t]*$')
             if ($closing.Success -and $closing.Groups['marker'].Value[0] -eq $fenceCharacter -and $closing.Groups['marker'].Value.Length -ge $fenceLength) {
                 $fenceCharacter = $null
                 $fenceLength = 0
             }
+
+            $null = $views.Add([pscustomobject]@{ Visible = $false; Text = $line })
             continue
         }
 
-        $opening = [Regex]::Match($line, '^( {0,3})(?<marker>`{3,}|~{3,})')
+        $builder = [System.Text.StringBuilder]::new()
+        $cursor = 0
+        while ($cursor -lt $line.Length) {
+            if ($inComment) {
+                $close = $line.IndexOf('-->', $cursor, [StringComparison]::Ordinal)
+                if ($close -lt 0) {
+                    $cursor = $line.Length
+                    break
+                }
+
+                $inComment = $false
+                $cursor = $close + 3
+                continue
+            }
+
+            $open = $line.IndexOf('<!--', $cursor, [StringComparison]::Ordinal)
+            if ($open -lt 0) {
+                [void]$builder.Append($line, $cursor, $line.Length - $cursor)
+                $cursor = $line.Length
+                break
+            }
+
+            [void]$builder.Append($line, $cursor, $open - $cursor)
+            $inComment = $true
+            $cursor = $open + 4
+        }
+
+        $text = $builder.ToString()
+        $opening = [Regex]::Match($text, '^( {0,3})(?<marker>`{3,}|~{3,})')
         if ($opening.Success) {
             $fenceCharacter = $opening.Groups['marker'].Value[0]
             $fenceLength = $opening.Groups['marker'].Value.Length
+            $null = $views.Add([pscustomobject]@{ Visible = $false; Text = $text })
             continue
         }
 
-        if ($line -match '^(?: {4}|\t)') { continue }
-        $visible[$index] = $true
+        $visible = -not [string]::IsNullOrWhiteSpace($text) -and $text -notmatch '^(?: {4}|\t)'
+        $null = $views.Add([pscustomobject]@{ Visible = $visible; Text = $text })
     }
 
-    return $visible
+    return $views.ToArray()
+}
+
+function Get-VisibleMarkdownFlags {
+    param([string[]]$Lines)
+
+    return @((Get-MarkdownViews -Lines $Lines) | ForEach-Object { [bool]$_.Visible })
 }
 
 function Get-HeadingSections {
     param([string[]]$Lines)
 
     $sections = [System.Collections.Generic.List[object]]::new()
-    $visible = @(Get-VisibleMarkdownFlags -Lines $Lines)
+    $views = @(Get-MarkdownViews -Lines $Lines)
     for ($index = 0; $index -lt $Lines.Count; $index++) {
-        if ($visible[$index] -and $Lines[$index] -match '^ {0,3}##\s+\[(?<label>[^\]]+)\](?:\s+-\s*(?<date>\d{4}-\d{2}-\d{2}))?\s*$') {
+        if ($views[$index].Visible -and $views[$index].Text -match '^ {0,3}##\s+\[(?<label>[^\]]+)\](?:\s+-\s*(?<date>\d{4}-\d{2}-\d{2}))?\s*$') {
             $null = $sections.Add([pscustomobject]@{
                     Index = $index
                     Label = $Matches.label.Trim()
@@ -156,8 +181,8 @@ function Get-SectionLines {
     }
 
     if ($next -le $Section.Index + 1) { return @() }
-    $visible = @(Get-VisibleMarkdownFlags -Lines $Lines)
-    return @((($Section.Index + 1)..($next - 1)) | Where-Object { $visible[$_] } | ForEach-Object { $Lines[$_] })
+    $views = @(Get-MarkdownViews -Lines $Lines)
+    return @((($Section.Index + 1)..($next - 1)) | Where-Object { $views[$_].Visible } | ForEach-Object { $views[$_].Text })
 }
 
 function Get-RealReleaseContent {
@@ -166,10 +191,10 @@ function Get-RealReleaseContent {
     $categories = [System.Collections.Generic.List[string]]::new()
     $hasAddedEntry = $false
     $currentCategory = $null
-    $visible = @(Get-VisibleMarkdownFlags -Lines $Lines)
+    $views = @(Get-MarkdownViews -Lines $Lines)
     for ($index = 0; $index -lt $Lines.Count; $index++) {
-        $line = $Lines[$index]
-        if (-not $visible[$index]) { continue }
+        $line = $views[$index].Text
+        if (-not $views[$index].Visible) { continue }
         if ($line -match '^ {0,3}###\s+(?<category>.+?)\s*$') {
             $currentCategory = $Matches.category.Trim()
             $null = $categories.Add($currentCategory)
@@ -191,10 +216,10 @@ function Get-RealBulletEntries {
     param([string[]]$Lines)
 
     $entries = [System.Collections.Generic.List[string]]::new()
-    $visible = @(Get-VisibleMarkdownFlags -Lines $Lines)
+    $views = @(Get-MarkdownViews -Lines $Lines)
     for ($index = 0; $index -lt $Lines.Count; $index++) {
-        $line = $Lines[$index]
-        if ($visible[$index] -and $line -match '^ {0,3}[-*+]\s+(?<text>\S.*)$') {
+        $line = $views[$index].Text
+        if ($views[$index].Visible -and $line -match '^ {0,3}[-*+]\s+(?<text>\S.*)$') {
             $null = $entries.Add($Matches.text.Trim())
         }
     }

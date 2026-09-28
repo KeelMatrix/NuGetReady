@@ -31,6 +31,7 @@ internal sealed class ArtifactSnapshotSet : IDisposable
         var snapshotRoot = Directory.CreateTempSubdirectory("nugetready-artifacts-").FullName;
         var snapshots = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         var hashes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var aggregateBytes = 0L;
         try
         {
             foreach (var relativePath in actualArtifacts.Values.SelectMany(paths => paths)
@@ -45,11 +46,15 @@ internal sealed class ArtifactSnapshotSet : IDisposable
                     throw new IOException($"Artifact '{normalized}' was not found while taking the artifact snapshot.");
                 }
 
+                if ((File.GetAttributes(sourcePath) & FileAttributes.ReparsePoint) != 0)
+                {
+                    throw new IOException($"Artifact '{normalized}' is a reparse point and cannot be snapshotted.");
+                }
+
                 var snapshotPath = Path.Combine(snapshotRoot, normalized.Replace('/', Path.DirectorySeparatorChar));
                 Directory.CreateDirectory(Path.GetDirectoryName(snapshotPath)!);
-                CopyBounded(sourcePath, snapshotPath);
+                hashes[normalized] = CopyAndHashBounded(sourcePath, snapshotPath, ref aggregateBytes);
                 snapshots[normalized] = snapshotPath;
-                hashes[normalized] = ComputeHash(sourcePath);
             }
 
             return new ArtifactSnapshotSet(sourceRoot, snapshotRoot, snapshots, hashes);
@@ -85,7 +90,20 @@ internal sealed class ArtifactSnapshotSet : IDisposable
         foreach (var pair in sourceHashes)
         {
             var sourcePath = Path.Combine(sourceRoot, pair.Key.Replace('/', Path.DirectorySeparatorChar));
-            if (!File.Exists(sourcePath) || !string.Equals(ComputeHash(sourcePath), pair.Value, StringComparison.Ordinal))
+            try
+            {
+                if (!File.Exists(sourcePath) ||
+                    (File.GetAttributes(sourcePath) & FileAttributes.ReparsePoint) != 0 ||
+                    !string.Equals(ComputeHash(sourcePath), pair.Value, StringComparison.Ordinal))
+                {
+                    return false;
+                }
+            }
+            catch (IOException)
+            {
+                return false;
+            }
+            catch (UnauthorizedAccessException)
             {
                 return false;
             }
@@ -99,12 +117,11 @@ internal sealed class ArtifactSnapshotSet : IDisposable
         DeleteDirectory(snapshotRoot);
     }
 
-    private static void CopyBounded(string sourcePath, string destinationPath)
+    internal static string CopyAndHash(Stream source, Stream destination, ref long aggregateBytes)
     {
-        using var source = File.OpenRead(sourcePath);
-        using var destination = File.Create(destinationPath);
         var buffer = new byte[64 * 1024];
         var total = 0L;
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA512);
         while (true)
         {
             var read = source.Read(buffer, 0, buffer.Length);
@@ -119,8 +136,25 @@ internal sealed class ArtifactSnapshotSet : IDisposable
                 throw new ArchiveLimitExceededException($"Artifact exceeds the {MaxCompressedArtifactBytes} byte compressed-artifact limit.");
             }
 
+            aggregateBytes = checked(aggregateBytes + read);
+            if (aggregateBytes > ArtifactTreeLimits.MaxTotalCompressedArchiveBytes)
+            {
+                throw new ArchiveLimitExceededException(
+                    $"Artifact archives exceed the {ArtifactTreeLimits.MaxTotalCompressedArchiveBytes} byte aggregate compressed-size limit.");
+            }
+
+            hash.AppendData(buffer, 0, read);
             destination.Write(buffer, 0, read);
         }
+
+        return Convert.ToBase64String(hash.GetHashAndReset());
+    }
+
+    private static string CopyAndHashBounded(string sourcePath, string destinationPath, ref long aggregateBytes)
+    {
+        using var source = File.OpenRead(sourcePath);
+        using var destination = File.Create(destinationPath);
+        return CopyAndHash(source, destination, ref aggregateBytes);
     }
 
     private static string ComputeHash(string path)
