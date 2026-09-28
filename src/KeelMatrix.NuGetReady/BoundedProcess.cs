@@ -561,6 +561,8 @@ internal static class UnixProcessSupervisor
         var filePointer = IntPtr.Zero;
         var argumentPointers = new IntPtr[request.Arguments.Length + 2];
         var argumentVector = IntPtr.Zero;
+        var environmentPointers = new List<IntPtr>();
+        var environmentVector = IntPtr.Zero;
         var spawnAttributes = IntPtr.Zero;
         var spawnAttributesInitialized = false;
         try
@@ -577,6 +579,19 @@ internal static class UnixProcessSupervisor
             {
                 Marshal.WriteIntPtr(argumentVector, index * IntPtr.Size, argumentPointers[index]);
             }
+
+            foreach (System.Collections.DictionaryEntry pair in Environment.GetEnvironmentVariables())
+            {
+                environmentPointers.Add(Marshal.StringToCoTaskMemUTF8($"{pair.Key}={pair.Value}"));
+            }
+
+            environmentVector = Marshal.AllocHGlobal((environmentPointers.Count + 1) * IntPtr.Size);
+            for (var index = 0; index < environmentPointers.Count; index++)
+            {
+                Marshal.WriteIntPtr(environmentVector, index * IntPtr.Size, environmentPointers[index]);
+            }
+
+            Marshal.WriteIntPtr(environmentVector, environmentPointers.Count * IntPtr.Size, IntPtr.Zero);
 
             if (setsid() < 0)
             {
@@ -610,7 +625,7 @@ internal static class UnixProcessSupervisor
                 IntPtr.Zero,
                 spawnAttributes,
                 argumentVector,
-                IntPtr.Zero);
+                environmentVector);
             if (spawnResult != 0 || child <= 0)
             {
                 return 125;
@@ -653,7 +668,20 @@ internal static class UnixProcessSupervisor
                 Marshal.FreeHGlobal(argumentVector);
             }
 
+            if (environmentVector != IntPtr.Zero)
+            {
+                Marshal.FreeHGlobal(environmentVector);
+            }
+
             foreach (var pointer in argumentPointers)
+            {
+                if (pointer != IntPtr.Zero)
+                {
+                    Marshal.FreeCoTaskMem(pointer);
+                }
+            }
+
+            foreach (var pointer in environmentPointers)
             {
                 if (pointer != IntPtr.Zero)
                 {
