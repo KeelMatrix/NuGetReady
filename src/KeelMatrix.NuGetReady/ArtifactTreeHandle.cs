@@ -579,16 +579,24 @@ internal static class ArtifactNative
 
     private static List<string> EnumerateUnix(SafeFileHandle handle)
     {
-        var duplicate = UnixDup(handle.DangerousGetHandle().ToInt32());
-        if (duplicate < 0)
+        // dup() shares the directory stream offset with the held descriptor.
+        // A second scan would therefore start at EOF after the first scan. Open
+        // the held directory itself through openat(".") to obtain an independent
+        // open-file description while keeping enumeration handle-relative.
+        var enumerationDescriptor = UnixOpenAt(
+            handle.DangerousGetHandle().ToInt32(),
+            ".",
+            UnixReadOnly | (OperatingSystem.IsMacOS() ? UnixNoFollowMacOs : UnixNoFollowLinux),
+            0);
+        if (enumerationDescriptor < 0)
         {
             throw new IOException("Artifact directory could not be enumerated.", new Win32Exception(Marshal.GetLastWin32Error()));
         }
 
-        var directory = FdOpenDir(duplicate);
+        var directory = FdOpenDir(enumerationDescriptor);
         if (directory == IntPtr.Zero)
         {
-            _ = UnixClose(duplicate);
+            _ = UnixClose(enumerationDescriptor);
             throw new IOException("Artifact directory could not be enumerated.", new Win32Exception(Marshal.GetLastWin32Error()));
         }
 
