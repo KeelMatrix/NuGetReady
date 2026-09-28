@@ -327,6 +327,12 @@ internal static class BoundedProcess
         processJob?.Dispose();
         try
         {
+            if (unixProcessGroup && OperatingSystem.IsMacOS())
+            {
+                process.Kill(entireProcessTree: true);
+                return WaitForDirectExit(process);
+            }
+
             if (unixProcessGroup)
             {
                 var groupKill = kill(-process.Id, SigKill);
@@ -626,10 +632,10 @@ internal static class UnixProcessSupervisor
                 return 125;
             }
 
-            // Keep a subreaper parent alive for the complete child lifetime. This makes
-            // reparented descendants observable instead of treating the original group
-            // disappearing as proof that the whole process tree is gone.
-            if (prctl(PrSetChildSubreaper, 1, 0, 0, 0) != 0)
+            // On Linux, keep a subreaper parent alive for the complete child lifetime.
+            // This makes reparented descendants observable instead of treating the
+            // original group disappearing as proof that the whole process tree is gone.
+            if (OperatingSystem.IsLinux() && prctl(PrSetChildSubreaper, 1, 0, 0, 0) != 0)
             {
                 return 125;
             }
@@ -642,6 +648,15 @@ internal static class UnixProcessSupervisor
 
             if (child == 0)
             {
+                // macOS has no Linux-style child subreaper. Put the target in a
+                // separate process group so the supervisor can still remove
+                // descendants after the target exits without killing itself.
+                if (OperatingSystem.IsMacOS() && setpgid(0, 0) != 0)
+                {
+                    _exit(125);
+                    return 125;
+                }
+
                 _ = execvp(filePointer, argumentVector);
                 _exit(127);
                 return 127;
@@ -656,7 +671,9 @@ internal static class UnixProcessSupervisor
 
             // Reap any descendants adopted by this supervisor. A child that remains
             // after the target exits is not a confirmed-clean process tree.
-            var descendantsClean = ReapDescendants();
+            var descendantsClean = OperatingSystem.IsMacOS()
+                ? KillAndVerifyMacProcessGroup(child)
+                : ReapDescendants();
             if (!descendantsClean)
             {
                 return 125;
@@ -721,17 +738,42 @@ internal static class UnixProcessSupervisor
         return waitpid(-1, out _, WaitNoHang) < 0 && Marshal.GetLastWin32Error() == NoChildrenError;
     }
 
+    private static bool KillAndVerifyMacProcessGroup(int processGroupId)
+    {
+        _ = kill(-processGroupId, SigKill);
+        var deadline = DateTime.UtcNow + TimeSpan.FromMilliseconds(250);
+        while (DateTime.UtcNow < deadline)
+        {
+            if (kill(-processGroupId, 0) != 0)
+            {
+                return Marshal.GetLastWin32Error() == NoSuchProcessError;
+            }
+
+            Thread.Sleep(10);
+        }
+
+        return kill(-processGroupId, 0) != 0 && Marshal.GetLastWin32Error() == NoSuchProcessError;
+    }
+
     private static int DecodeExitStatus(int status)
     {
         return (status & 0x7f) == 0 ? (status >> 8) & 0xff : 128 + (status & 0x7f);
     }
 
     private const int PrSetChildSubreaper = 36;
+    private const int SigKill = 9;
     private const int WaitNoHang = 1;
     private const int NoChildrenError = 10;
+    private const int NoSuchProcessError = 3;
 
     [DllImport("libc", SetLastError = true)]
     private static extern int prctl(int option, int arg2, int arg3, int arg4, int arg5);
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int setpgid(int processId, int processGroupId);
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int kill(int processId, int signal);
 
     [DllImport("libc", SetLastError = true)]
     private static extern int fork();
