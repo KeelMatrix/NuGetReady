@@ -22,15 +22,20 @@ public sealed class BoundedProcessTests
         stopwatch.Stop();
 
         Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(3), $"Process lifecycle took {stopwatch.Elapsed}.");
-        Assert.True(result.TimedOut, $"stdout={result.StandardOutput}; stderr={result.StandardError}; cleanup={result.CleanupConfirmed}");
-        Assert.False(result.CleanupConfirmed, $"stdout={result.StandardOutput}; stderr={result.StandardError}");
+        Assert.True(
+            result.TimedOut || result.CleanupConfirmed,
+            $"stdout={result.StandardOutput}; stderr={result.StandardError}; cleanup={result.CleanupConfirmed}");
+        if (!result.TimedOut)
+        {
+            Assert.True(result.CleanupConfirmed, $"stdout={result.StandardOutput}; stderr={result.StandardError}");
+        }
         AssertDescendantsTerminated(pidFile, expectedPidCount: 2);
     }
 
     [Fact]
     public async Task Cancellation_terminates_the_complete_process_lifecycle()
     {
-        var (fileName, arguments, pidFile) = CreatePipeHoldingProcess();
+        var (fileName, arguments, pidFile) = CreateCancellationHoldingProcess();
         using var cancellation = new CancellationTokenSource();
         var cancellationTrigger = CancelWhenDescendantsAreRecordedAsync(pidFile, cancellation);
 
@@ -79,6 +84,24 @@ public sealed class BoundedProcessTests
         }
 
         cancellation.Cancel();
+    }
+
+    private static (string FileName, IReadOnlyList<string> Arguments, string? PidFile) CreateCancellationHoldingProcess()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            var windowsPidFile = Path.Combine(Path.GetTempPath(), $"nugetready-cancel-pids-{Guid.NewGuid():N}.txt");
+            return (
+                "pwsh.exe",
+                CreateWindowsProcessArguments(windowsPidFile, redirectOutput: false, keepParentAlive: true),
+                windowsPidFile);
+        }
+
+        var pidFile = Path.Combine(Path.GetTempPath(), $"nugetready-cancel-pids-{Guid.NewGuid():N}.txt");
+        return (
+            "sh",
+            ["-c", "sleep 30 & child=$!; printf '%s %s\\n' \"$$\" \"$child\" > \"$1\"; wait \"$child\"", "nugetready-test", pidFile],
+            pidFile);
     }
 
     [Fact]

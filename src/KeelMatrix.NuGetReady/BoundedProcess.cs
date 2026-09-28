@@ -731,7 +731,9 @@ internal static class UnixProcessSupervisor
 
     private static bool ReapDescendants()
     {
-        var deadline = DateTime.UtcNow + TimeSpan.FromMilliseconds(250);
+        var deadline = DateTime.UtcNow + (OperatingSystem.IsMacOS()
+            ? TimeSpan.FromSeconds(2)
+            : TimeSpan.FromMilliseconds(250));
         while (DateTime.UtcNow < deadline)
         {
             var child = waitpid(-1, out _, WaitNoHang);
@@ -753,7 +755,9 @@ internal static class UnixProcessSupervisor
     private static bool KillAndVerifyProcessGroup(int processGroupId)
     {
         _ = kill(-processGroupId, SigKill);
-        var deadline = DateTime.UtcNow + TimeSpan.FromMilliseconds(250);
+        var deadline = DateTime.UtcNow + (OperatingSystem.IsMacOS()
+            ? TimeSpan.FromSeconds(2)
+            : TimeSpan.FromMilliseconds(250));
         while (DateTime.UtcNow < deadline)
         {
             if (OperatingSystem.IsLinux())
