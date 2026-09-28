@@ -10,31 +10,40 @@ internal sealed class ArtifactSnapshotSet : IDisposable
     private readonly string snapshotRoot;
     private readonly Dictionary<string, string> snapshotByRelativePath;
     private readonly Dictionary<string, string> sourceHashes;
+    private readonly ArtifactTreeScanResult sourceScan;
 
     private ArtifactSnapshotSet(
         string sourceRoot,
         string snapshotRoot,
         Dictionary<string, string> snapshotByRelativePath,
-        Dictionary<string, string> sourceHashes)
+        Dictionary<string, string> sourceHashes,
+        ArtifactTreeScanResult sourceScan)
     {
         this.sourceRoot = sourceRoot;
         this.snapshotRoot = snapshotRoot;
         this.snapshotByRelativePath = snapshotByRelativePath;
         this.sourceHashes = sourceHashes;
+        this.sourceScan = sourceScan;
     }
 
     public static ArtifactSnapshotSet Create(
         string artifactsPath,
-        IReadOnlyDictionary<string, List<string>> actualArtifacts)
+        ArtifactTreeScanResult sourceScan)
     {
         var sourceRoot = Path.GetFullPath(artifactsPath);
+        var currentScan = ArtifactTreeScanner.Scan(sourceRoot);
+        if (!sourceScan.HasSameTree(currentScan))
+        {
+            throw new IOException("The artifact tree changed after it was scanned and could not be snapshotted consistently.");
+        }
+
         var snapshotRoot = Directory.CreateTempSubdirectory("nugetready-artifacts-").FullName;
         var snapshots = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         var hashes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         var aggregateBytes = 0L;
         try
         {
-            foreach (var relativePath in actualArtifacts.Values.SelectMany(paths => paths)
+            foreach (var relativePath in currentScan.Artifacts.Values.SelectMany(paths => paths)
                          .Distinct(StringComparer.OrdinalIgnoreCase)
                          .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
                          .ThenBy(path => path, StringComparer.Ordinal))
@@ -57,7 +66,7 @@ internal sealed class ArtifactSnapshotSet : IDisposable
                 snapshots[normalized] = snapshotPath;
             }
 
-            return new ArtifactSnapshotSet(sourceRoot, snapshotRoot, snapshots, hashes);
+            return new ArtifactSnapshotSet(sourceRoot, snapshotRoot, snapshots, hashes, sourceScan);
         }
         catch
         {
@@ -87,6 +96,22 @@ internal sealed class ArtifactSnapshotSet : IDisposable
 
     public bool VerifySourcesUnchanged()
     {
+        try
+        {
+            if (!sourceScan.HasSameTree(ArtifactTreeScanner.Scan(sourceRoot)))
+            {
+                return false;
+            }
+        }
+        catch (IOException)
+        {
+            return false;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return false;
+        }
+
         foreach (var pair in sourceHashes)
         {
             var sourcePath = Path.Combine(sourceRoot, pair.Key.Replace('/', Path.DirectorySeparatorChar));

@@ -39,10 +39,11 @@ internal static class CheckRunner
             return BuildReport(0, 0, failures, Array.Empty<RehearsalResult>(), checkStates);
         }
 
-        Dictionary<string, List<string>> actualArtifacts;
+        ArtifactTreeScanResult artifactScan;
         try
         {
-            actualArtifacts = ArtifactTreeScanner.Scan(artifactsPath).Artifacts;
+            artifactScan = ArtifactTreeScanner.Scan(artifactsPath);
+            ArtifactTreeScanner.AfterScanForTests?.Invoke(artifactsPath);
         }
         catch (ArtifactTreeLimitExceededException exception)
         {
@@ -62,6 +63,7 @@ internal static class CheckRunner
             MarkDownstreamChecksNotRun(checkStates);
             return BuildReport(0, 0, failures, Array.Empty<RehearsalResult>(), checkStates);
         }
+        var actualArtifacts = artifactScan.Artifacts;
         var expectedArtifacts = config.Packages!.SelectMany(package => package.Artifacts!).ToArray();
         var expectations = config.Packages!
             .SelectMany(package => package.Artifacts!.Select(artifact => (package, artifact)))
@@ -129,7 +131,7 @@ internal static class CheckRunner
         ArtifactSnapshotSet snapshots;
         try
         {
-            snapshots = ArtifactSnapshotSet.Create(artifactsPath, actualArtifacts);
+            snapshots = ArtifactSnapshotSet.Create(artifactsPath, artifactScan);
         }
         catch (ArchiveLimitExceededException exception)
         {
@@ -152,7 +154,15 @@ internal static class CheckRunner
 
         using (snapshots)
         {
-            AddDuplicatePrimaryIdentityFailures(snapshots, actualArtifacts, failures["artifact-set"]);
+            if (!snapshots.VerifySourcesUnchanged())
+            {
+                failures["artifact-set"].Add(new Failure(
+                    "artifact-set",
+                    "The artifact tree changed after it was scanned; the check result is unproven.",
+                    true));
+                MarkDownstreamChecksNotRun(checkStates);
+                return BuildReport(expectedArtifacts.Length, actualArtifacts.Values.Sum(paths => paths.Count), failures, Array.Empty<RehearsalResult>(), checkStates);
+            }
 
             foreach (var expected in expectedArtifacts.OrderBy(name => name, StringComparer.OrdinalIgnoreCase).ThenBy(name => name, StringComparer.Ordinal))
             {
@@ -213,8 +223,16 @@ internal static class CheckRunner
                 }
             }
 
-            var archiveParseBlocked = HasBlockingFailure(failures["archive-parse"]);
-            if (!archiveParseBlocked)
+            var archiveContractBlocked = failures
+                .Where(pair => pair.Key is "archive-metadata" or "archive-layout" or "dependency-groups" or "archive-security" or "archive-parse")
+                .SelectMany(pair => pair.Value)
+                .Any(failure => !failure.IsWarning);
+            if (!archiveContractBlocked)
+            {
+                AddDuplicatePrimaryIdentityFailures(snapshots, actualArtifacts, failures["artifact-set"]);
+            }
+
+            if (!archiveContractBlocked)
             {
                 foreach (var failure in DependencyCoherence.Inspect(config, snapshots, actualArtifacts))
                 {
@@ -231,7 +249,7 @@ internal static class CheckRunner
             }
 
             var releaseIdentityBlocked = HasBlockingFailure(failures["archive-metadata"]);
-            if (repositoryPath is not null && !archiveParseBlocked && !releaseIdentityBlocked)
+            if (repositoryPath is not null && !archiveContractBlocked && !releaseIdentityBlocked)
             {
                 var workflowInspection = WorkflowPolicyInspector.InspectDetailed(repositoryPath, config, configPath);
                 foreach (var failure in workflowInspection.Failures)

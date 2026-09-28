@@ -18,20 +18,22 @@ internal static class ArchiveInspector
     {
         using var reader = new PackageArchiveReader(path);
         var rawFiles = ArchiveInspectionLimits.GetFiles(reader);
-        ArchiveInspectionLimits.ValidateExpandedPayload(reader, rawFiles);
+        if (!ArchivePathCanonicalizer.TryCreate(rawFiles, out var archiveFiles, out var pathError))
+        {
+            return WithArtifactContext(new[] { new Failure("archive-security", pathError) }, expectation, artifactFileName ?? Path.GetFileName(path));
+        }
+
+        ArchiveInspectionLimits.ValidateExpandedPayload(reader, archiveFiles!.RawPaths);
         var nuspec = reader.NuspecReader;
         var identity = nuspec.GetIdentity();
-        var files = rawFiles
-            .Select(Normalize)
-            .OrderBy(file => file, StringComparer.Ordinal)
-            .ToArray();
+        var files = archiveFiles.Paths;
         var failures = new List<Failure>();
 
         CheckIdentity(identity, expectation, failures);
 
         if (symbols)
         {
-            CheckSymbols(reader, files, mainPackagePath, failures);
+            CheckSymbols(reader, archiveFiles, mainPackagePath, failures);
 
             CheckUnexpectedFiles(files, failures);
             return WithArtifactContext(failures, expectation, artifactFileName ?? Path.GetFileName(path));
@@ -82,7 +84,7 @@ internal static class ArchiveInspector
         }
 
         CheckDependencyGroups(nuspec, files, failures);
-        CheckLayout(reader, expectation, files, failures);
+        CheckLayout(reader, archiveFiles, expectation, files, failures);
         CheckUnexpectedFiles(files, failures);
         return WithArtifactContext(failures, expectation, artifactFileName ?? Path.GetFileName(path));
     }
@@ -153,7 +155,12 @@ internal static class ArchiveInspector
         }
     }
 
-    private static void CheckLayout(PackageArchiveReader reader, PackageExpectation expectation, IReadOnlyList<string> files, List<Failure> failures)
+    private static void CheckLayout(
+        PackageArchiveReader reader,
+        CanonicalArchiveFiles archiveFiles,
+        PackageExpectation expectation,
+        IReadOnlyList<string> files,
+        List<Failure> failures)
     {
         if (expectation.Kind!.Equals("dotnetTool", StringComparison.OrdinalIgnoreCase))
         {
@@ -164,7 +171,7 @@ internal static class ArchiveInspector
                 failures.Add(new Failure("archive-layout", "Tool package does not contain a tools/<tfm>/any assembly."));
             }
 
-            CheckToolCommand(reader, files, expectation, failures);
+            CheckToolCommand(reader, archiveFiles, files, expectation, failures);
 
             return;
         }
@@ -186,11 +193,11 @@ internal static class ArchiveInspector
 
     private static void CheckSymbols(
         PackageArchiveReader symbolReader,
-        IReadOnlyList<string> symbolFiles,
+        CanonicalArchiveFiles symbolFiles,
         string? mainPackagePath,
         List<Failure> failures)
     {
-        var pdbFiles = symbolFiles
+        var pdbFiles = symbolFiles.Paths
             .Where(file => file.EndsWith(".pdb", StringComparison.OrdinalIgnoreCase))
             .OrderBy(file => file, StringComparer.Ordinal)
             .ToArray();
@@ -217,7 +224,7 @@ internal static class ArchiveInspector
                 var symbolAssemblyNames = pdbFiles
                     .Select(GetFileNameWithoutExtension)
                     .ToHashSet(StringComparer.OrdinalIgnoreCase);
-                foreach (var assembly in mainFiles.Where(file =>
+                foreach (var assembly in mainFiles.Paths.Where(file =>
                              IsSymbolBearingAssembly(file) &&
                              IsIntendedSymbolAssembly(file, mainFiles, symbolAssemblyNames)))
                 {
@@ -232,7 +239,7 @@ internal static class ArchiveInspector
             {
                 try
                 {
-                    using var source = symbolReader.GetStream(pdbFile);
+                    using var source = symbolReader.GetStream(symbolFiles.RawPath(pdbFile));
                     using var stream = new MemoryStream(ArchiveInspectionLimits.ReadBounded(source), writable: false);
                     stream.Position = 0;
                     using var provider = System.Reflection.Metadata.MetadataReaderProvider.FromPortablePdbStream(stream);
@@ -249,7 +256,7 @@ internal static class ArchiveInspector
                     if (mainFiles is not null)
                     {
                         var expectedAssembly = pdbFile[..^4] + ".dll";
-                        if (!mainFiles.Contains(expectedAssembly))
+                        if (!mainFiles.Paths.Contains(expectedAssembly, StringComparer.OrdinalIgnoreCase))
                         {
                             failures.Add(new Failure("archive-layout", "Symbol archive contains a PDB without a matching package assembly."));
                         }
@@ -257,6 +264,7 @@ internal static class ArchiveInspector
                         {
                             ValidatePdbCorrespondence(
                                 mainReader!,
+                                mainFiles,
                                 expectedAssembly,
                                 stream.ToArray(),
                                 metadata,
@@ -286,12 +294,13 @@ internal static class ArchiveInspector
 
     private static void ValidatePdbCorrespondence(
         PackageArchiveReader mainReader,
+        CanonicalArchiveFiles mainFiles,
         string assemblyPath,
         byte[] pdbBytes,
         MetadataReader pdbMetadata,
         List<Failure> failures)
     {
-        using var source = mainReader.GetStream(assemblyPath);
+        using var source = mainReader.GetStream(mainFiles.RawPath(assemblyPath));
         using var assemblyStream = new MemoryStream(ArchiveInspectionLimits.ReadBounded(source), writable: false);
         assemblyStream.Position = 0;
         using var peReader = new PEReader(assemblyStream);
@@ -416,11 +425,16 @@ internal static class ArchiveInspector
         }
     }
 
-    private static HashSet<string> GetValidatedFiles(PackageArchiveReader reader)
+    private static CanonicalArchiveFiles GetValidatedFiles(PackageArchiveReader reader)
     {
         var files = ArchiveInspectionLimits.GetFiles(reader);
-        ArchiveInspectionLimits.ValidateExpandedPayload(reader, files);
-        return files.Select(Normalize).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (!ArchivePathCanonicalizer.TryCreate(files, out var canonicalFiles, out var pathError))
+        {
+            throw new NuGetReadyInputException(pathError);
+        }
+
+        ArchiveInspectionLimits.ValidateExpandedPayload(reader, canonicalFiles!.RawPaths);
+        return canonicalFiles;
     }
 
     private static bool IsSymbolBearingAssembly(string file)
@@ -433,11 +447,11 @@ internal static class ArchiveInspector
 
     private static bool IsIntendedSymbolAssembly(
         string assembly,
-        HashSet<string> mainFiles,
+        CanonicalArchiveFiles mainFiles,
         HashSet<string> symbolAssemblyNames)
     {
         var expectedPdb = assembly[..^4] + ".pdb";
-        return mainFiles.Contains(expectedPdb) ||
+        return mainFiles.Paths.Contains(expectedPdb, StringComparer.OrdinalIgnoreCase) ||
                symbolAssemblyNames.Contains(GetFileNameWithoutExtension(assembly));
     }
 
@@ -463,7 +477,12 @@ internal static class ArchiveInspector
                document.EndsWith(pattern[(star + 1)..], StringComparison.OrdinalIgnoreCase);
     }
 
-    private static void CheckToolCommand(PackageArchiveReader reader, IReadOnlyList<string> files, PackageExpectation expectation, List<Failure> failures)
+    private static void CheckToolCommand(
+        PackageArchiveReader reader,
+        CanonicalArchiveFiles archiveFiles,
+        IReadOnlyList<string> files,
+        PackageExpectation expectation,
+        List<Failure> failures)
     {
         var settingsPath = files.FirstOrDefault(file => file.EndsWith("/DotnetToolSettings.xml", StringComparison.OrdinalIgnoreCase));
         if (settingsPath is null)
@@ -472,7 +491,7 @@ internal static class ArchiveInspector
             return;
         }
 
-        using var stream = reader.GetStream(settingsPath);
+        using var stream = reader.GetStream(archiveFiles.RawPath(settingsPath));
         var document = XDocument.Load(stream, LoadOptions.None);
         var commands = document
             .Descendants()
@@ -504,8 +523,8 @@ internal static class ArchiveInspector
 
     private static bool ContainsFile(IReadOnlyList<string> files, string file)
     {
-        var expected = Normalize(file);
-        return files.Any(candidate => string.Equals(candidate, expected, StringComparison.OrdinalIgnoreCase));
+        return ArchivePathCanonicalizer.TryCanonicalize(file, out var expected, out _) &&
+               files.Any(candidate => string.Equals(candidate, expected, StringComparison.OrdinalIgnoreCase));
     }
 
     private static bool IsUnexpectedFile(string file)
@@ -513,8 +532,4 @@ internal static class ArchiveInspector
         return PackageSensitiveFilePolicy.IsSensitive(file);
     }
 
-    private static string Normalize(string path)
-    {
-        return path.Replace('\\', '/').TrimStart('/');
-    }
 }

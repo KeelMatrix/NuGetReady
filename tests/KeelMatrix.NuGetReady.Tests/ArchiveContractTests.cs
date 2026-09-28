@@ -241,6 +241,64 @@ public sealed class ArchiveContractTests
         Assert.Contains(report.Failures, failure => failure.Message.Contains("symbol file", StringComparison.Ordinal));
     }
 
+    [Theory]
+    [InlineData(false, "README.md")]
+    [InlineData(false, "README\\md")]
+    [InlineData(false, "./dot.txt")]
+    [InlineData(false, "../escape.txt")]
+    [InlineData(false, "/root.txt")]
+    [InlineData(false, "readme.md")]
+    [InlineData(false, "e\u0301.txt|é.txt")]
+    [InlineData(true, "README.md")]
+    [InlineData(true, "README\\md")]
+    [InlineData(true, "./dot.txt")]
+    [InlineData(true, "../escape.txt")]
+    [InlineData(true, "/root.txt")]
+    [InlineData(true, "readme.md")]
+    [InlineData(true, "e\u0301.txt|é.txt")]
+    public void Noncanonical_archive_entry_paths_fail_before_archive_decisions(bool symbols, string entryNames)
+    {
+        using var fixture = PackageFixture.Create();
+        var path = symbols
+            ? fixture.AddSymbols("Example.Core.1.2.3.snupkg", "Example.Core", "1.2.3")
+            : fixture.AddPackage("Example.Core.1.2.3.nupkg", "Example.Core", "1.2.3");
+        if (symbols)
+        {
+            fixture.AddPackage("Example.Core.1.2.3.nupkg", "Example.Core", "1.2.3", kind: "dotnetTool");
+        }
+        var current = path;
+        foreach (var entryName in entryNames.Split('|'))
+        {
+            var effectiveEntryName = symbols && (entryName is "README.md" or "readme.md")
+                ? entryName.Equals("README.md", StringComparison.Ordinal) ? "Example.Core.nuspec" : "example.core.nuspec"
+                : entryName;
+            var mutated = ArchiveMutator.AddEntry(current, effectiveEntryName, [1, 2, 3]);
+            if (!string.Equals(current, path, StringComparison.Ordinal))
+            {
+                File.Delete(current);
+            }
+
+            current = mutated;
+        }
+
+        if (!string.Equals(current, path, StringComparison.Ordinal))
+        {
+            File.Delete(path);
+            File.Move(current, path);
+        }
+
+        var artifacts = symbols
+            ? new[] { "Example.Core.1.2.3.nupkg", Path.GetFileName(path) }
+            : new[] { Path.GetFileName(path) };
+        var report = CheckRunner.Run(
+            Config("Example.Core", symbols ? "dotnetTool" : "library", "1.2.3", artifacts),
+            fixture.ArtifactsPath);
+
+        Assert.Equal(1, report.ExitCode);
+        Assert.NotEmpty(report.Failures);
+        Assert.All(report.Failures, failure => Assert.Equal("archive-security", failure.CheckId));
+    }
+
     [Fact]
     public void Malformed_or_mismatched_symbols_and_missing_license_file_fail()
     {

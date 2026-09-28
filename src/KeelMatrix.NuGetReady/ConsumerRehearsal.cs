@@ -40,10 +40,11 @@ internal static class ConsumerRehearsal
         ConsumerRehearsalOptions? options = null,
         CancellationToken cancellationToken = default)
     {
-        Dictionary<string, List<string>> actualArtifacts;
+        ArtifactTreeScanResult artifactScan;
         try
         {
-            actualArtifacts = ArtifactTreeScanner.Scan(artifactsPath).Artifacts;
+            artifactScan = ArtifactTreeScanner.Scan(artifactsPath);
+            ArtifactTreeScanner.AfterScanForTests?.Invoke(artifactsPath);
         }
         catch (ArtifactTreeLimitExceededException exception)
         {
@@ -60,8 +61,8 @@ internal static class ConsumerRehearsal
 
         try
         {
-            using var snapshots = ArtifactSnapshotSet.Create(artifactsPath, actualArtifacts);
-            return RunDetailed(config, snapshots, actualArtifacts, timeout, options, cancellationToken);
+            using var snapshots = ArtifactSnapshotSet.Create(artifactsPath, artifactScan);
+            return RunDetailed(config, snapshots, artifactScan.Artifacts, timeout, options, cancellationToken);
         }
         catch (ArchiveLimitExceededException exception)
         {

@@ -1,3 +1,5 @@
+using System.Security.Cryptography;
+
 namespace KeelMatrix.NuGetReady;
 
 internal sealed class ArtifactTreeLimitExceededException : IOException
@@ -8,11 +10,27 @@ internal sealed class ArtifactTreeLimitExceededException : IOException
     }
 }
 
+internal sealed record ArtifactTreeEntry(
+    string RelativePath,
+    bool IsDirectory,
+    long Length,
+    long LastWriteUtcTicks,
+    long CreationUtcTicks,
+    FileAttributes Attributes,
+    string ContentHash);
+
 internal sealed record ArtifactTreeScanResult(
     Dictionary<string, List<string>> Artifacts,
     int EntryCount,
     int ArchiveCount,
-    long CompressedArchiveBytes);
+    long CompressedArchiveBytes,
+    IReadOnlyList<ArtifactTreeEntry> Entries)
+{
+    public bool HasSameTree(ArtifactTreeScanResult other)
+    {
+        return Entries.SequenceEqual(other.Entries);
+    }
+}
 
 internal static class ArtifactTreeLimits
 {
@@ -25,6 +43,8 @@ internal static class ArtifactTreeLimits
 
 internal static class ArtifactTreeScanner
 {
+    internal static Action<string>? AfterScanForTests { get; set; }
+
     public static ArtifactTreeScanResult Scan(string artifactsPath)
     {
         var root = Path.GetFullPath(artifactsPath);
@@ -34,21 +54,31 @@ internal static class ArtifactTreeScanner
         }
 
         EnsureSafeEntry(root, root, isDirectory: true);
+        if (IsReparsePoint(root))
+        {
+            throw new ArtifactTreeLimitExceededException("Artifact tree root is a reparse point; links and junctions are not followed.");
+        }
 
         var artifacts = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
-        var pending = new Queue<(string Path, int Depth)>();
-        pending.Enqueue((root, 0));
+        var entries = new List<ArtifactTreeEntry>();
+        var pending = new Queue<(string Path, string RelativePath, int Depth)>();
+        pending.Enqueue((root, string.Empty, 0));
         var entryCount = 0;
         var archiveCount = 0;
         var compressedBytes = 0L;
 
         while (pending.Count > 0)
         {
-            var (directory, depth) = pending.Dequeue();
-            IEnumerable<string> entries;
+            var (directory, relativeDirectory, depth) = pending.Dequeue();
+            if (!EnsureNoReparseChain(root, relativeDirectory))
+            {
+                throw new ArtifactTreeLimitExceededException("Artifact tree contains a reparse point; links and junctions are not followed.");
+            }
+
+            IEnumerable<string> childEntries;
             try
             {
-                entries = Directory.EnumerateFileSystemEntries(
+                childEntries = Directory.EnumerateFileSystemEntries(
                     directory,
                     "*",
                     new EnumerationOptions
@@ -68,7 +98,7 @@ internal static class ArtifactTreeScanner
                 throw new IOException("Artifact directory could not be enumerated.", exception);
             }
 
-            foreach (var entry in entries)
+            foreach (var entry in childEntries.OrderBy(path => path, StringComparer.Ordinal))
             {
                 entryCount = checked(entryCount + 1);
                 if (entryCount > ArtifactTreeLimits.MaxEntryCount)
@@ -77,11 +107,21 @@ internal static class ArtifactTreeScanner
                         $"Artifact tree exceeds the {ArtifactTreeLimits.MaxEntryCount} entry limit.");
                 }
 
+                var name = Path.GetFileName(entry);
+                var relative = string.IsNullOrEmpty(relativeDirectory)
+                    ? name
+                    : relativeDirectory + "/" + name;
                 EnsureSafeEntry(root, entry, isDirectory: false);
+                if (!EnsureNoReparseChain(root, relative))
+                {
+                    throw new ArtifactTreeLimitExceededException(
+                        $"Artifact tree contains a reparse point at '{relative}'; links and junctions are not followed.");
+                }
+
                 FileAttributes attributes;
                 try
                 {
-                    attributes = File.GetAttributes(entry);
+                    attributes = StableAttributes(File.GetAttributes(entry));
                 }
                 catch (IOException exception)
                 {
@@ -95,7 +135,7 @@ internal static class ArtifactTreeScanner
                 if ((attributes & FileAttributes.ReparsePoint) != 0)
                 {
                     throw new ArtifactTreeLimitExceededException(
-                        $"Artifact tree contains a reparse point at '{Normalize(Path.GetRelativePath(root, entry))}'; links and junctions are not followed.");
+                        $"Artifact tree contains a reparse point at '{relative}'; links and junctions are not followed.");
                 }
 
                 if ((attributes & FileAttributes.Directory) != 0)
@@ -107,20 +147,10 @@ internal static class ArtifactTreeScanner
                             $"Artifact tree exceeds the {ArtifactTreeLimits.MaxTraversalDepth}-level traversal-depth limit.");
                     }
 
-                    pending.Enqueue((entry, childDepth));
+                    var info = new DirectoryInfo(entry);
+                    entries.Add(new ArtifactTreeEntry(relative, true, 0, info.LastWriteTimeUtc.Ticks, info.CreationTimeUtc.Ticks, attributes, string.Empty));
+                    pending.Enqueue((entry, relative, childDepth));
                     continue;
-                }
-
-                if (!IsArchive(entry))
-                {
-                    continue;
-                }
-
-                archiveCount = checked(archiveCount + 1);
-                if (archiveCount > ArtifactTreeLimits.MaxArchiveCount)
-                {
-                    throw new ArtifactTreeLimitExceededException(
-                        $"Artifact tree exceeds the {ArtifactTreeLimits.MaxArchiveCount} archive count limit.");
                 }
 
                 long length;
@@ -133,17 +163,31 @@ internal static class ArtifactTreeScanner
                     throw new IOException("Artifact archive could not be inspected.", exception);
                 }
 
-                compressedBytes = AddCompressedBytes(compressedBytes, length);
-
-                var relative = Normalize(Path.GetRelativePath(root, entry));
-                var name = Path.GetFileName(relative);
-                if (!artifacts.TryGetValue(name, out var paths))
+                var hash = string.Empty;
+                if (IsArchive(entry))
                 {
-                    paths = new List<string>();
-                    artifacts[name] = paths;
+                    archiveCount = checked(archiveCount + 1);
+                    if (archiveCount > ArtifactTreeLimits.MaxArchiveCount)
+                    {
+                        throw new ArtifactTreeLimitExceededException(
+                            $"Artifact tree exceeds the {ArtifactTreeLimits.MaxArchiveCount} archive count limit.");
+                    }
+
+                    hash = ComputeHash(entry, ref compressedBytes);
                 }
 
-                paths.Add(relative);
+                var fileInfo = new FileInfo(entry);
+                entries.Add(new ArtifactTreeEntry(relative, false, length, fileInfo.LastWriteTimeUtc.Ticks, fileInfo.CreationTimeUtc.Ticks, attributes, hash));
+                if (IsArchive(entry))
+                {
+                    if (!artifacts.TryGetValue(name, out var paths))
+                    {
+                        paths = new List<string>();
+                        artifacts[name] = paths;
+                    }
+
+                    paths.Add(relative);
+                }
             }
         }
 
@@ -156,7 +200,12 @@ internal static class ArtifactTreeScanner
             });
         }
 
-        return new ArtifactTreeScanResult(artifacts, entryCount, archiveCount, compressedBytes);
+        return new ArtifactTreeScanResult(
+            artifacts,
+            entryCount,
+            archiveCount,
+            compressedBytes,
+            entries.OrderBy(entry => entry.RelativePath, StringComparer.Ordinal).ToArray());
     }
 
     internal static long AddCompressedBytes(long current, long next)
@@ -168,6 +217,26 @@ internal static class ArtifactTreeScanner
         }
 
         return current + next;
+    }
+
+    private static string ComputeHash(string path, ref long compressedBytes)
+    {
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA512);
+        using var stream = File.OpenRead(path);
+        var buffer = new byte[64 * 1024];
+        while (true)
+        {
+            var read = stream.Read(buffer, 0, buffer.Length);
+            if (read == 0)
+            {
+                break;
+            }
+
+            compressedBytes = AddCompressedBytes(compressedBytes, read);
+            hash.AppendData(buffer, 0, read);
+        }
+
+        return Convert.ToBase64String(hash.GetHashAndReset());
     }
 
     private static void EnsureSafeEntry(string root, string path, bool isDirectory)
@@ -190,11 +259,39 @@ internal static class ArtifactTreeScanner
         }
     }
 
+    private static bool EnsureNoReparseChain(string root, string relativePath)
+    {
+        if (IsReparsePoint(root))
+        {
+            return false;
+        }
+
+        var current = root;
+        foreach (var segment in relativePath.Split('/', StringSplitOptions.RemoveEmptyEntries))
+        {
+            current = Path.Combine(current, segment);
+            if (IsReparsePoint(current))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool IsReparsePoint(string path)
+    {
+        return (File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0;
+    }
+
+    private static FileAttributes StableAttributes(FileAttributes attributes)
+    {
+        return attributes & (FileAttributes.Directory | FileAttributes.Hidden | FileAttributes.ReadOnly | FileAttributes.System | FileAttributes.ReparsePoint);
+    }
+
     private static bool IsArchive(string path)
     {
         return path.EndsWith(".nupkg", StringComparison.OrdinalIgnoreCase) ||
                path.EndsWith(".snupkg", StringComparison.OrdinalIgnoreCase);
     }
-
-    private static string Normalize(string path) => path.Replace('\\', '/');
 }
