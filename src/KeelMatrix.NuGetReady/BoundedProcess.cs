@@ -609,6 +609,7 @@ internal static class UnixProcessSupervisor
             return 125;
         }
 
+        var isMacOs = OperatingSystem.IsMacOS();
         var filePointer = IntPtr.Zero;
         var argumentPointers = new IntPtr[request.Arguments.Length + 2];
         var argumentVector = IntPtr.Zero;
@@ -651,7 +652,7 @@ internal static class UnixProcessSupervisor
                 // macOS has no Linux-style child subreaper. Put the target in a
                 // separate process group so the supervisor can still remove
                 // descendants after the target exits without killing itself.
-                if (OperatingSystem.IsMacOS() && setpgid(0, 0) != 0)
+                if (isMacOs && setpgid(0, 0) != 0)
                 {
                     _exit(125);
                     return 125;
