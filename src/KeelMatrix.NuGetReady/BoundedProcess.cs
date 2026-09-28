@@ -561,12 +561,6 @@ internal static class UnixProcessSupervisor
         var filePointer = IntPtr.Zero;
         var argumentPointers = new IntPtr[request.Arguments.Length + 2];
         var argumentVector = IntPtr.Zero;
-        var anchorFilePointer = IntPtr.Zero;
-        var anchorArgumentPointers = new IntPtr[3];
-        var anchorArgumentVector = IntPtr.Zero;
-        var anchorProcess = 0;
-        var anchorGroup = 0;
-        var anchorReaped = false;
         var environmentPointers = new List<IntPtr>();
         var environmentVector = IntPtr.Zero;
         var spawnAttributes = IntPtr.Zero;
@@ -637,39 +631,6 @@ internal static class UnixProcessSupervisor
                 return 125;
             }
 
-            // Keep the target group alive after the target exits so its identity
-            // cannot be reused before verification. The anchor joins the group
-            // created for the target and is killed with the complete group.
-            if (posix_spawnattr_setpgroup(spawnAttributes, child) != 0)
-            {
-                _ = killpg(child, SigKill);
-                return 125;
-            }
-
-            anchorFilePointer = Marshal.StringToCoTaskMemUTF8("/bin/sleep");
-            anchorArgumentPointers[0] = anchorFilePointer;
-            anchorArgumentPointers[1] = Marshal.StringToCoTaskMemUTF8("600");
-            anchorArgumentVector = Marshal.AllocHGlobal(anchorArgumentPointers.Length * IntPtr.Size);
-            for (var index = 0; index < anchorArgumentPointers.Length; index++)
-            {
-                Marshal.WriteIntPtr(anchorArgumentVector, index * IntPtr.Size, anchorArgumentPointers[index]);
-            }
-
-            var anchorResult = posix_spawnp(
-                out anchorProcess,
-                anchorFilePointer,
-                IntPtr.Zero,
-                spawnAttributes,
-                anchorArgumentVector,
-                environmentVector);
-            if (anchorResult != 0 || anchorProcess <= 0)
-            {
-                _ = killpg(child, SigKill);
-                return 125;
-            }
-
-            anchorGroup = child;
-
             SignalReady();
             var status = 0;
             if (waitpid(child, out status, 0) < 0)
@@ -677,7 +638,7 @@ internal static class UnixProcessSupervisor
                 return 125;
             }
 
-            // The target and its anchor share a dedicated process group. Kill and verify that group before
+            // The target has its own process group. Kill and verify that group before
             // claiming cleanup; on Linux also require the subreaper to have no adopted
             // child remaining, which keeps detached/reparented descendants unproven.
             var descendantsClean = KillAndVerifyProcessGroup(child);
@@ -685,13 +646,6 @@ internal static class UnixProcessSupervisor
             {
                 return 125;
             }
-
-            if (!ReapAnchor(anchorProcess))
-            {
-                return 125;
-            }
-
-            anchorReaped = true;
 
             SignalCleanupConfirmed();
             return DecodeExitStatus(status);
@@ -713,25 +667,12 @@ internal static class UnixProcessSupervisor
                 Marshal.FreeHGlobal(argumentVector);
             }
 
-            if (anchorArgumentVector != IntPtr.Zero)
-            {
-                Marshal.FreeHGlobal(anchorArgumentVector);
-            }
-
             if (environmentVector != IntPtr.Zero)
             {
                 Marshal.FreeHGlobal(environmentVector);
             }
 
             foreach (var pointer in argumentPointers)
-            {
-                if (pointer != IntPtr.Zero)
-                {
-                    Marshal.FreeCoTaskMem(pointer);
-                }
-            }
-
-            foreach (var pointer in anchorArgumentPointers)
             {
                 if (pointer != IntPtr.Zero)
                 {
@@ -747,11 +688,6 @@ internal static class UnixProcessSupervisor
                 }
             }
 
-            if (anchorProcess > 0 && !anchorReaped)
-            {
-                _ = KillAndVerifyProcessGroup(anchorGroup);
-                _ = ReapAnchor(anchorProcess);
-            }
         }
     }
 
@@ -817,25 +753,14 @@ internal static class UnixProcessSupervisor
         return waitpid(-1, out _, WaitNoHang) < 0 && Marshal.GetLastWin32Error() == NoChildrenError;
     }
 
-    private static bool ReapAnchor(int processId)
-    {
-        var result = waitpid(processId, out _, 0);
-        return result == processId || result < 0 && Marshal.GetLastWin32Error() == NoChildrenError;
-    }
-
     private static bool KillAndVerifyProcessGroup(int processGroupId)
     {
-        _ = killpg(processGroupId, SigKill);
+        _ = kill(-processGroupId, SigKill);
         var deadline = DateTime.UtcNow + (OperatingSystem.IsMacOS()
             ? TimeSpan.FromSeconds(5)
             : TimeSpan.FromMilliseconds(250));
         while (DateTime.UtcNow < deadline)
         {
-            // A descendant can fork into the target group between the initial
-            // signal and the first observation. Re-issue the group kill while
-            // the bounded verification window remains open.
-            _ = killpg(processGroupId, SigKill);
-
             if (OperatingSystem.IsLinux())
             {
                 while (waitpid(-1, out _, WaitNoHang) > 0)
@@ -843,10 +768,14 @@ internal static class UnixProcessSupervisor
                 }
             }
 
-            var groupProbe = killpg(processGroupId, 0);
-            if (groupProbe != 0)
+            if (kill(-processGroupId, 0) != 0)
             {
                 var groupError = Marshal.GetLastWin32Error();
+                if (OperatingSystem.IsMacOS() && MacProcessGroupHasNoLiveMembers(processGroupId))
+                {
+                    return true;
+                }
+
                 return groupError == NoSuchProcessError &&
                     (!OperatingSystem.IsLinux() || ReapDescendants());
             }
@@ -864,7 +793,7 @@ internal static class UnixProcessSupervisor
             return true;
         }
 
-        return killpg(processGroupId, 0) != 0 &&
+        return kill(-processGroupId, 0) != 0 &&
             Marshal.GetLastWin32Error() == NoSuchProcessError &&
             (!OperatingSystem.IsLinux() || ReapDescendants());
     }
@@ -928,9 +857,6 @@ internal static class UnixProcessSupervisor
 
     [DllImport("libc", SetLastError = true)]
     private static extern int kill(int processId, int signal);
-
-    [DllImport("libc", SetLastError = true)]
-    private static extern int killpg(int processGroupId, int signal);
 
     [DllImport("libc", SetLastError = true)]
     private static extern int waitpid(int processId, out int status, int options);

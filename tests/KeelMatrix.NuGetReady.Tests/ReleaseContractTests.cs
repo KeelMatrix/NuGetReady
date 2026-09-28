@@ -330,6 +330,13 @@ public sealed class ReleaseContractTests
         {
             var root = Directory.CreateTempSubdirectory("nugetready-release-contract-");
             var projectDirectory = Directory.CreateDirectory(Path.Combine(root.FullName, "src", "KeelMatrix.NuGetReady"));
+            var buildDirectory = Directory.CreateDirectory(Path.Combine(root.FullName, "build"));
+            var repositoryBuildDirectory = Path.Combine(FindRepositoryRoot(), "build");
+            foreach (var buildFile in new[] { "Invoke-NestedPwsh.ps1", "Test-NestedPwshLaunch.ps1" })
+            {
+                File.Copy(Path.Combine(repositoryBuildDirectory, buildFile), Path.Combine(buildDirectory.FullName, buildFile));
+            }
+
             File.WriteAllText(Path.Combine(root.FullName, "CHANGELOG.md"), changelog ?? FinalizedChangelog, Encoding.UTF8);
             File.WriteAllText(Path.Combine(root.FullName, "Directory.Build.props"), $"""
                 <Project>
