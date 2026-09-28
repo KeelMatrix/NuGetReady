@@ -173,14 +173,14 @@ public sealed class BoundedProcessTests
     {
         var grandchildScript = "Start-Sleep -Seconds 30";
         var encodedGrandchildScript = Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes(grandchildScript));
-        var childScript = $"[System.IO.File]::WriteAllText('{EscapePowerShellLiteral(pidFile)}', [string]$PID + ' '); $grandchild = Start-Process -FilePath 'pwsh.exe' -ArgumentList @('-NoProfile', '-EncodedCommand', '{encodedGrandchildScript}') -PassThru; [System.IO.File]::AppendAllText('{EscapePowerShellLiteral(pidFile)}', [string]$grandchild.Id + ' '); Start-Sleep -Seconds 30";
+        var childScript = $"[System.IO.File]::WriteAllText('{EscapePowerShellLiteral(pidFile)}', [string]$PID + ' '); $grandchild = Start-Process -WindowStyle Hidden -FilePath 'pwsh.exe' -ArgumentList @('-NoProfile', '-EncodedCommand', '{encodedGrandchildScript}') -PassThru; [System.IO.File]::AppendAllText('{EscapePowerShellLiteral(pidFile)}', [string]$grandchild.Id + ' '); Start-Sleep -Seconds 30";
         var encodedChildScript = Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes(childScript));
         var standardOutputFile = pidFile + ".stdout";
         var standardErrorFile = pidFile + ".stderr";
         var waitForDescendants = $"for ($i = 0; $i -lt 200 -and ((-not (Test-Path '{EscapePowerShellLiteral(pidFile)}')) -or ((Get-Content '{EscapePowerShellLiteral(pidFile)}' -Raw).Trim().Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries).Count -lt 2)); $i++) {{ Start-Sleep -Milliseconds 10 }}";
         var holdParent = keepParentAlive ? "; Start-Sleep -Seconds 30" : string.Empty;
         var processScript = redirectOutput
-            ? $"Start-Process -FilePath 'pwsh.exe' -ArgumentList @('-NoProfile', '-EncodedCommand', '{encodedChildScript}') -RedirectStandardOutput '{EscapePowerShellLiteral(standardOutputFile)}' -RedirectStandardError '{EscapePowerShellLiteral(standardErrorFile)}' -PassThru | Out-Null; {waitForDescendants}{holdParent}; exit 0"
+            ? $"Start-Process -WindowStyle Hidden -FilePath 'pwsh.exe' -ArgumentList @('-NoProfile', '-EncodedCommand', '{encodedChildScript}') -RedirectStandardOutput '{EscapePowerShellLiteral(standardOutputFile)}' -RedirectStandardError '{EscapePowerShellLiteral(standardErrorFile)}' -PassThru | Out-Null; {waitForDescendants}{holdParent}; exit 0"
             : $"$psi = [System.Diagnostics.ProcessStartInfo]::new(); $psi.FileName = 'pwsh.exe'; $psi.UseShellExecute = $false; $psi.ArgumentList.Add('-NoProfile'); $psi.ArgumentList.Add('-EncodedCommand'); $psi.ArgumentList.Add('{encodedChildScript}'); [System.Diagnostics.Process]::Start($psi) | Out-Null; {waitForDescendants}{holdParent}; exit 0";
         var encodedProcessScript = Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes(processScript));
         return ["-NoProfile", "-EncodedCommand", encodedProcessScript];
