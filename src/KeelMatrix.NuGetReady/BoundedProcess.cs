@@ -773,12 +773,65 @@ internal static class UnixProcessSupervisor
                     (!OperatingSystem.IsLinux() || ReapDescendants());
             }
 
+            if (OperatingSystem.IsMacOS() && MacProcessGroupHasNoLiveMembers(processGroupId))
+            {
+                return true;
+            }
+
             Thread.Sleep(10);
+        }
+
+        if (OperatingSystem.IsMacOS() && MacProcessGroupHasNoLiveMembers(processGroupId))
+        {
+            return true;
         }
 
         return kill(-processGroupId, 0) != 0 &&
             Marshal.GetLastWin32Error() == NoSuchProcessError &&
             (!OperatingSystem.IsLinux() || ReapDescendants());
+    }
+
+    private static bool MacProcessGroupHasNoLiveMembers(int processGroupId)
+    {
+        try
+        {
+            using var process = Process.Start(new ProcessStartInfo
+            {
+                FileName = "/bin/ps",
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                ArgumentList = { "-axo", "pid=,pgid=,state=" }
+            });
+            if (process is null)
+            {
+                return false;
+            }
+
+            var output = process.StandardOutput.ReadToEnd();
+            if (!process.WaitForExit(1000) || process.ExitCode != 0)
+            {
+                return false;
+            }
+
+            foreach (var line in output.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+            {
+                var fields = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                if (fields.Length >= 3 &&
+                    int.TryParse(fields[1], out var groupId) &&
+                    groupId == processGroupId &&
+                    !fields[2].StartsWith('Z'))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+        catch (Exception exception) when (exception is InvalidOperationException or System.ComponentModel.Win32Exception)
+        {
+            return false;
+        }
     }
 
     private static int DecodeExitStatus(int status)
