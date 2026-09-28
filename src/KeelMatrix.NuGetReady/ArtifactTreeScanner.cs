@@ -377,13 +377,27 @@ internal static class ArtifactTreeScanner
         var current = new DirectoryInfo(root);
         while (current is not null)
         {
-            if (IsReparsePoint(current.FullName))
+            if (IsReparsePoint(current.FullName) && !IsMacOsSystemPathAlias(current.FullName))
             {
                 throw new ArtifactTreeLimitExceededException("Artifact tree has a reparse-point ancestor; links and junctions are not followed.");
             }
 
             current = current.Parent;
         }
+    }
+
+    private static bool IsMacOsSystemPathAlias(string path)
+    {
+        if (!OperatingSystem.IsMacOS())
+        {
+            return false;
+        }
+
+        var normalized = path.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        // macOS exposes these fixed aliases for system temporary locations. They
+        // are outside the caller-controlled artifact tree and resolve only to
+        // their corresponding /private paths.
+        return normalized is "/var" or "/tmp";
     }
 
     private static bool IsReparsePoint(string path)
