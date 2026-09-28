@@ -641,8 +641,7 @@ internal static class UnixProcessSupervisor
             // The target has its own process group. Kill and verify that group before
             // claiming cleanup; on Linux also require the subreaper to have no adopted
             // child remaining, which keeps detached/reparented descendants unproven.
-            var descendantsClean = KillAndVerifyProcessGroup(child) &&
-                (!OperatingSystem.IsLinux() || ReapDescendants());
+            var descendantsClean = KillAndVerifyProcessGroup(child);
             if (!descendantsClean)
             {
                 return 125;
@@ -757,15 +756,25 @@ internal static class UnixProcessSupervisor
         var deadline = DateTime.UtcNow + TimeSpan.FromMilliseconds(250);
         while (DateTime.UtcNow < deadline)
         {
+            if (OperatingSystem.IsLinux())
+            {
+                while (waitpid(-1, out _, WaitNoHang) > 0)
+                {
+                }
+            }
+
             if (kill(-processGroupId, 0) != 0)
             {
-                return Marshal.GetLastWin32Error() == NoSuchProcessError;
+                return Marshal.GetLastWin32Error() == NoSuchProcessError &&
+                    (!OperatingSystem.IsLinux() || ReapDescendants());
             }
 
             Thread.Sleep(10);
         }
 
-        return kill(-processGroupId, 0) != 0 && Marshal.GetLastWin32Error() == NoSuchProcessError;
+        return kill(-processGroupId, 0) != 0 &&
+            Marshal.GetLastWin32Error() == NoSuchProcessError &&
+            (!OperatingSystem.IsLinux() || ReapDescendants());
     }
 
     private static int DecodeExitStatus(int status)
