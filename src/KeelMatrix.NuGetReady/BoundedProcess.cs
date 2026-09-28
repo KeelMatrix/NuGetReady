@@ -631,14 +631,18 @@ internal static class UnixProcessSupervisor
                 return 125;
             }
 
-            if (setpgid(child, child) != 0 && getpgid(child) != child)
+            var initialProcessGroupId = getpgid(child);
+            var setProcessGroupResult = setpgid(child, child);
+            var processGroupId = getpgid(child);
+            if (setProcessGroupResult != 0 && processGroupId != child)
             {
+                Console.Error.WriteLine($"Unix process-group setup failed: child={child}, initial={initialProcessGroupId}, actual={processGroupId}, set-result={setProcessGroupResult}, errno={Marshal.GetLastWin32Error()}, supervisor={getpgrp()}");
                 return 125;
             }
 
-            var processGroupId = getpgid(child);
             if (processGroupId <= 0 || processGroupId == getpgrp())
             {
+                Console.Error.WriteLine($"Unix process-group identity was not dedicated: child={child}, initial={initialProcessGroupId}, actual={processGroupId}, set-result={setProcessGroupResult}, errno={Marshal.GetLastWin32Error()}, supervisor={getpgrp()}");
                 return 125;
             }
 
