@@ -827,6 +827,7 @@ internal static class UnixProcessSupervisor
                     groupId == processGroupId &&
                     !fields[2].StartsWith('Z'))
                 {
+                    Console.Error.WriteLine($"macOS process-group cleanup still has a live member: group={processGroupId}, entry={line.Trim()}");
                     return false;
                 }
             }
@@ -835,6 +836,7 @@ internal static class UnixProcessSupervisor
         }
         catch (Exception exception) when (exception is InvalidOperationException or System.ComponentModel.Win32Exception)
         {
+            Console.Error.WriteLine($"macOS process-group cleanup inspection failed for group {processGroupId}: {exception.Message}");
             return false;
         }
     }
