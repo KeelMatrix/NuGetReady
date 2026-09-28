@@ -1,3 +1,5 @@
+using System.Diagnostics;
+
 namespace KeelMatrix.NuGetReady.Tests;
 
 public sealed class CliContractTests
@@ -27,6 +29,42 @@ public sealed class CliContractTests
         var exception = Assert.Throws<HelpRequestedException>(() => CliParser.Parse(new[] { "--help" }));
 
         Assert.Contains("nugetready check", CliParser.HelpText, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Built_cli_subprocess_exposes_the_same_help_contract()
+    {
+        var root = new DirectoryInfo(AppContext.BaseDirectory);
+        while (root is not null && !File.Exists(Path.Combine(root.FullName, "KeelMatrix.NuGetReady.sln")))
+        {
+            root = root.Parent;
+        }
+
+        Assert.NotNull(root);
+        var toolAssembly = Path.Combine(root!.FullName, "src", "KeelMatrix.NuGetReady", "bin", "Release", "net8.0", "KeelMatrix.NuGetReady.dll");
+        Assert.True(File.Exists(toolAssembly), $"Built CLI was not found at {toolAssembly}.");
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = "dotnet",
+            WorkingDirectory = root.FullName,
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
+        };
+        startInfo.ArgumentList.Add(toolAssembly);
+        startInfo.ArgumentList.Add("--help");
+        startInfo.Environment["KEELMATRIX_NO_TELEMETRY"] = "1";
+        startInfo.Environment["DOTNET_CLI_TELEMETRY_OPTOUT"] = "1";
+        using var process = Process.Start(startInfo)!;
+
+        var output = await process.StandardOutput.ReadToEndAsync();
+        var error = await process.StandardError.ReadToEndAsync();
+        await process.WaitForExitAsync();
+
+        Assert.Equal(0, process.ExitCode);
+        Assert.Empty(error);
+        Assert.Contains("snapshotted before inspection", output, StringComparison.Ordinal);
+        Assert.Contains("embedded NUL characters are rejected before process launch", output, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -81,6 +119,8 @@ public sealed class CliContractTests
         Assert.Contains("without a recognized credential binding stays outside", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("error/exit 2", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("warnings never create release confidence", CliParser.HelpText, StringComparison.Ordinal);
+        Assert.Contains("snapshotted before inspection", CliParser.HelpText, StringComparison.Ordinal);
+        Assert.Contains("embedded NUL characters are rejected before process launch", CliParser.HelpText, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -89,6 +129,31 @@ public sealed class CliContractTests
         var exception = Assert.Throws<CliInputException>(() => CliParser.Parse(new[] { "check", "--format", "json", "--config" }));
 
         Assert.Equal(OutputFormat.Json, exception.Format);
+    }
+
+    [Fact]
+    public void Human_readable_failures_escape_control_characters_in_artifact_context()
+    {
+        var failure = new Failure("artifact-set", "bad\nvalue\t\u0001") with
+        {
+            PackageId = "Example\nPackage",
+            PackageVersion = "1.0.0",
+            ArtifactFileName = "Example\r.nupkg",
+            ExpectationName = "Example"
+        };
+        var report = new ReadinessReport
+        {
+            Status = "fail",
+            ExitCode = 1,
+            Checks = [new CheckResult("artifact-set", [failure])],
+            Failures = [failure]
+        };
+
+        var text = ReportWriter.RenderText(report);
+
+        Assert.Contains("bad\\nvalue\\t\\u0001", text, StringComparison.Ordinal);
+        Assert.Contains("Example\\nPackage", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("bad\nvalue", text, StringComparison.Ordinal);
     }
 
     [Theory]

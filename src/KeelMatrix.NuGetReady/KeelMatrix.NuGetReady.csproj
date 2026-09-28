@@ -48,7 +48,12 @@
     </PropertyGroup>
   </Target>
 
-  <Target Name="RejectNuGetReadySensitivePackInputs" BeforeTargets="_LoadPackInputItems">
-    <Exec Command="pwsh -NoProfile -NonInteractive -File &quot;$(MSBuildProjectDirectory)\..\..\scripts\reject-sensitive-pack-inputs.ps1&quot; -ProjectDirectory &quot;$(MSBuildProjectDirectory)&quot;" />
+  <Target Name="RejectNuGetReadySensitivePackInputs" AfterTargets="_GetPackageFiles">
+    <WriteLinesToFile
+      File="$(IntermediateOutputPath)nugetready-pack-items.txt"
+      Lines="@(_PackageFiles->'%(FullPath)|%(PackagePath)')"
+      Overwrite="true"
+      Encoding="UTF-8" />
+    <Exec Command="pwsh -NoProfile -NonInteractive -File &quot;$(MSBuildProjectDirectory)\..\..\scripts\reject-sensitive-pack-inputs.ps1&quot; -ProjectDirectory &quot;$(MSBuildProjectDirectory)&quot; -PackItemsFile &quot;$(IntermediateOutputPath)nugetready-pack-items.txt&quot;" />
   </Target>
 </Project>

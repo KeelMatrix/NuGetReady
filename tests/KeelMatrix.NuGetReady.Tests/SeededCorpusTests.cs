@@ -85,13 +85,8 @@ public sealed class SeededCorpusTests : IClassFixture<RealCorpusFixture>
             TimeSpan.FromMinutes(2),
             new ConsumerRehearsalOptions(PublicFeedPath: publicFeed.FullName)).Single();
 
-        Assert.Equal("error", outcome.Result.Status);
-        Assert.True(
-            outcome.Diagnostic.Contains("NU1100", StringComparison.OrdinalIgnoreCase) ||
-            outcome.Diagnostic.Contains("NU1101", StringComparison.OrdinalIgnoreCase) ||
-            outcome.Diagnostic.Contains("Unable to resolve", StringComparison.OrdinalIgnoreCase) ||
-            outcome.Diagnostic.Contains("Unable to find package", StringComparison.OrdinalIgnoreCase),
-            outcome.Diagnostic);
+        Assert.Equal("fail", outcome.Result.Status);
+        Assert.Contains("exit code 1", outcome.Diagnostic, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]

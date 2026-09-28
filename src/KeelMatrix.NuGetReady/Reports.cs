@@ -1,6 +1,7 @@
 using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text;
 
 namespace KeelMatrix.NuGetReady;
 
@@ -91,10 +92,37 @@ internal static class ReportWriter
         if (failure.PackageId is null || failure.PackageVersion is null ||
             failure.ArtifactFileName is null || failure.ExpectationName is null)
         {
-            return failure.Message;
+            return EscapeText(failure.Message);
         }
 
-        return $"Package '{failure.PackageId}' version '{failure.PackageVersion}' " +
-               $"(artifact '{failure.ArtifactFileName}', expectation '{failure.ExpectationName}'): {failure.Message}";
+        return $"Package '{EscapeText(failure.PackageId)}' version '{EscapeText(failure.PackageVersion)}' " +
+               $"(artifact '{EscapeText(failure.ArtifactFileName)}', expectation '{EscapeText(failure.ExpectationName)}'): {EscapeText(failure.Message)}";
+    }
+
+    private static string EscapeText(string value)
+    {
+        var builder = new StringBuilder(value.Length);
+        foreach (var character in value)
+        {
+            switch (character)
+            {
+                case '\r': builder.Append("\\r"); break;
+                case '\n': builder.Append("\\n"); break;
+                case '\t': builder.Append("\\t"); break;
+                default:
+                    if (char.IsControl(character))
+                    {
+                        builder.Append("\\u").Append(((int)character).ToString("X4", System.Globalization.CultureInfo.InvariantCulture));
+                    }
+                    else
+                    {
+                        builder.Append(character);
+                    }
+
+                    break;
+            }
+        }
+
+        return builder.ToString();
     }
 }

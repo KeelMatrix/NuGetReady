@@ -72,14 +72,14 @@
       "source": "exactFileNames",
       "match": "prefix",
       "scope": "pathSegments",
-      "exemptExtensions": [ ".dll", ".exe", ".pdb", ".so", ".dylib", ".xml" ]
+      "exemptExtensions": []
     },
     {
       "source": "exactFileNames",
       "match": "contains",
       "scope": "pathSegments",
       "boundary": "none",
-      "exemptExtensions": [ ".dll", ".exe", ".pdb", ".so", ".dylib", ".xml" ]
+      "exemptExtensions": []
     },
     { "source": "fileNamePrefixes", "match": "prefix", "scope": "pathSegments" },
     { "source": "fileNameSuffixes", "match": "extension", "scope": "pathSegments" },
@@ -89,7 +89,7 @@
       "match": "contains",
       "scope": "pathSegments",
       "boundary": "endOrSeparator",
-      "exemptExtensions": [ ".dll", ".exe", ".pdb", ".so", ".dylib", ".xml" ]
+      "exemptExtensions": []
     },
     { "source": "pathSegments", "match": "prefix", "scope": "pathSegments" }
   ]

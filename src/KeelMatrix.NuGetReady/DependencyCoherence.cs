@@ -6,7 +6,8 @@ internal static class DependencyCoherence
 {
     public static IReadOnlyList<Failure> Inspect(
         NuGetReadyConfig config,
-        string artifactsPath)
+        ArtifactSnapshotSet snapshots,
+        IReadOnlyDictionary<string, List<string>> actualArtifacts)
     {
         var expectedVersions = config.Packages!
             .ToDictionary(package => package.Id!, package => VersionText.Normalize(package.Version!), StringComparer.OrdinalIgnoreCase);
@@ -20,8 +21,7 @@ internal static class DependencyCoherence
                 continue;
             }
 
-            var path = Path.Combine(artifactsPath, artifact);
-            if (!File.Exists(path))
+            if (!snapshots.TryGetByArtifactName(artifact, actualArtifacts, out var path))
             {
                 continue;
             }
@@ -29,6 +29,8 @@ internal static class DependencyCoherence
             try
             {
                 using var reader = new PackageArchiveReader(path);
+                var rawFiles = ArchiveInspectionLimits.GetFiles(reader);
+                ArchiveInspectionLimits.ValidateExpandedPayload(reader, rawFiles);
                 foreach (var dependency in reader.NuspecReader.GetDependencyGroups()
                              .SelectMany(group => group.Packages)
                              .OrderBy(dependency => dependency.Id, StringComparer.OrdinalIgnoreCase))

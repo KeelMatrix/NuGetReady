@@ -47,6 +47,7 @@ internal static class PackageSensitiveFilePolicy
     };
 
     private static readonly PackageSensitivePathManifest Manifest = LoadManifest();
+    private static readonly string[] BinaryAssemblyExtensions = { ".dll", ".exe", ".pdb", ".so", ".dylib" };
 
     public static bool IsSensitive(string path)
     {
@@ -58,7 +59,8 @@ internal static class PackageSensitiveFilePolicy
         }
 
         var segments = lower.Split('/', StringSplitOptions.RemoveEmptyEntries);
-        if (Manifest.PathSegments.Any(segment => segments.Contains(segment, StringComparer.OrdinalIgnoreCase)))
+        var directorySegments = segments.Length > 1 ? segments[..^1] : Array.Empty<string>();
+        if (Manifest.PathSegments.Any(segment => directorySegments.Contains(segment, StringComparer.OrdinalIgnoreCase)))
         {
             return true;
         }
@@ -71,7 +73,7 @@ internal static class PackageSensitiveFilePolicy
         foreach (var rule in Manifest.FamilyRules)
         {
             var values = GetFamilyValues(rule.Source);
-            foreach (var segment in segments)
+            foreach (var segment in directorySegments)
             {
                 if (Manifest.FamilyExceptions.Contains(segment, StringComparer.OrdinalIgnoreCase))
                 {
@@ -104,10 +106,31 @@ internal static class PackageSensitiveFilePolicy
         }
 
         var name = lower[(lower.LastIndexOf('/') + 1)..];
-        return Manifest.ExactFileNames.Contains(name, StringComparer.OrdinalIgnoreCase) ||
+        var nameWithoutLeadingDots = name.TrimStart('.');
+        return Manifest.ExactFileNames.Any(exact => IsExactNameFamily(name, exact) || IsExactNameFamily(nameWithoutLeadingDots, exact)) ||
                Manifest.FileNamePrefixes.Any(prefix => name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) ||
-               Manifest.FileNameSuffixes.Any(suffix => name.EndsWith(suffix, StringComparison.OrdinalIgnoreCase)) ||
-               Manifest.FileExtensions.Any(extension => name.EndsWith(extension, StringComparison.OrdinalIgnoreCase));
+               Manifest.FileNameSuffixes.Any(suffix => ContainsExtensionFamily(name, suffix)) ||
+               Manifest.FileExtensions.Any(extension => ContainsExtensionFamily(name, extension)) ||
+               Manifest.FileNameFragments.Any(fragment =>
+                   ContainsFamilyValue(name, fragment, "endOrSeparator") && !IsBinaryAssemblyLike(name));
+    }
+
+    private static bool IsExactNameFamily(string name, string exact)
+    {
+        if (!name.StartsWith(exact, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var remainder = name[exact.Length..];
+        return remainder.Length == 0 ||
+               remainder.StartsWith('.') ||
+               !IsBinaryAssemblyLike(name);
+    }
+
+    private static bool IsBinaryAssemblyLike(string name)
+    {
+        return BinaryAssemblyExtensions.Any(extension => name.EndsWith(extension, StringComparison.OrdinalIgnoreCase));
     }
 
     private static string[] GetFamilyValues(string source)

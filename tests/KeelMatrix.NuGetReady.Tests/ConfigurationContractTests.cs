@@ -133,6 +133,29 @@ public sealed class ConfigurationContractTests
         Assert.Contains("Package kind", exception.Message, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void Smoke_arguments_are_only_valid_for_tools_and_must_not_contain_nul()
+    {
+        using var fixture = PackageFixture.Create();
+        var libraryPath = WriteConfig(fixture, """
+            {
+              "schemaVersion": 1,
+              "packages": [{ "id": "Example", "kind": "library", "version": "1.0.0", "artifacts": ["Example.1.0.0.nupkg"], "smoke": ["--help"] }]
+            }
+            """);
+        var libraryException = Assert.Throws<NuGetReadyInputException>(() => ConfigurationLoader.Load(libraryPath));
+        Assert.Contains("Only dotnetTool", libraryException.Message, StringComparison.Ordinal);
+
+        var nulPath = WriteConfig(fixture, """
+            {
+              "schemaVersion": 1,
+              "packages": [{ "id": "Example", "kind": "dotnetTool", "version": "1.0.0", "artifacts": ["Example.1.0.0.nupkg"], "command": "example", "smoke": ["--value\u0000"] }]
+            }
+            """);
+        var nulException = Assert.Throws<NuGetReadyInputException>(() => ConfigurationLoader.Load(nulPath));
+        Assert.Contains("embedded NUL", nulException.Message, StringComparison.Ordinal);
+    }
+
     private static string WriteConfig(PackageFixture fixture, string json)
     {
         var path = Path.Combine(fixture.Root.FullName, "nugetready.json");

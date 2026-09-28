@@ -2,6 +2,8 @@
 
 NuGetReady is a .NET tool that checks the exact NuGet artifacts you built and rehearses isolated consumer restore, build, execution, or tool installation before publication.
 
+Before inspection, counted archives are copied into one bounded temporary snapshot. The snapshot is used for archive, dependency, feed, consumer, and provenance checks; the original files are rechecked for changes afterward. Generated consumers disable ambient `Directory.Build.*` imports.
+
 ## Install
 
 ```bash
@@ -33,6 +35,8 @@ Workflow-policy `pass` applies only to the documented closed-world release profi
 Runtime environment identity follows the certified Ubuntu target: inheritance and overrides preserve case-sensitive names, and the supported bindings are exactly `KEELMATRIX_NO_TELEMETRY`, `DOTNET_CLI_TELEMETRY_OPTOUT`, `NUGET_PACKAGES`, and the publish-step `NUGET_API_KEY` where applicable. Credential-name normalization is a separate heuristic and does not establish a process binding. The supported producer, acquisition, and validator commands use a strict PowerShell token model that preserves command position, quote delimiters, literal argument bytes, empty arguments, and operators; quoted command heads, path whitespace, grouping, punctuation, escaping, and other unmodeled forms are rejected rather than normalized. Workflow input is parsed before release relevance filtering, so malformed YAML, duplicate keys, invalid roots, and multiple documents produce `error`/exit `2` with a safe relative workflow location; `not-applicable` requires successfully inspected non-applicability.
 
 See the canonical [Supported Release Workflow Profile](https://github.com/KeelMatrix/NuGetReady/blob/main/README.md#supported-release-workflow-profile) for the complete specification and fail-closed result mapping.
+
+Only `dotnetTool` expectations may declare smoke arguments; arguments are bounded and embedded NUL characters are rejected before execution.
 
 ## Package-Execution Safety
 

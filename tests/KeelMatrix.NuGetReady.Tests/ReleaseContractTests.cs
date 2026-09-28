@@ -136,6 +136,46 @@ public sealed class ReleaseContractTests
     }
 
     [Fact]
+    public void Tag_mode_ignores_comments_indented_code_and_unequal_fence_closers()
+    {
+        using var repository = SyntheticReleaseRepository.Create("""
+            # Changelog
+
+            ## [Unreleased]
+
+            ### Added
+
+            - Initial package capabilities.
+
+            ## [0.1.0] - 2026-09-16
+
+            <!--
+            ### Fixed
+            - Comment-only fake release evidence.
+            -->
+
+            ### Added
+
+            - Initial package capabilities.
+
+                ### Fixed
+                - Indented code is not a release category.
+
+            ````markdown
+            ### Fixed
+            - The three-backtick line does not close a four-backtick fence.
+            ```
+            ### Fixed
+            - Still inside the unequal fence.
+            ````
+            """);
+
+        var result = repository.Validate(mode: "Tag", tagVersion: "0.1.0");
+
+        Assert.True(result.ExitCode == 0, result.StandardOutput + Environment.NewLine + result.StandardError);
+    }
+
+    [Fact]
     public void A_mismatched_install_command_is_rejected()
     {
         using var repository = SyntheticReleaseRepository.Create(readme: """

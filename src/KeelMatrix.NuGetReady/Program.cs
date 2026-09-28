@@ -14,13 +14,27 @@ public static class Program
             return WindowsProcessSupervisor.Run(windowsPayload);
         }
 
-        return NuGetReadyApplication.Run(args, new NuGetReadyTelemetry());
+        using var cancellation = new CancellationTokenSource();
+        ConsoleCancelEventHandler cancel = (_, eventArgs) =>
+        {
+            eventArgs.Cancel = true;
+            cancellation.Cancel();
+        };
+        Console.CancelKeyPress += cancel;
+        try
+        {
+            return NuGetReadyApplication.Run(args, new NuGetReadyTelemetry(), cancellation.Token);
+        }
+        finally
+        {
+            Console.CancelKeyPress -= cancel;
+        }
     }
 }
 
 internal static class NuGetReadyApplication
 {
-    internal static int Run(string[] args, IUsageTelemetry telemetry)
+    internal static int Run(string[] args, IUsageTelemetry telemetry, CancellationToken cancellationToken = default)
     {
         CliOptions? options = null;
         try
@@ -34,7 +48,8 @@ internal static class NuGetReadyApplication
                 options.ArtifactsPath,
                 repositoryPath,
                 options.Timeout,
-                configPath: configPath);
+                configPath: configPath,
+                cancellationToken: cancellationToken);
             ReportWriter.Write(report, options.Format);
             TelemetryCoordinator.RecordIfTrustworthy(report, telemetry);
             return report.ExitCode;
@@ -58,6 +73,11 @@ internal static class NuGetReadyApplication
         {
             WriteError(exception.Message, options?.Format ?? OutputFormat.Text);
             return 2;
+        }
+        catch (OperationCanceledException)
+        {
+            WriteError("NuGetReady was cancelled before the bounded checks completed.", options?.Format ?? OutputFormat.Text);
+            return 130;
         }
         catch (Exception)
         {

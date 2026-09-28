@@ -59,6 +59,10 @@ jobs:
         shell: pwsh
         run: dotnet pack src/KeelMatrix.NuGetReady/KeelMatrix.NuGetReady.csproj --configuration Release --no-build --no-restore --include-symbols -p:SymbolPackageFormat=snupkg -p:ImportDirectoryBuildTargets=false -p:ImportDirectoryTargets=false --output artifacts/release --nologo -p:UseSharedCompilation=false
 
+      - name: Inspect the exact release-built package bytes
+        shell: pwsh
+        run: pwsh -NoProfile -NonInteractive -File scripts/inspect-package.ps1 -PackagePath artifacts/release/KeelMatrix.NuGetReady.0.1.0.nupkg -SymbolsPackagePath artifacts/release/KeelMatrix.NuGetReady.0.1.0.snupkg
+
       - name: Upload only the exact release artifacts
         uses: actions/upload-artifact@v4
         with:

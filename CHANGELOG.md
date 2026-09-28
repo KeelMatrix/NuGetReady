@@ -24,3 +24,5 @@ The 0.1.0 release is planned and unreleased.
 - Applies an explicit consumer-framework and SDK/tooling matrix, reporting unsupported or unavailable rehearsal infrastructure as error/exit 2 and identifying build-only validation as non-execution evidence.
 - Bounds archive inspection to a fixed entry count and expanded-size budget, verifies package provenance with bounded streaming operations, and reports unproven process cleanup as error/exit 2.
 - Accepts customer-owned Trusted Publishing usernames in the supported workflow profile, with an optional explicit expected username for repositories that require one.
+- Snapshots counted package archives before inspection, uses one immutable snapshot for archive, dependency, feed, consumer, and provenance checks, and verifies the source files remain unchanged after the rehearsal.
+- Rejects tool smoke arguments outside `dotnetTool` expectations or containing embedded NUL characters, isolates generated consumers from ambient `Directory.Build.*` imports, escapes control characters in human-readable diagnostics, and inspects the exact release-built package bytes before release upload.

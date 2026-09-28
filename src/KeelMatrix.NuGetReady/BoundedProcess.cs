@@ -17,6 +17,7 @@ internal sealed record ProcessResult(
 
 internal static class BoundedProcess
 {
+    internal const string CleanupSignal = "\u001eNU_GETREADY_SUPERVISOR_CLEANUP_CONFIRMED\u001e";
     private const int DefaultOutputLimit = 16 * 1024;
     private static readonly TimeSpan TerminationGracePeriod = TimeSpan.FromMilliseconds(500);
     private static readonly TimeSpan StartupReadinessTimeout = TimeSpan.FromSeconds(5);
@@ -109,7 +110,8 @@ internal static class BoundedProcess
         {
             var cleanupConfirmed = false;
             var readiness = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-            var standardOutput = CaptureAsync(process.StandardOutput, outputLimit, lifecycleCancellation.Token, readiness);
+            var cleanupSignal = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var standardOutput = CaptureAsync(process.StandardOutput, outputLimit, lifecycleCancellation.Token, readiness, cleanupSignal);
             var standardError = CaptureAsync(process.StandardError, outputLimit, lifecycleCancellation.Token);
             var waitForExit = process.WaitForExitAsync(CancellationToken.None);
             var completeLifecycle = Task.WhenAll(waitForExit, standardOutput, standardError);
@@ -170,7 +172,7 @@ internal static class BoundedProcess
                 timedOut,
                 GetCompletedOutput(standardOutput),
                 GetCompletedOutput(standardError),
-                cleanupConfirmed);
+                cleanupSignal.Task.IsCompletedSuccessfully && cleanupSignal.Task.Result);
         }
         finally
         {
@@ -209,12 +211,16 @@ internal static class BoundedProcess
         StreamReader reader,
         int limit,
         CancellationToken cancellationToken,
-        TaskCompletionSource<bool>? readiness = null)
+        TaskCompletionSource<bool>? readiness = null,
+        TaskCompletionSource<bool>? cleanup = null)
     {
         var builder = new StringBuilder(Math.Min(limit, 4096));
         var buffer = new char[4096];
         var pending = string.Empty;
         var truncated = false;
+        var signalTailLength = Math.Max(
+            readiness is null ? 0 : UnixProcessSupervisor.ReadinessSignal.Length - 1,
+            cleanup is null ? 0 : CleanupSignal.Length - 1);
 
         try
         {
@@ -227,18 +233,37 @@ internal static class BoundedProcess
                 }
 
                 var content = pending + new string(buffer, 0, read);
-                var markerIndex = content.IndexOf(UnixProcessSupervisor.ReadinessSignal, StringComparison.Ordinal);
-                if (markerIndex >= 0)
+                pending = string.Empty;
+                while (true)
                 {
-                    AppendOutput(builder, content.AsSpan(0, markerIndex), limit, ref truncated);
-                    readiness?.TrySetResult(true);
-                    content = content[(markerIndex + UnixProcessSupervisor.ReadinessSignal.Length)..];
-                    pending = string.Empty;
+                    var readinessIndex = readiness is null
+                        ? -1
+                        : content.IndexOf(UnixProcessSupervisor.ReadinessSignal, StringComparison.Ordinal);
+                    var cleanupIndex = cleanup is null
+                        ? -1
+                        : content.IndexOf(CleanupSignal, StringComparison.Ordinal);
+                    if (readinessIndex < 0 && cleanupIndex < 0)
+                    {
+                        break;
+                    }
+
+                    if (readinessIndex >= 0 && (cleanupIndex < 0 || readinessIndex < cleanupIndex))
+                    {
+                        AppendOutput(builder, content.AsSpan(0, readinessIndex), limit, ref truncated);
+                        readiness!.TrySetResult(true);
+                        content = content[(readinessIndex + UnixProcessSupervisor.ReadinessSignal.Length)..];
+                    }
+                    else
+                    {
+                        AppendOutput(builder, content.AsSpan(0, cleanupIndex), limit, ref truncated);
+                        cleanup!.TrySetResult(true);
+                        content = content[(cleanupIndex + CleanupSignal.Length)..];
+                    }
                 }
 
-                if (readiness is not null && !readiness.Task.IsCompleted)
+                if (signalTailLength > 0)
                 {
-                    var keep = Math.Min(content.Length, UnixProcessSupervisor.ReadinessSignal.Length - 1);
+                    var keep = Math.Min(content.Length, signalTailLength);
                     if (content.Length > keep)
                     {
                         AppendOutput(builder, content.AsSpan(0, content.Length - keep), limit, ref truncated);
@@ -266,6 +291,7 @@ internal static class BoundedProcess
             }
 
             readiness?.TrySetResult(false);
+            cleanup?.TrySetResult(false);
         }
 
         if (truncated)
@@ -600,10 +626,44 @@ internal static class UnixProcessSupervisor
                 return 125;
             }
 
+            // Keep a subreaper parent alive for the complete child lifetime. This makes
+            // reparented descendants observable instead of treating the original group
+            // disappearing as proof that the whole process tree is gone.
+            if (prctl(PrSetChildSubreaper, 1, 0, 0, 0) != 0)
+            {
+                return 125;
+            }
+
+            var child = fork();
+            if (child < 0)
+            {
+                return 125;
+            }
+
+            if (child == 0)
+            {
+                _ = execvp(filePointer, argumentVector);
+                _exit(127);
+                return 127;
+            }
+
             SignalReady();
-            _ = execvp(filePointer, argumentVector);
-            _exit(127);
-            return 127;
+            var status = 0;
+            if (waitpid(child, out status, 0) < 0)
+            {
+                return 125;
+            }
+
+            // Reap any descendants adopted by this supervisor. A child that remains
+            // after the target exits is not a confirmed-clean process tree.
+            var descendantsClean = ReapDescendants();
+            if (!descendantsClean)
+            {
+                return 125;
+            }
+
+            SignalCleanupConfirmed();
+            return DecodeExitStatus(status);
         }
         finally
         {
@@ -633,6 +693,51 @@ internal static class UnixProcessSupervisor
         var signal = Encoding.UTF8.GetBytes(ReadinessSignal);
         _ = write(1, signal, (nuint)signal.Length);
     }
+
+    private static void SignalCleanupConfirmed()
+    {
+        var signal = Encoding.UTF8.GetBytes(BoundedProcess.CleanupSignal);
+        _ = write(1, signal, (nuint)signal.Length);
+    }
+
+    private static bool ReapDescendants()
+    {
+        var deadline = DateTime.UtcNow + TimeSpan.FromMilliseconds(250);
+        while (DateTime.UtcNow < deadline)
+        {
+            var child = waitpid(-1, out _, WaitNoHang);
+            if (child < 0)
+            {
+                return Marshal.GetLastWin32Error() == NoChildrenError;
+            }
+
+            if (child == 0)
+            {
+                Thread.Sleep(10);
+                continue;
+            }
+        }
+
+        return waitpid(-1, out _, WaitNoHang) < 0 && Marshal.GetLastWin32Error() == NoChildrenError;
+    }
+
+    private static int DecodeExitStatus(int status)
+    {
+        return (status & 0x7f) == 0 ? (status >> 8) & 0xff : 128 + (status & 0x7f);
+    }
+
+    private const int PrSetChildSubreaper = 36;
+    private const int WaitNoHang = 1;
+    private const int NoChildrenError = 10;
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int prctl(int option, int arg2, int arg3, int arg4, int arg5);
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int fork();
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int waitpid(int processId, out int status, int options);
 
     [DllImport("libc", SetLastError = true)]
     private static extern nint write(int fileDescriptor, byte[] buffer, nuint count);
@@ -722,6 +827,7 @@ internal static class WindowsProcessSupervisor
             return 125;
         }
 
+        WriteCleanupSignal();
         return exitCode;
     }
 
@@ -760,6 +866,16 @@ internal static class WindowsProcessSupervisor
             new SafeFileHandle(GetStdHandle(StdOutputHandle), ownsHandle: false),
             FileAccess.Write);
         var bytes = Encoding.UTF8.GetBytes(UnixProcessSupervisor.ReadinessSignal);
+        output.Write(bytes, 0, bytes.Length);
+        output.Flush();
+    }
+
+    private static void WriteCleanupSignal()
+    {
+        using var output = new FileStream(
+            new SafeFileHandle(GetStdHandle(StdOutputHandle), ownsHandle: false),
+            FileAccess.Write);
+        var bytes = Encoding.UTF8.GetBytes(BoundedProcess.CleanupSignal);
         output.Write(bytes, 0, bytes.Length);
         output.Flush();
     }

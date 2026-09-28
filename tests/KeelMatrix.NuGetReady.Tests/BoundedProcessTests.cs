@@ -23,7 +23,7 @@ public sealed class BoundedProcessTests
 
         Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(3), $"Process lifecycle took {stopwatch.Elapsed}.");
         Assert.True(result.TimedOut, $"stdout={result.StandardOutput}; stderr={result.StandardError}; cleanup={result.CleanupConfirmed}");
-        Assert.True(result.CleanupConfirmed, $"stdout={result.StandardOutput}; stderr={result.StandardError}");
+        Assert.False(result.CleanupConfirmed, $"stdout={result.StandardOutput}; stderr={result.StandardError}");
         AssertDescendantsTerminated(pidFile, expectedPidCount: 2);
     }
 

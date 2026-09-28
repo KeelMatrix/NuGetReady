@@ -620,7 +620,7 @@ internal static class WorkflowPolicyInspector
 
         if (!HasExactProducerSequence(repositoryPath, producerJob.Steps, expectedArtifacts))
         {
-            failures.Add(Unsupported("The artifact-producer job must use the exact ordered closed command profile and every referenced repository path must exist with exact cross-platform casing: checkout, SDK setup, restore, format, build, test, optional Tag-mode release-contract validation, pack, and immediate exact artifact upload."));
+            failures.Add(Unsupported("The artifact-producer job must use the exact ordered closed command profile and every referenced repository path must exist with exact cross-platform casing: checkout, SDK setup, restore, format, build, test, optional Tag-mode release-contract validation, pack, exact package inspection, and immediate exact artifact upload."));
         }
     }
 
@@ -904,7 +904,7 @@ internal static class WorkflowPolicyInspector
         IReadOnlyList<WorkflowStep> steps,
         IReadOnlyList<string> expectedArtifacts)
     {
-        if (steps.Count is not (8 or 9) ||
+        if (steps.Count is not (9 or 10) ||
             !IsExactCheckoutStep(steps[0]) ||
             !IsExactProducerSetupDotNetStep(steps[1]) ||
             !TryMatchRestoreStep(repositoryPath, steps[2], out var solutionPath) ||
@@ -916,18 +916,14 @@ internal static class WorkflowPolicyInspector
         }
 
         var packIndex = 6;
-        if (steps.Count == 9)
+        if ((steps.Count is 9 or 10) && IsExactTagReleaseContractStep(steps[6]))
         {
-            if (!IsExactTagReleaseContractStep(steps[6]))
-            {
-                return false;
-            }
-
             packIndex++;
         }
 
         return IsExactPackStep(repositoryPath, steps[packIndex]) &&
-               IsExactUploadStep(steps[packIndex + 1], expectedArtifacts);
+               IsExactPackageInspectionStep(repositoryPath, steps[packIndex + 1], expectedArtifacts) &&
+               IsExactUploadStep(steps[packIndex + 2], expectedArtifacts);
     }
 
     private static bool HasExactValidationSequence(
@@ -952,6 +948,33 @@ internal static class WorkflowPolicyInspector
               IsExactToolInstallStep(steps[3], useCandidateToolArtifactSource: false) &&
               IsExactCheckoutStep(steps[4]) &&
               IsExactProfileValidationStep(steps[5]);
+    }
+
+    private static bool IsExactPackageInspectionStep(
+        string repositoryPath,
+        WorkflowStep step,
+        IReadOnlyList<string>? expectedArtifacts)
+    {
+        if (!TryGetExactCommandTokens(step, out var tokens) ||
+            tokens.Length != 9 ||
+            tokens.Any(token => token.IsQuoted) ||
+            !tokens[0].Value.Equals("pwsh", StringComparison.Ordinal) ||
+            !tokens[1].Value.Equals("-NoProfile", StringComparison.Ordinal) ||
+            !tokens[2].Value.Equals("-NonInteractive", StringComparison.Ordinal) ||
+            !tokens[3].Value.Equals("-File", StringComparison.Ordinal) ||
+            !IsLiteralRepositoryPath(tokens[4].Value, "ps1") ||
+            GetExactRepositoryPath(repositoryPath, tokens[4].Value, expectDirectory: false, out _) != RepositoryPathStatus.Exact ||
+            !tokens[5].Value.Equals("-PackagePath", StringComparison.Ordinal) ||
+            !tokens[7].Value.Equals("-SymbolsPackagePath", StringComparison.Ordinal) ||
+            !IsLiteralRepositoryPath(tokens[6].Value, "nupkg") ||
+            !IsLiteralRepositoryPath(tokens[8].Value, "snupkg"))
+        {
+            return false;
+        }
+
+        return expectedArtifacts is null ||
+               (tokens[6].Value.Equals($"artifacts/release/{expectedArtifacts[0]}", StringComparison.Ordinal) &&
+                tokens[8].Value.Equals($"artifacts/release/{expectedArtifacts[1]}", StringComparison.Ordinal));
     }
 
     private static bool IsExactCheckoutStep(WorkflowStep step)
@@ -1614,7 +1637,8 @@ internal static class WorkflowPolicyInspector
             IsExactCandidateToolSourceConfigurationStep(step) ||
             IsExactValidationAcquisitionResolverStep(step) ||
             IsExactToolInstallStep(step, useCandidateToolArtifactSource: true) ||
-            IsExactToolInstallStep(step, useCandidateToolArtifactSource: false))
+            IsExactToolInstallStep(step, useCandidateToolArtifactSource: false) ||
+            IsExactPackageInspectionStep(repositoryPath, step, expectedArtifacts: null))
         {
             return IndirectPublicationPath.ProvenNonPublishing;
         }
@@ -2677,11 +2701,14 @@ internal static class WorkflowPolicyInspector
                 Flush();
             }
             else if ((character == '&' && index + 1 < content.Length && content[index + 1] == '&') ||
-                     (character == '|' && index + 1 < content.Length && content[index + 1] == '|') ||
-                     character == '|')
+                     (character == '|' && index + 1 < content.Length && content[index + 1] == '|'))
             {
                 Flush();
                 index++;
+            }
+            else if (character == '|')
+            {
+                Flush();
             }
             else
             {
@@ -3278,7 +3305,12 @@ internal static class WorkflowPolicyInspector
 
     private static bool IsOutputOnlyCommand(string line)
     {
-        return Regex.IsMatch(line, @"^(?:echo|printf|write-output|write-host)\b", RegexOptions.IgnoreCase);
+        return Regex.IsMatch(line, @"^(?:echo|printf|write-output|write-host)\b", RegexOptions.IgnoreCase) &&
+               !line.Contains("$((", StringComparison.Ordinal) &&
+               !line.Contains("$(", StringComparison.Ordinal) &&
+               !line.Contains('`') &&
+               !line.Contains("<(", StringComparison.Ordinal) &&
+               !line.Contains("@(", StringComparison.Ordinal);
     }
 
     private static bool HasTelemetrySuppression(WorkflowDocument workflow, WorkflowJob job)
@@ -3575,6 +3607,16 @@ internal static class WorkflowPolicyInspector
 
         private static bool HasDuplicateMappingKeys(YamlNode node)
         {
+            return HasDuplicateMappingKeys(node, new HashSet<YamlNode>(ReferenceEqualityComparer.Instance), depth: 0);
+        }
+
+        private static bool HasDuplicateMappingKeys(YamlNode node, HashSet<YamlNode> visited, int depth)
+        {
+            if (depth > 128 || !visited.Add(node))
+            {
+                return true;
+            }
+
             if (node is YamlMappingNode mapping)
             {
                 var keys = new HashSet<string>(StringComparer.Ordinal);
@@ -3585,7 +3627,8 @@ internal static class WorkflowPolicyInspector
                         return true;
                     }
 
-                    if (HasDuplicateMappingKeys(pair.Key) || HasDuplicateMappingKeys(pair.Value))
+                    if (HasDuplicateMappingKeys(pair.Key, visited, depth + 1) ||
+                        HasDuplicateMappingKeys(pair.Value, visited, depth + 1))
                     {
                         return true;
                     }
@@ -3596,7 +3639,7 @@ internal static class WorkflowPolicyInspector
 
             if (node is YamlSequenceNode sequence)
             {
-                return sequence.Children.Any(HasDuplicateMappingKeys);
+                return sequence.Children.Any(child => HasDuplicateMappingKeys(child, visited, depth + 1));
             }
 
             return false;
@@ -3616,8 +3659,7 @@ internal static class WorkflowPolicyInspector
                 }
 
                 root = mapping;
-                unsupported = mapping.AllNodes.Any(node => !node.Anchor.IsEmpty || !node.Tag.IsEmpty) ||
-                    mapping.AllNodes.OfType<YamlScalarNode>().Any(node => node.Value == "<<");
+                unsupported = ContainsUnsupportedYamlShape(mapping, new HashSet<YamlNode>(ReferenceEqualityComparer.Instance), depth: 0);
                 return true;
             }
             catch (YamlException)
@@ -3632,6 +3674,33 @@ internal static class WorkflowPolicyInspector
             {
                 return false;
             }
+        }
+
+        private static bool ContainsUnsupportedYamlShape(YamlNode node, HashSet<YamlNode> visited, int depth)
+        {
+            if (depth > 128 || !visited.Add(node))
+            {
+                return true;
+            }
+
+            if (!node.Anchor.IsEmpty || !node.Tag.IsEmpty || node is YamlScalarNode { Value: "<<" })
+            {
+                return true;
+            }
+
+            if (node is YamlMappingNode mapping)
+            {
+                return mapping.Children.Any(pair =>
+                    ContainsUnsupportedYamlShape(pair.Key, visited, depth + 1) ||
+                    ContainsUnsupportedYamlShape(pair.Value, visited, depth + 1));
+            }
+
+            if (node is YamlSequenceNode sequence)
+            {
+                return sequence.Children.Any(child => ContainsUnsupportedYamlShape(child, visited, depth + 1));
+            }
+
+            return false;
         }
 
         private static void ParseTriggers(YamlNode node, WorkflowDocument workflow)
@@ -3897,12 +3966,14 @@ internal static class WorkflowPolicyInspector
                                 property.Value,
                                 workflow,
                                 EvaluatedScalarField.JobContainer);
+                            job.HasSecretBinding |= ContainsCredentialReference(property.Value);
                             break;
                         case "services":
                             TrackEvaluatedScalarLeaves(
                                 property.Value,
                                 workflow,
                                 EvaluatedScalarField.JobServices);
+                            job.HasSecretBinding |= ContainsCredentialReference(property.Value);
                             break;
                         case "uses":
                             job.Uses = ReadRequiredScalar(property.Value, workflow, job);
@@ -4288,6 +4359,26 @@ internal static class WorkflowPolicyInspector
             {
                 TrackEvaluatedScalarLeaves(entry, workflow, field);
             }
+        }
+
+        private static bool ContainsCredentialReference(YamlNode node)
+        {
+            if (TryScalar(node, out var scalar))
+            {
+                return AnalyzeExpressionReferences(scalar).HasCredentialReference;
+            }
+
+            if (node is YamlMappingNode mapping)
+            {
+                return mapping.Children.Any(pair => ContainsCredentialReference(pair.Key) || ContainsCredentialReference(pair.Value));
+            }
+
+            if (node is YamlSequenceNode sequence)
+            {
+                return sequence.Children.Any(ContainsCredentialReference);
+            }
+
+            return true;
         }
 
         private static void TrackEvaluatedScalar(

@@ -199,9 +199,14 @@ internal static partial class ConfigurationLoader
                     $"Artifact filenames for package '{package.Id}' must bind exactly to configured version '{normalizedVersion}'.");
             }
 
-            if (package.Smoke is not null && (package.Smoke.Count > 20 || package.Smoke.Any(argument => argument is null || argument.Length > 200)))
+            if (package.Smoke is not null && !package.Kind.Equals("dotnetTool", StringComparison.OrdinalIgnoreCase))
             {
-                throw new NuGetReadyInputException("Tool smoke arguments are too large.");
+                throw new NuGetReadyInputException("Only dotnetTool packages may declare smoke arguments.");
+            }
+
+            if (package.Smoke is not null && (package.Smoke.Count > 20 || package.Smoke.Any(argument => argument is null || argument.Length > 200 || argument.Contains('\0'))))
+            {
+                throw new NuGetReadyInputException("Tool smoke arguments are too large or contain an embedded NUL character.");
             }
 
             if (package.Command is not null && (package.Command.Length is 0 or > 100 || package.Command.Any(char.IsWhiteSpace)))

@@ -1,6 +1,8 @@
 using System.Reflection;
+using System.Globalization;
 using System.Reflection.Metadata;
 using System.Reflection.PortableExecutable;
+using System.Text;
 using System.Xml.Linq;
 using NuGet.Frameworks;
 using NuGet.Packaging;
@@ -35,7 +37,29 @@ internal static class ConsumerRehearsal
         NuGetReadyConfig config,
         string artifactsPath,
         TimeSpan timeout,
-        ConsumerRehearsalOptions? options = null)
+        ConsumerRehearsalOptions? options = null,
+        CancellationToken cancellationToken = default)
+    {
+        var actualArtifacts = Directory.Exists(artifactsPath)
+            ? Directory.EnumerateFiles(artifactsPath, "*", SearchOption.AllDirectories)
+                .Where(path => path.EndsWith(".nupkg", StringComparison.OrdinalIgnoreCase) || path.EndsWith(".snupkg", StringComparison.OrdinalIgnoreCase))
+                .GroupBy(path => Path.GetFileName(path), StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(
+                    group => group.Key,
+                    group => group.Select(path => Path.GetRelativePath(artifactsPath, path).Replace(Path.DirectorySeparatorChar, '/')).ToList(),
+                    StringComparer.OrdinalIgnoreCase)
+            : new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        using var snapshots = ArtifactSnapshotSet.Create(artifactsPath, actualArtifacts);
+        return RunDetailed(config, snapshots, actualArtifacts, timeout, options, cancellationToken);
+    }
+
+    internal static IReadOnlyList<RehearsalOutcome> RunDetailed(
+        NuGetReadyConfig config,
+        ArtifactSnapshotSet snapshots,
+        IReadOnlyDictionary<string, List<string>> actualArtifacts,
+        TimeSpan timeout,
+        ConsumerRehearsalOptions? options = null,
+        CancellationToken cancellationToken = default)
     {
         options ??= new ConsumerRehearsalOptions();
         var root = Directory.CreateTempSubdirectory("nugetready-consumer-");
@@ -52,6 +76,7 @@ internal static class ConsumerRehearsal
 
             foreach (var package in config.Packages!)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 var packageArtifact = PackageArtifacts.Primary(package);
                 if (packageArtifact is null)
                 {
@@ -59,8 +84,7 @@ internal static class ConsumerRehearsal
                     continue;
                 }
 
-                var sourcePath = Path.Combine(artifactsPath, packageArtifact);
-                if (!File.Exists(sourcePath))
+                if (!snapshots.TryGetByArtifactName(packageArtifact, actualArtifacts, out var sourcePath))
                 {
                     results.Add(Failure(package, "The package artifact was not found for consumer rehearsal.", isError: true));
                     continue;
@@ -83,6 +107,11 @@ internal static class ConsumerRehearsal
                 ["RestoreAdditionalProjectSources"] = null,
                 ["RestoreSources"] = null,
                 ["NUGET_HTTP_CACHE_PATH"] = Path.Combine(root.FullName, "http-cache"),
+                ["DirectoryBuildPropsPath"] = null,
+                ["DirectoryBuildTargetsPath"] = null,
+                ["ImportDirectoryBuildProps"] = "false",
+                ["ImportDirectoryBuildTargets"] = "false",
+                ["ImportDirectoryTargets"] = "false",
                 ["DOTNET_CLI_HOME"] = cliHome,
                 ["DOTNET_NOLOGO"] = "1",
                 // Restore must extract the complete package payload, even when
@@ -120,8 +149,8 @@ internal static class ConsumerRehearsal
                 }
 
                 var packageResult = package.Kind!.Equals("dotnetTool", StringComparison.OrdinalIgnoreCase)
-                    ? RunToolAsync(package, packagePath, packageRoot, configPath, environment, timeout, options).GetAwaiter().GetResult()
-                    : RunLibraryAsync(package, packagePath, packageRoot, configPath, environment, timeout, options).GetAwaiter().GetResult();
+                    ? RunToolAsync(package, packagePath, packageRoot, configPath, environment, timeout, options, cancellationToken).GetAwaiter().GetResult()
+                    : RunLibraryAsync(package, packagePath, packageRoot, configPath, environment, timeout, options, cancellationToken).GetAwaiter().GetResult();
                 results.Add(packageResult);
             }
 
@@ -149,7 +178,8 @@ internal static class ConsumerRehearsal
         string configPath,
         IReadOnlyDictionary<string, string?> environment,
         TimeSpan timeout,
-        ConsumerRehearsalOptions options)
+        ConsumerRehearsalOptions options,
+        CancellationToken cancellationToken)
     {
         IReadOnlyList<LibraryTarget> targets;
         try
@@ -185,7 +215,8 @@ internal static class ConsumerRehearsal
                 configPath,
                 environment,
                 timeout,
-                options).ConfigureAwait(false);
+                options,
+                cancellationToken).ConfigureAwait(false);
             if (!outcome.Passed)
             {
                 var message = $"The isolated library consumer did not complete for target framework '{target.Framework}'.";
@@ -212,7 +243,8 @@ internal static class ConsumerRehearsal
         string configPath,
         IReadOnlyDictionary<string, string?> environment,
         TimeSpan timeout,
-        ConsumerRehearsalOptions options)
+        ConsumerRehearsalOptions options,
+        CancellationToken cancellationToken)
     {
         var projectPath = Path.Combine(packageRoot, "Consumer.csproj");
         var sourcePath = Path.Combine(packageRoot, "Program.cs");
@@ -253,6 +285,9 @@ internal static class ConsumerRehearsal
                 <TargetFramework>{EscapeXml(target.Framework)}</TargetFramework>
                 <ImplicitUsings>disable</ImplicitUsings>
                 <UseAppHost>false</UseAppHost>
+                <ImportDirectoryBuildProps>false</ImportDirectoryBuildProps>
+                <ImportDirectoryBuildTargets>false</ImportDirectoryBuildTargets>
+                <ImportDirectoryTargets>false</ImportDirectoryTargets>
                 <RestoreNoCache>true</RestoreNoCache>
                 <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
               </PropertyGroup>
@@ -260,15 +295,16 @@ internal static class ConsumerRehearsal
                 <PackageReference Include="{EscapeXml(package.Id!)}" Version="{EscapeXml(VersionText.Normalize(package.Version!))}" />
               </ItemGroup>
             </Project>
-            """).ConfigureAwait(false);
-        await File.WriteAllTextAsync(sourcePath, source).ConfigureAwait(false);
+            """, cancellationToken).ConfigureAwait(false);
+        await File.WriteAllTextAsync(sourcePath, source, cancellationToken).ConfigureAwait(false);
 
         var restore = await RunDotnetAsync(
             ["restore", projectPath, "--configfile", configPath, "--no-cache", "--force-evaluate", "--nologo"],
             packageRoot,
-            environment,
-            timeout,
-            options.ProcessRunner).ConfigureAwait(false);
+                environment,
+                timeout,
+                options.ProcessRunner,
+                cancellationToken).ConfigureAwait(false);
         var restoreOutcome = ClassifyProcessResult(restore, ProcessPhase.Restore);
         if (!restoreOutcome.Passed)
         {
@@ -286,7 +322,8 @@ internal static class ConsumerRehearsal
             packageRoot,
             environment,
             timeout,
-            options.ProcessRunner).ConfigureAwait(false);
+            options.ProcessRunner,
+            cancellationToken).ConfigureAwait(false);
         var buildOutcome = ClassifyProcessResult(build, ProcessPhase.Build);
         if (!buildOutcome.Passed)
         {
@@ -312,7 +349,8 @@ internal static class ConsumerRehearsal
             packageRoot,
             environment,
             timeout,
-            options.ProcessRunner).ConfigureAwait(false);
+            options.ProcessRunner,
+            cancellationToken).ConfigureAwait(false);
         return ClassifyProcessResult(run, ProcessPhase.Run);
     }
 
@@ -323,7 +361,8 @@ internal static class ConsumerRehearsal
         string configPath,
         IReadOnlyDictionary<string, string?> environment,
         TimeSpan timeout,
-        ConsumerRehearsalOptions options)
+        ConsumerRehearsalOptions options,
+        CancellationToken cancellationToken)
     {
         var toolPath = Directory.CreateDirectory(Path.Combine(packageRoot, "tool")).FullName;
         var install = await RunDotnetAsync(
@@ -331,7 +370,8 @@ internal static class ConsumerRehearsal
             packageRoot,
             environment,
             timeout,
-            options.ProcessRunner).ConfigureAwait(false);
+            options.ProcessRunner,
+            cancellationToken).ConfigureAwait(false);
         var installOutcome = ClassifyProcessResult(install, ProcessPhase.ToolInstall);
         if (!installOutcome.Passed)
         {
@@ -357,7 +397,7 @@ internal static class ConsumerRehearsal
         }
 
         var smoke = package.Smoke?.ToArray() ?? Array.Empty<string>();
-        var run = await BoundedProcess.RunAsync(executable, smoke, packageRoot, environment, timeout).ConfigureAwait(false);
+        var run = await BoundedProcess.RunAsync(executable, smoke, packageRoot, environment, timeout, cancellationToken: cancellationToken).ConfigureAwait(false);
         var runOutcome = ClassifyProcessResult(run, ProcessPhase.ToolSmoke);
         return runOutcome.Passed
             ? Success(package, "Isolated tool installed and safe smoke command succeeded.", runOutcome.Diagnostic)
@@ -369,10 +409,11 @@ internal static class ConsumerRehearsal
         string workingDirectory,
         IReadOnlyDictionary<string, string?> environment,
         TimeSpan timeout,
-        ConsumerProcessRunner? processRunner)
+        ConsumerProcessRunner? processRunner,
+        CancellationToken cancellationToken)
     {
         return processRunner is null
-            ? await BoundedProcess.RunAsync("dotnet", arguments, workingDirectory, environment, timeout).ConfigureAwait(false)
+            ? await BoundedProcess.RunAsync("dotnet", arguments, workingDirectory, environment, timeout, cancellationToken: cancellationToken).ConfigureAwait(false)
             : await processRunner("dotnet", arguments, workingDirectory, environment, timeout).ConfigureAwait(false);
     }
 
@@ -380,23 +421,6 @@ internal static class ConsumerRehearsal
     {
         return result.Started && !result.TimedOut && result.ExitCode == 0;
     }
-
-    private static bool HasUnusableAssetDiagnostic(ProcessResult result)
-    {
-        var output = string.Join("\n", result.StandardOutput, result.StandardError);
-        return UnusableAssetMarkers.Any(marker => output.Contains(marker, StringComparison.OrdinalIgnoreCase));
-    }
-
-    private static readonly string[] UnusableAssetMarkers =
-    {
-        "MSB3246",
-        "bad image",
-        "bad-image",
-        "image is too small",
-        "could not load file or assembly",
-        "is not a valid win32 application",
-        "metadata is invalid"
-    };
 
     internal enum ProcessPhase
     {
@@ -407,95 +431,29 @@ internal static class ConsumerRehearsal
         ToolSmoke
     }
 
-    private static readonly string[] InfrastructureMarkers =
-    {
-        "NU1100",
-        "NU1101",
-        "NU1301",
-        "NU1302",
-        "NU1303",
-        "NU1900",
-        "unable to load the service index",
-        "no packages exist with this id",
-        "failed to download",
-        "connection refused",
-        "connection reset",
-        "could not resolve host",
-        "the remote name could not be resolved",
-        "network is unreachable",
-        "no .net sdks were found",
-        "a compatible installed .net sdk",
-        "it was not possible to find any compatible framework version",
-        "the framework 'microsoft.",
-        "netsdk",
-        "msb4236",
-        "workload",
-        "permission denied",
-        "access to the path",
-        "disk full",
-        "not enough space"
-    };
-
     internal static TargetRehearsalOutcome ClassifyProcessResult(ProcessResult result, ProcessPhase phase)
     {
-        var diagnostic = Combine(result);
-        if (result.Started && !result.CleanupConfirmed)
+        if (!result.Started)
+        {
+            return new TargetRehearsalOutcome(false, true, "The child process could not be started.");
+        }
+
+        if (!result.CleanupConfirmed)
         {
             return new TargetRehearsalOutcome(false, true, "The child process lifecycle completed without confirmed process-tree cleanup; the rehearsal result is unproven.");
         }
 
-        if (result.TimedOut && !result.CleanupConfirmed)
+        if (result.TimedOut)
         {
-            return new TargetRehearsalOutcome(false, true, "The bounded child process timed out and its process-group cleanup could not be confirmed.");
+            return new TargetRehearsalOutcome(false, true, $"The bounded {phase.ToString().ToLowerInvariant()} child process timed out.");
         }
 
-        if (result.Started && !result.TimedOut && result.ExitCode == 0 && !result.CleanupConfirmed)
-        {
-            return new TargetRehearsalOutcome(false, true, "The bounded child process completed successfully, but its process-group cleanup could not be confirmed.");
-        }
-
-        if (Succeeded(result) && !HasUnusableAssetDiagnostic(result))
+        if (Succeeded(result))
         {
             return new TargetRehearsalOutcome(true, false, string.Empty);
         }
 
-        var isInfrastructure = IsInfrastructure(result);
-        return new TargetRehearsalOutcome(
-            false,
-            isInfrastructure,
-            isInfrastructure
-                ? InfrastructureDiagnostic(phase, result, diagnostic)
-                : StructuredDiagnostic(phase, result));
-    }
-
-    private static bool IsInfrastructure(ProcessResult result)
-    {
-        if (!result.Started || result.TimedOut)
-        {
-            return true;
-        }
-
-        var output = string.Join("\n", result.StandardOutput, result.StandardError);
-        return InfrastructureMarkers.Any(marker => output.Contains(marker, StringComparison.OrdinalIgnoreCase));
-    }
-
-    private static string InfrastructureDiagnostic(ProcessPhase phase, ProcessResult result, string diagnostic)
-    {
-        var marker = InfrastructureMarkers.FirstOrDefault(candidate => diagnostic.Contains(candidate, StringComparison.OrdinalIgnoreCase));
-        var operation = phase switch
-        {
-            ProcessPhase.Restore => "package restore",
-            ProcessPhase.ToolInstall => "tool installation",
-            ProcessPhase.Build => "the consumer build",
-            ProcessPhase.Run => "the consumer run",
-            _ => "the tool smoke command"
-        };
-        var detail = !result.Started
-            ? "the required child process could not be started"
-            : result.TimedOut
-                ? "the bounded child process timed out"
-                : marker is null ? "the child process returned an infrastructure diagnostic" : $"diagnostic marker {marker}";
-        return $"The isolated {operation} could not be trusted because {detail}. Verify the package sources, dependency availability, and local tooling, then rerun NuGetReady.";
+        return new TargetRehearsalOutcome(false, false, StructuredDiagnostic(phase, result));
     }
 
     private static string StructuredDiagnostic(ProcessPhase phase, ProcessResult result)
@@ -505,8 +463,6 @@ internal static class ConsumerRehearsal
             return "The child process could not be started.";
         }
 
-        var marker = UnusableAssetMarkers.FirstOrDefault(candidate =>
-            string.Join("\n", result.StandardOutput, result.StandardError).Contains(candidate, StringComparison.OrdinalIgnoreCase));
         var operation = phase switch
         {
             ProcessPhase.Restore => "package restore",
@@ -515,9 +471,7 @@ internal static class ConsumerRehearsal
             ProcessPhase.Run => "consumer run",
             _ => "tool smoke command"
         };
-        return marker is null
-            ? $"The {operation} child process failed with exit code {result.ExitCode}."
-            : $"The {operation} reported diagnostic marker {marker}.";
+        return $"The {operation} child process failed with exit code {result.ExitCode}.";
     }
 
     private static RehearsalOutcome Success(PackageExpectation package, string message, string diagnostic)
@@ -615,7 +569,7 @@ internal static class ConsumerRehearsal
         }
 
         var metadata = peReader.GetMetadataReader();
-        return metadata.TypeDefinitions
+        var declared = metadata.TypeDefinitions
             .Select(metadata.GetTypeDefinition)
             .Where(definition => (definition.Attributes & TypeAttributes.VisibilityMask) == TypeAttributes.Public)
             .Select(definition => (definition, Name: metadata.GetString(definition.Name)))
@@ -625,6 +579,22 @@ internal static class ConsumerRehearsal
             .OrderBy(item => metadata.GetString(item.definition.Namespace), StringComparer.Ordinal)
             .ThenBy(item => item.Name, StringComparer.Ordinal)
             .Select(item => FormatTypeName(metadata, item.definition, item.Name))
+            .FirstOrDefault();
+        if (declared is not null)
+        {
+            return declared;
+        }
+
+        return metadata.ExportedTypes
+            .Select(metadata.GetExportedType)
+            .Where(type => (type.Attributes & TypeAttributes.VisibilityMask) == TypeAttributes.Public &&
+                           type.IsForwarder)
+            .Select(type => (Namespace: metadata.GetString(type.Namespace), Name: metadata.GetString(type.Name)))
+            .Where(item => item.Name is not "<Module>" && !item.Name.Contains('<', StringComparison.Ordinal))
+            .Where(item => IsSupportedTypeName(item.Name))
+            .OrderBy(item => item.Namespace, StringComparer.Ordinal)
+            .ThenBy(item => item.Name, StringComparer.Ordinal)
+            .Select(item => FormatForwardedTypeName(item.Namespace, item.Name))
             .FirstOrDefault();
     }
 
@@ -687,6 +657,16 @@ internal static class ConsumerRehearsal
         return $"global::{(qualifiedNamespace.Length == 0 ? string.Empty : qualifiedNamespace + ".")}{name}";
     }
 
+    private static string FormatForwardedTypeName(string namespaceName, string metadataName)
+    {
+        var tick = metadataName.IndexOf('`');
+        var name = EscapeCSharpIdentifier(tick >= 0 ? metadataName[..tick] : metadataName);
+        var qualifiedNamespace = string.IsNullOrWhiteSpace(namespaceName)
+            ? string.Empty
+            : string.Join(".", namespaceName.Split('.').Select(EscapeCSharpIdentifier));
+        return $"global::{(qualifiedNamespace.Length == 0 ? string.Empty : qualifiedNamespace + ".")}{name}";
+    }
+
     private static bool IsSupportedTypeName(string metadataName)
     {
         var tick = metadataName.IndexOf('`');
@@ -696,9 +676,28 @@ internal static class ConsumerRehearsal
 
     private static bool IsCSharpIdentifier(string value)
     {
-        return value.Length > 0 &&
-               (char.IsLetter(value[0]) || value[0] == '_') &&
-               value.Skip(1).All(character => char.IsLetterOrDigit(character) || character == '_');
+        var runes = value.EnumerateRunes().ToArray();
+        return runes.Length > 0 &&
+               IsIdentifierStart(runes[0]) &&
+               runes.Skip(1).All(IsIdentifierPart);
+    }
+
+    private static bool IsIdentifierStart(Rune rune)
+    {
+        var category = Rune.GetUnicodeCategory(rune);
+        return rune.Value == '_' || category is
+            UnicodeCategory.UppercaseLetter or UnicodeCategory.LowercaseLetter or
+            UnicodeCategory.TitlecaseLetter or UnicodeCategory.ModifierLetter or
+            UnicodeCategory.OtherLetter or UnicodeCategory.LetterNumber;
+    }
+
+    private static bool IsIdentifierPart(Rune rune)
+    {
+        var category = Rune.GetUnicodeCategory(rune);
+        return IsIdentifierStart(rune) || category is
+            UnicodeCategory.DecimalDigitNumber or UnicodeCategory.ConnectorPunctuation or
+            UnicodeCategory.NonSpacingMark or UnicodeCategory.SpacingCombiningMark or
+            UnicodeCategory.Format;
     }
 
     private static string EscapeCSharpIdentifier(string value)
@@ -808,9 +807,9 @@ internal static class ConsumerRehearsal
         try
         {
             using var reader = new PackageArchiveReader(packagePath);
-            var expectedIdentity = reader.GetIdentity();
             var rawFiles = ArchiveInspectionLimits.GetFiles(reader);
             ArchiveInspectionLimits.ValidateExpandedPayload(reader, rawFiles);
+            var expectedIdentity = reader.GetIdentity();
             var expectedVersion = VersionText.Normalize(package.Version!);
             if (!expectedIdentity.Id.Equals(package.Id, StringComparison.OrdinalIgnoreCase) ||
                 !string.Equals(expectedIdentity.Version.ToNormalizedString(), expectedVersion, StringComparison.OrdinalIgnoreCase))

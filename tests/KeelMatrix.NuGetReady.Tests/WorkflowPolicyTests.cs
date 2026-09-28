@@ -363,7 +363,9 @@ public sealed class WorkflowPolicyTests
 
         var findings = WorkflowPolicyInspector.Inspect(repository.Root.FullName);
 
-        Assert.Contains(findings, finding => finding.IsError && finding.Message.Contains("unsupported", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(findings, finding => finding.IsError &&
+            (finding.Message.Contains("unsupported", StringComparison.OrdinalIgnoreCase) ||
+             finding.Message.Contains("could not be parsed", StringComparison.OrdinalIgnoreCase)));
     }
 
     [Fact]
@@ -3917,6 +3919,78 @@ public sealed class WorkflowPolicyTests
     }
 
     [Theory]
+    [InlineData("echo $(dotnet nuget push artifacts/package.nupkg)")]
+    [InlineData("printf '$(dotnet nuget push artifacts/package.nupkg)'")]
+    [InlineData("Write-Output $(dotnet nuget push artifacts/package.nupkg)")]
+    [InlineData("Write-Host `$(dotnet nuget push artifacts/package.nupkg)")]
+    [InlineData("echo safe | dotnet nuget push artifacts/package.nupkg")]
+    public void Output_wrappers_and_single_pipes_do_not_hide_publication_commands(string command)
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", $$"""
+            name: publication probe
+            on:
+              push:
+            permissions:
+              packages: write
+            jobs:
+              publish:
+                runs-on: ubuntu-latest
+                steps:
+                  - run: {{command}}
+            """);
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        Assert.True(inspection.Evaluated);
+        Assert.Contains(inspection.Failures, failure => failure.IsError || !failure.IsWarning);
+    }
+
+    [Theory]
+    [InlineData("container")]
+    [InlineData("services")]
+    public void Container_and_service_credential_references_enter_publication_capability(string surface)
+    {
+        var yaml = surface == "container"
+            ? """
+              name: publication probe
+              on:
+                push:
+              permissions: {}
+              jobs:
+                build:
+                  runs-on: ubuntu-latest
+                  container:
+                    image: ubuntu:latest
+                    env:
+                      PASSWORD: ${{ secrets.PASSWORD }}
+                  steps:
+                    - run: dotnet build
+              """
+            : """
+              name: publication probe
+              on:
+                push:
+              permissions: {}
+              jobs:
+                build:
+                  runs-on: ubuntu-latest
+                  services:
+                    redis:
+                      image: redis:latest
+                      env:
+                        PASSWORD: ${{ secrets.PASSWORD }}
+                  steps:
+                    - run: dotnet build
+              """;
+        using var repository = WorkflowRepository.Create("ci.yml", yaml);
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        Assert.True(inspection.Evaluated);
+        Assert.Contains(inspection.Failures, failure => failure.IsError);
+    }
+
+    [Theory]
     [InlineData("oidc", "dotnet build")]
     [InlineData("oidc", "dotnet test")]
     [InlineData("oidc", "dotnet tool list")]
@@ -4380,6 +4454,9 @@ public sealed class WorkflowPolicyTests
               - name: Pack the exact release artifacts
                 shell: pwsh
                 run: dotnet pack src/Example/Example.csproj --configuration Release --no-build --no-restore --include-symbols -p:SymbolPackageFormat=snupkg -p:ImportDirectoryBuildTargets=false -p:ImportDirectoryTargets=false --output artifacts/release --nologo -p:UseSharedCompilation=false
+              - name: Inspect the exact release-built package bytes
+                shell: pwsh
+                run: pwsh -NoProfile -NonInteractive -File scripts/inspect-package.ps1 -PackagePath artifacts/release/KeelMatrix.NuGetReady.1.0.0.nupkg -SymbolsPackagePath artifacts/release/KeelMatrix.NuGetReady.1.0.0.snupkg
               - name: Upload exact artifacts
                 uses: actions/upload-artifact@v4
                 with:
@@ -4539,6 +4616,8 @@ internal sealed class WorkflowRepository : IDisposable
         File.WriteAllText(Path.Combine(root.FullName, "Example.sln"), string.Empty);
         var projectDirectory = Directory.CreateDirectory(Path.Combine(root.FullName, "src", "Example"));
         File.WriteAllText(Path.Combine(projectDirectory.FullName, "Example.csproj"), "<Project />");
+        var scriptsDirectory = Directory.CreateDirectory(Path.Combine(root.FullName, "scripts"));
+        File.WriteAllText(Path.Combine(scriptsDirectory.FullName, "inspect-package.ps1"), "param([string]$PackagePath, [string]$SymbolsPackagePath)");
         return new WorkflowRepository(root);
     }
 

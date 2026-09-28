@@ -17,10 +17,10 @@ internal static class ArchiveInspector
         string? artifactFileName = null)
     {
         using var reader = new PackageArchiveReader(path);
-        var nuspec = reader.NuspecReader;
-        var identity = nuspec.GetIdentity();
         var rawFiles = ArchiveInspectionLimits.GetFiles(reader);
         ArchiveInspectionLimits.ValidateExpandedPayload(reader, rawFiles);
+        var nuspec = reader.NuspecReader;
+        var identity = nuspec.GetIdentity();
         var files = rawFiles
             .Select(Normalize)
             .OrderBy(file => file, StringComparer.Ordinal)
@@ -210,9 +210,24 @@ internal static class ArchiveInspector
 
             var mainFiles = mainReader is null
                 ? null
-                : ArchiveInspectionLimits.GetFiles(mainReader)
-                .Select(Normalize)
-                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+                : GetValidatedFiles(mainReader);
+            if (mainFiles is not null)
+            {
+                var symbolSet = pdbFiles.ToHashSet(StringComparer.OrdinalIgnoreCase);
+                var symbolAssemblyNames = pdbFiles
+                    .Select(GetFileNameWithoutExtension)
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+                foreach (var assembly in mainFiles.Where(file =>
+                             IsSymbolBearingAssembly(file) &&
+                             IsIntendedSymbolAssembly(file, mainFiles, symbolAssemblyNames)))
+                {
+                    var expectedPdb = assembly[..^4] + ".pdb";
+                    if (!symbolSet.Contains(expectedPdb))
+                    {
+                        failures.Add(new Failure("archive-layout", "Symbol archive does not provide PDB coverage for every package assembly."));
+                    }
+                }
+            }
             foreach (var pdbFile in pdbFiles)
             {
                 try
@@ -362,9 +377,36 @@ internal static class ArchiveInspector
                 using var document = System.Text.Json.JsonDocument.Parse(metadata.GetBlobBytes(information.Value));
                 if (document.RootElement.ValueKind != System.Text.Json.JsonValueKind.Object ||
                     !document.RootElement.TryGetProperty("documents", out var documents) ||
-                    documents.ValueKind != System.Text.Json.JsonValueKind.Object)
+                    documents.ValueKind != System.Text.Json.JsonValueKind.Object ||
+                    !documents.EnumerateObject().Any())
                 {
                     failures.Add(new Failure("archive-layout", "Portable PDB SourceLink metadata is invalid."));
+                    continue;
+                }
+
+                var mappings = documents.EnumerateObject().ToArray();
+                foreach (var mapping in mappings)
+                {
+                    if (mapping.Name.Length == 0 || mapping.Value.ValueKind != System.Text.Json.JsonValueKind.String)
+                    {
+                        failures.Add(new Failure("archive-layout", "Portable PDB SourceLink metadata is invalid."));
+                        break;
+                    }
+
+                    var value = mapping.Value.GetString();
+                    if (value is null || !value.Contains('*', StringComparison.Ordinal) ||
+                        !Uri.TryCreate(value.Replace("*", "source", StringComparison.Ordinal), UriKind.Absolute, out var uri) ||
+                        (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
+                    {
+                        failures.Add(new Failure("archive-layout", "Portable PDB SourceLink metadata is invalid."));
+                        break;
+                    }
+                }
+
+                if (!mappings.All(mapping => mapping.Value.ValueKind == System.Text.Json.JsonValueKind.String) ||
+                    !metadata.Documents.Select(handle => metadata.GetString(metadata.GetDocument(handle).Name)).All(documentName => mappings.Any(mapping => SourceLinkMatches(mapping.Name, documentName))))
+                {
+                    failures.Add(new Failure("archive-layout", "Portable PDB SourceLink metadata does not cover all source documents."));
                 }
             }
             catch (System.Text.Json.JsonException)
@@ -372,6 +414,53 @@ internal static class ArchiveInspector
                 failures.Add(new Failure("archive-layout", "Portable PDB SourceLink metadata is invalid."));
             }
         }
+    }
+
+    private static HashSet<string> GetValidatedFiles(PackageArchiveReader reader)
+    {
+        var files = ArchiveInspectionLimits.GetFiles(reader);
+        ArchiveInspectionLimits.ValidateExpandedPayload(reader, files);
+        return files.Select(Normalize).ToHashSet(StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static bool IsSymbolBearingAssembly(string file)
+    {
+        return file.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) &&
+               (file.StartsWith("lib/", StringComparison.OrdinalIgnoreCase) ||
+                file.StartsWith("ref/", StringComparison.OrdinalIgnoreCase) ||
+                file.StartsWith("tools/", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool IsIntendedSymbolAssembly(
+        string assembly,
+        HashSet<string> mainFiles,
+        HashSet<string> symbolAssemblyNames)
+    {
+        var expectedPdb = assembly[..^4] + ".pdb";
+        return mainFiles.Contains(expectedPdb) ||
+               symbolAssemblyNames.Contains(GetFileNameWithoutExtension(assembly));
+    }
+
+    private static string GetFileNameWithoutExtension(string path)
+    {
+        var fileName = path[(path.LastIndexOf('/') + 1)..];
+        return fileName.EndsWith(".pdb", StringComparison.OrdinalIgnoreCase)
+            ? fileName[..^4]
+            : fileName.EndsWith(".dll", StringComparison.OrdinalIgnoreCase)
+                ? fileName[..^4]
+                : fileName;
+    }
+
+    private static bool SourceLinkMatches(string pattern, string document)
+    {
+        var star = pattern.IndexOf('*');
+        if (star < 0)
+        {
+            return string.Equals(pattern, document, StringComparison.OrdinalIgnoreCase);
+        }
+
+        return document.StartsWith(pattern[..star], StringComparison.OrdinalIgnoreCase) &&
+               document.EndsWith(pattern[(star + 1)..], StringComparison.OrdinalIgnoreCase);
     }
 
     private static void CheckToolCommand(PackageArchiveReader reader, IReadOnlyList<string> files, PackageExpectation expectation, List<Failure> failures)

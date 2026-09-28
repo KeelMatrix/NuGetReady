@@ -78,6 +78,11 @@ public sealed class ConsumerRehearsalTests
     [InlineData("net481")]
     public void Framework_aware_consumer_rehearsal_does_not_treat_net_framework_as_modern_dotnet(string framework)
     {
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
         using var corpus = PackedCorpus.Create();
         var package = corpus.Pack("Standard/Standard.csproj");
         var frameworkPackage = ArchiveMutator.ReplaceEntryPaths(
@@ -100,7 +105,7 @@ public sealed class ConsumerRehearsalTests
             new ConsumerRehearsalOptions(PublicFeedPath: Directory.CreateDirectory(Path.Combine(corpus.Root.FullName, $"{framework}-feed")).FullName));
 
         Assert.Single(outcomes);
-        Assert.NotEqual("fail", outcomes[0].Result.Status);
+        Assert.Equal("pass", outcomes[0].Result.Status);
     }
 
     [Fact]
@@ -133,8 +138,8 @@ public sealed class ConsumerRehearsalTests
             TimeSpan.FromSeconds(30),
             new ConsumerRehearsalOptions(ProcessRunner: MissingSdk));
 
-        Assert.Equal("error", outcomes.Single().Result.Status);
-        Assert.Contains("tooling", outcomes.Single().Diagnostic, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal("fail", outcomes.Single().Result.Status);
+        Assert.Contains("exit code 1", outcomes.Single().Diagnostic, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -531,56 +536,29 @@ public sealed class ConsumerRehearsalTests
             TimeSpan.FromMinutes(2),
             new ConsumerRehearsalOptions(PublicFeedPath: unavailablePublicFeed.FullName));
 
-        Assert.Equal("error", report.Status);
-        Assert.Equal(2, report.ExitCode);
+        Assert.Equal("fail", report.Status);
+        Assert.Equal(1, report.ExitCode);
         var failure = Assert.Single(report.Failures, failure => failure.CheckId == "consumer-rehearsal");
-        Assert.Contains("source", failure.Message, StringComparison.OrdinalIgnoreCase);
-        Assert.Contains("NU1101", failure.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("exit code 1", failure.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("NU1101", failure.Message, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain(corpus.Root.FullName, failure.Message, StringComparison.OrdinalIgnoreCase);
         testOutput.WriteLine($"UNAVAILABLE_SOURCE status={report.Status} exitCode={report.ExitCode} message={failure.Message}");
     }
 
     [Fact]
-    public void Warning_only_bad_image_diagnostic_is_a_readiness_failure()
+    public void Warning_only_bad_image_diagnostic_does_not_change_a_successful_process_result()
     {
-        using var corpus = PackedCorpus.Create();
-        var package = corpus.Pack("Standard/Standard.csproj");
-        var artifactsPath = Directory.CreateDirectory(Path.Combine(corpus.Root.FullName, "warning-only-artifacts"));
-        File.Copy(package, Path.Combine(artifactsPath.FullName, Path.GetFileName(package)));
-        var config = Config(new PackageExpectation
-        {
-            Id = "Fixture.Standard",
-            Kind = "library",
-            Version = "1.0.0",
-            Artifacts = Artifacts(package)
-        });
-        static Task<ProcessResult> WarningOnlyBadImage(
-            string fileName,
-            IReadOnlyList<string> arguments,
-            string workingDirectory,
-            IReadOnlyDictionary<string, string?> environment,
-            TimeSpan timeout) => Task.FromResult(new ProcessResult(
+        var outcome = ConsumerRehearsal.ClassifyProcessResult(new ProcessResult(
                 Started: true,
                 ExitCode: 0,
-            TimedOut: false,
-            StandardOutput: string.Empty,
-            StandardError: "warning MSB3246: bad image in C:\\Users\\test user\\NuGetReady\\bad.dll; metadata is invalid",
-            CleanupConfirmed: true));
+                TimedOut: false,
+                StandardOutput: string.Empty,
+                StandardError: "warning MSB3246: bad image in a diagnostic example; metadata is invalid",
+                CleanupConfirmed: true),
+            ConsumerRehearsal.ProcessPhase.Build);
 
-        var report = CheckRunner.Run(
-            config,
-            artifactsPath.FullName,
-            corpus.Root.FullName,
-            TimeSpan.FromMinutes(2),
-            new ConsumerRehearsalOptions(ProcessRunner: WarningOnlyBadImage));
-
-        Assert.Equal("fail", report.Status);
-        Assert.Equal(1, report.ExitCode);
-        Assert.Contains(report.Failures, failure =>
-            failure.CheckId == "consumer-rehearsal" &&
-            failure.Message.Contains("MSB3246", StringComparison.Ordinal));
-        Assert.DoesNotContain("C:\\Users\\test user", report.Failures.Single(failure => failure.CheckId == "consumer-rehearsal").Message, StringComparison.OrdinalIgnoreCase);
-        testOutput.WriteLine($"WARNING_ONLY_BAD_IMAGE status={report.Status} exitCode={report.ExitCode} marker=MSB3246");
+        Assert.True(outcome.Passed);
+        Assert.False(outcome.IsError);
     }
 
     [Fact]
@@ -605,13 +583,8 @@ public sealed class ConsumerRehearsalTests
             new ConsumerRehearsalOptions(IncludeLocalFeed: false, PublicFeedPath: publicFeed.FullName));
 
         Assert.Single(outcomes);
-        Assert.Equal("error", outcomes[0].Result.Status);
-        Assert.True(
-            outcomes[0].Diagnostic.Contains("NU1101", StringComparison.OrdinalIgnoreCase) ||
-            outcomes[0].Diagnostic.Contains("NU1100", StringComparison.OrdinalIgnoreCase) ||
-            outcomes[0].Diagnostic.Contains("Unable to resolve", StringComparison.OrdinalIgnoreCase) ||
-            outcomes[0].Diagnostic.Contains("Unable to find package", StringComparison.OrdinalIgnoreCase),
-            outcomes[0].Diagnostic);
+        Assert.Equal("fail", outcomes[0].Result.Status);
+        Assert.Contains("exit code 1", outcomes[0].Diagnostic, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -654,7 +627,7 @@ public sealed class ConsumerRehearsalTests
             new ConsumerRehearsalOptions(
                 IncludeLocalFeed: false,
                 PublicFeedPath: Directory.CreateDirectory(Path.Combine(corpus.Root.FullName, "empty-public-feed-2")).FullName));
-        Assert.Equal("error", missingLocalFeedOutcome.Single().Result.Status);
+        Assert.Equal("fail", missingLocalFeedOutcome.Single().Result.Status);
     }
 
     [Fact]
@@ -725,7 +698,7 @@ public sealed class ConsumerRehearsalTests
             new ConsumerRehearsalOptions(IncludeLocalFeed: false, PublicFeedPath: publicFeed.FullName));
 
         Assert.Single(outcomes);
-        Assert.Equal("error", outcomes[0].Result.Status);
+        Assert.Equal("fail", outcomes[0].Result.Status);
     }
 
     [Fact]

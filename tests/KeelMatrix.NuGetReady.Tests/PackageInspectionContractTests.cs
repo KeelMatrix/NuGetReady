@@ -229,6 +229,7 @@ public sealed class PackageInspectionContractTests
         var sensitiveFiles = new[] { ".env.local", "keelmatrix.telemetry.json" }
             .Select(name => Path.Combine(projectDirectory, name))
             .ToArray();
+        var originalProject = File.ReadAllText(project);
         var output = Directory.CreateTempSubdirectory("nugetready-pack-guard-");
         try
         {
@@ -236,6 +237,11 @@ public sealed class PackageInspectionContractTests
             {
                 File.WriteAllText(path, "local-only");
             }
+            var packItems = string.Join(
+                Environment.NewLine,
+                new[] { ".env.local", "keelmatrix.telemetry.json" }
+                    .Select(name => $"  <ItemGroup><None Include=\"{name}\" Pack=\"true\" PackagePath=\"{name}\" /></ItemGroup>"));
+            File.WriteAllText(project, originalProject.Replace("</Project>", packItems + Environment.NewLine + "</Project>", StringComparison.Ordinal));
 
             var result = await BoundedProcess.RunAsync(
                 "dotnet",
@@ -267,6 +273,8 @@ public sealed class PackageInspectionContractTests
                 }
             }
 
+            File.WriteAllText(project, originalProject);
+
             output.Delete(recursive: true);
         }
     }
@@ -285,10 +293,13 @@ public sealed class PackageInspectionContractTests
         var project = FindRepositoryFile("src", "KeelMatrix.NuGetReady", "KeelMatrix.NuGetReady.csproj");
         var projectDirectory = Path.GetDirectoryName(project)!;
         var sensitivePath = Path.Combine(projectDirectory, sensitiveFile);
+        var originalProject = File.ReadAllText(project);
         var output = Directory.CreateTempSubdirectory("nugetready-pack-family-guard-");
         try
         {
             File.WriteAllText(sensitivePath, "local-only");
+            var packItem = $"  <ItemGroup><None Include=\"{sensitiveFile}\" Pack=\"true\" PackagePath=\"{sensitiveFile}\" /></ItemGroup>\n";
+            File.WriteAllText(project, originalProject.Replace("</Project>", packItem + "</Project>", StringComparison.Ordinal));
 
             var result = await BoundedProcess.RunAsync(
                 "dotnet",
@@ -320,6 +331,8 @@ public sealed class PackageInspectionContractTests
             {
                 File.Delete(sensitivePath);
             }
+
+            File.WriteAllText(project, originalProject);
 
             output.Delete(recursive: true);
         }

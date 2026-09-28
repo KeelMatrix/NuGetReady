@@ -46,7 +46,8 @@ function Test-SensitivePackagePath {
     if (@($packageSensitivePathPolicy.pathFragments) | Where-Object { $lower.Contains([string]$_, [StringComparison]::Ordinal) }) { return $true }
 
     $segments = $lower.Split('/', [StringSplitOptions]::RemoveEmptyEntries)
-    if (@($packageSensitivePathPolicy.pathSegments) | Where-Object { $segments -contains ([string]$_).ToLowerInvariant() }) { return $true }
+    $directorySegments = if ($segments.Count -gt 1) { $segments[0..($segments.Count - 2)] } else { @() }
+    if (@($packageSensitivePathPolicy.pathSegments) | Where-Object { $directorySegments -contains ([string]$_).ToLowerInvariant() }) { return $true }
 
     foreach ($familyRule in @($packageSensitivePathPolicy.familyRules)) {
         if ([string]$familyRule.scope -ne "pathSegments") {
@@ -54,7 +55,7 @@ function Test-SensitivePackagePath {
         }
 
         $values = @(Get-FamilyValues ([string]$familyRule.source) | ForEach-Object { ([string]$_).ToLowerInvariant() })
-        foreach ($segment in $segments) {
+        foreach ($segment in $directorySegments) {
             if (@($packageSensitivePathPolicy.familyExceptions) | Where-Object { $segment -eq ([string]$_).ToLowerInvariant() }) { continue }
             $exemptExtensions = @()
             if ($null -ne $familyRule.PSObject.Properties["exemptExtensions"]) {
@@ -87,9 +88,32 @@ function Test-SensitivePackagePath {
     }
 
     $name = [IO.Path]::GetFileName($lower)
-    if (@($packageSensitivePathPolicy.exactFileNames) | Where-Object { $name -eq ([string]$_).ToLowerInvariant() }) { return $true }
+    $nameWithoutLeadingDots = $name.TrimStart('.')
+    if (@($packageSensitivePathPolicy.exactFileNames) | Where-Object {
+            $exact = ([string]$_).ToLowerInvariant()
+            $candidate = if ($name.StartsWith($exact, [StringComparison]::Ordinal)) { $name } elseif ($nameWithoutLeadingDots.StartsWith($exact, [StringComparison]::Ordinal)) { $nameWithoutLeadingDots } else { return $false }
+            $remainder = $candidate.Substring($exact.Length)
+            return $remainder.Length -eq 0 -or $remainder.StartsWith('.') -or
+                -not (@('.dll', '.exe', '.pdb', '.so', '.dylib') | Where-Object { $name.EndsWith([string]$_, [StringComparison]::Ordinal) })
+        }) { return $true }
     if (@($packageSensitivePathPolicy.fileNamePrefixes) | Where-Object { $name.StartsWith(([string]$_).ToLowerInvariant(), [StringComparison]::Ordinal) }) { return $true }
-    if (@($packageSensitivePathPolicy.fileNameSuffixes) | Where-Object { $name.EndsWith(([string]$_).ToLowerInvariant(), [StringComparison]::Ordinal) }) { return $true }
-    if (@($packageSensitivePathPolicy.fileExtensions) | Where-Object { $name.EndsWith(([string]$_).ToLowerInvariant(), [StringComparison]::Ordinal) }) { return $true }
+    if (@($packageSensitivePathPolicy.fileNameSuffixes) | Where-Object { Test-ExtensionFamily $name (([string]$_).ToLowerInvariant()) }) { return $true }
+    if (@($packageSensitivePathPolicy.fileExtensions) | Where-Object { Test-ExtensionFamily $name (([string]$_).ToLowerInvariant()) }) { return $true }
+    if (@($packageSensitivePathPolicy.fileNameFragments) | Where-Object {
+            $isBinaryAssembly = @('.dll', '.exe', '.pdb', '.so', '.dylib') | Where-Object { $name.EndsWith([string]$_, [StringComparison]::Ordinal) }
+            if ($isBinaryAssembly) { return $false }
+            $fragment = ([string]$_).ToLowerInvariant()
+            $start = $name.IndexOf($fragment, [StringComparison]::Ordinal)
+            while ($start -ge 0) {
+                $end = $start + $fragment.Length
+                if ($end -eq $name.Length -or -not [char]::IsLetterOrDigit($name[$end])) { return $true }
+                $nextStart = $end
+                $remaining = $name.Length - $nextStart
+                $next = $name.Substring($nextStart, $remaining)
+                $relative = $next.IndexOf($fragment, [StringComparison]::Ordinal)
+                $start = if ($relative -ge 0) { $nextStart + $relative } else { -1 }
+            }
+            return $false
+        }) { return $true }
     return $false
 }

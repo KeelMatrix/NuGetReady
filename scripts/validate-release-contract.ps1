@@ -71,18 +71,57 @@ function Get-PropertyValue {
     return $node.InnerText.Trim()
 }
 
+function Get-VisibleMarkdownFlags {
+    param([string[]]$Lines)
+
+    $visible = [bool[]]::new($Lines.Count)
+    $inComment = $false
+    $fenceCharacter = $null
+    $fenceLength = 0
+    for ($index = 0; $index -lt $Lines.Count; $index++) {
+        $line = $Lines[$index]
+        $visible[$index] = $false
+
+        if ($inComment) {
+            if ($line.Contains("-->", [StringComparison]::Ordinal)) { $inComment = $false }
+            continue
+        }
+
+        if ($line -match '^\s*<!--') {
+            if (-not $line.Contains("-->", [StringComparison]::Ordinal)) { $inComment = $true }
+            continue
+        }
+
+        if ($null -ne $fenceCharacter) {
+            $closing = [Regex]::Match($line, '^( {0,3})(?<marker>`{3,}|~{3,})')
+            if ($closing.Success -and $closing.Groups['marker'].Value[0] -eq $fenceCharacter -and $closing.Groups['marker'].Value.Length -ge $fenceLength) {
+                $fenceCharacter = $null
+                $fenceLength = 0
+            }
+            continue
+        }
+
+        $opening = [Regex]::Match($line, '^( {0,3})(?<marker>`{3,}|~{3,})')
+        if ($opening.Success) {
+            $fenceCharacter = $opening.Groups['marker'].Value[0]
+            $fenceLength = $opening.Groups['marker'].Value.Length
+            continue
+        }
+
+        if ($line -match '^(?: {4}|\t)') { continue }
+        $visible[$index] = $true
+    }
+
+    return $visible
+}
+
 function Get-HeadingSections {
     param([string[]]$Lines)
 
     $sections = [System.Collections.Generic.List[object]]::new()
-    $inFence = $false
+    $visible = @(Get-VisibleMarkdownFlags -Lines $Lines)
     for ($index = 0; $index -lt $Lines.Count; $index++) {
-        if ($Lines[$index] -match '^\s*(```|~~~)') {
-            $inFence = -not $inFence
-            continue
-        }
-
-        if (-not $inFence -and $Lines[$index] -match '^\s*##\s+\[(?<label>[^\]]+)\](?:\s+-\s*(?<date>\d{4}-\d{2}-\d{2}))?\s*$') {
+        if ($visible[$index] -and $Lines[$index] -match '^ {0,3}##\s+\[(?<label>[^\]]+)\](?:\s+-\s*(?<date>\d{4}-\d{2}-\d{2}))?\s*$') {
             $null = $sections.Add([pscustomobject]@{
                     Index = $index
                     Label = $Matches.label.Trim()
@@ -109,11 +148,9 @@ function Get-SectionLines {
         }
     }
 
-    if ($next -le $Section.Index + 1) {
-        return @()
-    }
-
-    return @($Lines[($Section.Index + 1)..($next - 1)])
+    if ($next -le $Section.Index + 1) { return @() }
+    $visible = @(Get-VisibleMarkdownFlags -Lines $Lines)
+    return @((($Section.Index + 1)..($next - 1)) | Where-Object { $visible[$_] } | ForEach-Object { $Lines[$_] })
 }
 
 function Get-RealReleaseContent {
@@ -122,24 +159,17 @@ function Get-RealReleaseContent {
     $categories = [System.Collections.Generic.List[string]]::new()
     $hasAddedEntry = $false
     $currentCategory = $null
-    $inFence = $false
-    foreach ($line in $Lines) {
-        if ($line -match '^\s*(```|~~~)') {
-            $inFence = -not $inFence
-            continue
-        }
-
-        if ($inFence) {
-            continue
-        }
-
-        if ($line -match '^\s*###\s+(?<category>.+?)\s*$') {
+    $visible = @(Get-VisibleMarkdownFlags -Lines $Lines)
+    for ($index = 0; $index -lt $Lines.Count; $index++) {
+        $line = $Lines[$index]
+        if (-not $visible[$index]) { continue }
+        if ($line -match '^ {0,3}###\s+(?<category>.+?)\s*$') {
             $currentCategory = $Matches.category.Trim()
             $null = $categories.Add($currentCategory)
             continue
         }
 
-        if ($currentCategory -eq "Added" -and $line -match '^\s*[-*+]\s+\S') {
+        if ($currentCategory -eq "Added" -and $line -match '^ {0,3}[-*+]\s+\S') {
             $hasAddedEntry = $true
         }
     }
@@ -154,14 +184,10 @@ function Get-RealBulletEntries {
     param([string[]]$Lines)
 
     $entries = [System.Collections.Generic.List[string]]::new()
-    $inFence = $false
-    foreach ($line in $Lines) {
-        if ($line -match '^\s*(```|~~~)') {
-            $inFence = -not $inFence
-            continue
-        }
-
-        if (-not $inFence -and $line -match '^\s*[-*+]\s+(?<text>\S.*)$') {
+    $visible = @(Get-VisibleMarkdownFlags -Lines $Lines)
+    for ($index = 0; $index -lt $Lines.Count; $index++) {
+        $line = $Lines[$index]
+        if ($visible[$index] -and $line -match '^ {0,3}[-*+]\s+(?<text>\S.*)$') {
             $null = $entries.Add($Matches.text.Trim())
         }
     }
@@ -422,7 +448,7 @@ if ($releaseBody -match '(?i)\b(now|no\s+longer|previously|formerly|used\s+to|fi
 if ($Mode -eq "Tag" -and $null -ne $unreleased) {
     $unreleasedLines = @(Get-SectionLines -Lines $changelogLines -Section $unreleased -Sections $sections)
     $releaseNormalized = Normalize-Text $releaseBody
-    foreach ($bullet in @($unreleasedLines | Where-Object { $_ -match '^\s*[-*+]\s+(?<text>.+?)\s*$' } | ForEach-Object { $Matches.text.Trim() })) {
+    foreach ($bullet in @(Get-RealBulletEntries -Lines $unreleasedLines)) {
         $bulletNormalized = Normalize-Text $bullet
         if (-not $releaseNormalized.Contains($bulletNormalized, [StringComparison]::Ordinal)) {
             Fail-Contract "[Unreleased] contains an entry not documented by the finalized [$targetVersion] release: $bullet"
