@@ -163,7 +163,17 @@ public sealed class ConsumerRehearsalTests
             new ConsumerRehearsalOptions(PublicFeedPath: corpus.OutputPath));
 
         Assert.Equal(4, outcomes.Count);
-        Assert.All(outcomes, outcome => Assert.Equal("pass", outcome.Result.Status));
+        Assert.All(outcomes.Where(outcome => outcome.Result.PackageId != "Fixture.Tool"), outcome => Assert.Equal("pass", outcome.Result.Status));
+        if (OperatingSystem.IsWindows())
+        {
+            Assert.Equal("pass", outcomes.Single(outcome => outcome.Result.PackageId == "Fixture.Tool").Result.Status);
+        }
+        else
+        {
+            var toolOutcome = outcomes.Single(outcome => outcome.Result.PackageId == "Fixture.Tool").Result;
+            Assert.Equal("error", toolOutcome.Status);
+            Assert.Contains("cannot be bound", toolOutcome.Message, StringComparison.OrdinalIgnoreCase);
+        }
         Assert.Contains("net8.0", outcomes.Single(outcome => outcome.Result.PackageId == "Fixture.MultiTarget").Result.Message, StringComparison.Ordinal);
         Assert.Contains("netstandard2.1", outcomes.Single(outcome => outcome.Result.PackageId == "Fixture.MultiTarget").Result.Message, StringComparison.Ordinal);
         Assert.DoesNotContain("consumer-api:", outcomes.Single(outcome => outcome.Result.PackageId == "Fixture.Standard").Diagnostic, StringComparison.Ordinal);
@@ -227,11 +237,10 @@ public sealed class ConsumerRehearsalTests
     }
 
     [Fact]
-    public void Tool_rehearsal_launches_the_pinned_image_when_the_installed_child_is_rebound_after_validation()
+    public void Tool_rehearsal_blocks_apphost_and_dependency_replacement_after_validation()
     {
         using var corpus = PackedCorpus.Create();
         var package = corpus.Pack("Tool/Tool.csproj");
-        var failingPackage = corpus.Pack("ToolFailure/ToolFailure.csproj");
         var config = Config(new PackageExpectation
         {
             Id = "Fixture.Tool",
@@ -243,18 +252,39 @@ public sealed class ConsumerRehearsalTests
         });
 
         var previous = ConsumerRehearsal.BeforeToolLaunchForTests;
+        var previousSnapshot = ConsumerRehearsal.BeforeToolLaunchSnapshotForTests;
+        var apphostReplacementBlocked = false;
+        var dependencyReplacementBlocked = false;
+        ConsumerRehearsal.BeforeToolLaunchSnapshotForTests = toolDirectory =>
+            File.WriteAllText(Path.Combine(toolDirectory, "Fixture.Tool.Dependency.dll"), "pinned dependency");
         ConsumerRehearsal.BeforeToolLaunchForTests = executable =>
         {
             var toolDirectory = Path.GetDirectoryName(executable)!;
-            using var archive = ZipFile.OpenRead(failingPackage);
-            foreach (var entry in archive.Entries.Where(entry => entry.FullName.StartsWith("tools/net8.0/any/", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrEmpty(entry.Name)))
+            try
             {
-                var targetName = Path.GetFileName(entry.FullName)
-                    .Replace("fixture-tool-failure", "fixture-tool", StringComparison.OrdinalIgnoreCase)
-                    .Replace("Fixture.ToolFailure", "Fixture.Tool", StringComparison.OrdinalIgnoreCase);
-                using var source = entry.Open();
-                using var target = new FileStream(Path.Combine(toolDirectory, targetName), FileMode.Create, FileAccess.Write, FileShare.None);
-                source.CopyTo(target);
+                using var apphost = new FileStream(executable, FileMode.Create, FileAccess.Write, FileShare.None);
+                apphost.WriteByte(0);
+            }
+            catch (IOException) when (OperatingSystem.IsWindows())
+            {
+                apphostReplacementBlocked = true;
+            }
+            catch (UnauthorizedAccessException) when (OperatingSystem.IsWindows())
+            {
+                apphostReplacementBlocked = true;
+            }
+            try
+            {
+                using var dependency = new FileStream(Path.Combine(toolDirectory, "Fixture.Tool.Dependency.dll"), FileMode.Create, FileAccess.Write, FileShare.None);
+                dependency.WriteByte(0);
+            }
+            catch (IOException) when (OperatingSystem.IsWindows())
+            {
+                dependencyReplacementBlocked = true;
+            }
+            catch (UnauthorizedAccessException) when (OperatingSystem.IsWindows())
+            {
+                dependencyReplacementBlocked = true;
             }
         };
 
@@ -266,11 +296,22 @@ public sealed class ConsumerRehearsalTests
                 TimeSpan.FromMinutes(2),
                 new ConsumerRehearsalOptions(PublicFeedPath: Directory.CreateDirectory(Path.Combine(corpus.Root.FullName, "empty-public-feed")).FullName));
 
-            Assert.Equal("pass", outcomes.Single().Result.Status);
+            if (OperatingSystem.IsWindows())
+            {
+                Assert.True(apphostReplacementBlocked, "The held launch handle did not block apphost replacement.");
+                Assert.True(dependencyReplacementBlocked, "The held launch handle did not block dependency replacement.");
+                Assert.Equal("pass", outcomes.Single().Result.Status);
+            }
+            else
+            {
+                Assert.Equal("error", outcomes.Single().Result.Status);
+                Assert.Contains("cannot be bound", outcomes.Single().Result.Message, StringComparison.OrdinalIgnoreCase);
+            }
         }
         finally
         {
             ConsumerRehearsal.BeforeToolLaunchForTests = previous;
+            ConsumerRehearsal.BeforeToolLaunchSnapshotForTests = previousSnapshot;
         }
     }
 
@@ -304,6 +345,7 @@ public sealed class ConsumerRehearsalTests
         });
 
         var rebound = false;
+        var replacementBlocked = false;
         var previous = ConsumerRehearsal.BeforeToolLaunchForTests;
         ConsumerRehearsal.BeforeToolLaunchForTests = executable =>
         {
@@ -320,9 +362,20 @@ public sealed class ConsumerRehearsalTests
             }
 
             var outsideExecutable = Path.Combine(outside.FullName, Path.GetFileName(executable));
-            File.Delete(executable);
-            File.CreateSymbolicLink(executable, outsideExecutable);
-            rebound = true;
+            try
+            {
+                File.Delete(executable);
+                File.CreateSymbolicLink(executable, outsideExecutable);
+                rebound = true;
+            }
+            catch (IOException) when (OperatingSystem.IsWindows())
+            {
+                replacementBlocked = true;
+            }
+            catch (UnauthorizedAccessException) when (OperatingSystem.IsWindows())
+            {
+                replacementBlocked = true;
+            }
         };
 
         try
@@ -333,8 +386,17 @@ public sealed class ConsumerRehearsalTests
                 TimeSpan.FromMinutes(2),
                 new ConsumerRehearsalOptions(PublicFeedPath: Directory.CreateDirectory(Path.Combine(corpus.Root.FullName, "empty-public-feed")).FullName));
 
-            Assert.True(rebound, "The reparse-child rebind probe did not run.");
-            Assert.Equal("pass", outcomes.Single().Result.Status);
+            Assert.True(rebound || replacementBlocked, "The reparse-child rebind probe did not run.");
+            if (OperatingSystem.IsWindows())
+            {
+                Assert.True(replacementBlocked, "The held launch handles did not block reparse replacement.");
+                Assert.Equal("pass", outcomes.Single().Result.Status);
+            }
+            else
+            {
+                Assert.Equal("error", outcomes.Single().Result.Status);
+                Assert.Contains("cannot be bound", outcomes.Single().Result.Message, StringComparison.OrdinalIgnoreCase);
+            }
         }
         finally
         {
@@ -365,7 +427,15 @@ public sealed class ConsumerRehearsalTests
             new ConsumerRehearsalOptions(PublicFeedPath: Directory.CreateDirectory(Path.Combine(corpus.Root.FullName, "empty-public-feed")).FullName));
 
         Assert.Single(outcomes);
-        Assert.Equal("pass", outcomes[0].Result.Status);
+        if (OperatingSystem.IsWindows())
+        {
+            Assert.Equal("pass", outcomes[0].Result.Status);
+        }
+        else
+        {
+            Assert.Equal("error", outcomes[0].Result.Status);
+            Assert.Contains("cannot be bound", outcomes[0].Result.Message, StringComparison.OrdinalIgnoreCase);
+        }
     }
 
     [Fact]
@@ -465,7 +535,15 @@ public sealed class ConsumerRehearsalTests
                 PublicFeedPath: Directory.CreateDirectory(Path.Combine(corpus.Root.FullName, "empty-public-feed")).FullName));
 
         Assert.Single(outcomes);
-        Assert.True(outcomes[0].Result.Status == "pass", outcomes[0].Result.Message + " " + outcomes[0].Diagnostic);
+        if (OperatingSystem.IsWindows())
+        {
+            Assert.Equal("pass", outcomes[0].Result.Status);
+        }
+        else
+        {
+            Assert.Equal("error", outcomes[0].Result.Status);
+            Assert.Contains("cannot be bound", outcomes[0].Result.Message, StringComparison.OrdinalIgnoreCase);
+        }
     }
 
     [Fact]

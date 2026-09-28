@@ -267,6 +267,107 @@ public sealed class WorkflowPolicyTests
             finding.Message.Contains("casing", StringComparison.OrdinalIgnoreCase));
     }
 
+    [Fact]
+    public void Repository_policy_rejects_reparse_points_at_each_inspection_surface()
+    {
+        var surfaces = new[]
+        {
+            "repository .github directory",
+            "workflow directory",
+            "nested workflow directory",
+            "workflow leaf",
+            "NuGet.config",
+            "global.json",
+            "nugetready.json",
+            "local script",
+            "composite action"
+        };
+
+        for (var index = 0; index < surfaces.Length; index++)
+        {
+            using var repository = WorkflowRepository.Create("release.yml", ReleaseWorkflow);
+            var outside = Directory.CreateTempSubdirectory($"nugetready-workflow-outside-{index}-");
+            try
+            {
+                File.WriteAllText(Path.Combine(outside.FullName, "OUTSIDE_SENTINEL.yml"), "name: OUTSIDE_SENTINEL");
+
+                try
+                {
+                    ConfigureReparseSurface(repository, outside.FullName, index);
+                }
+                catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
+                {
+                    return;
+                }
+
+                var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+                var diagnostics = string.Join(" | ", inspection.Failures.Select(failure => failure.Message));
+                if (!inspection.Failures.Any(failure => failure.IsError))
+                {
+                    throw new Xunit.Sdk.XunitException($"{surfaces[index]} unexpectedly remained certifiable.");
+                }
+                Assert.DoesNotContain("OUTSIDE_SENTINEL", diagnostics, StringComparison.Ordinal);
+                Assert.DoesNotContain(outside.FullName, diagnostics, StringComparison.OrdinalIgnoreCase);
+            }
+            finally
+            {
+                outside.Delete(recursive: true);
+            }
+        }
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData(".github")]
+    [InlineData(".github/workflows")]
+    public void Repository_policy_rejects_ancestor_rename_swap_before_reading_the_replacement(string relativePath)
+    {
+        using var repository = WorkflowRepository.Create("release.yml", ReleaseWorkflow);
+        var originalPath = repository.Root.FullName;
+        var swappedPath = Path.Combine(originalPath, relativePath.Replace('/', Path.DirectorySeparatorChar));
+        var movedPath = swappedPath + "-moved";
+        var swapped = false;
+        var previous = WorkflowPolicyInspector.BeforeInspectionForTests;
+        WorkflowPolicyInspector.BeforeInspectionForTests = path =>
+        {
+            if (!string.Equals(path, originalPath, StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            Directory.Move(swappedPath, movedPath);
+            Directory.CreateDirectory(swappedPath);
+            var replacementWorkflowDirectory = relativePath.Length == 0
+                ? Path.Combine(swappedPath, ".github", "workflows")
+                : relativePath.Equals(".github", StringComparison.Ordinal)
+                    ? Path.Combine(swappedPath, "workflows")
+                    : swappedPath;
+            Directory.CreateDirectory(replacementWorkflowDirectory);
+            File.WriteAllText(Path.Combine(replacementWorkflowDirectory, "OUTSIDE_SENTINEL.yml"), "name: OUTSIDE_SENTINEL");
+            swapped = true;
+        };
+
+        WorkflowInspectionResult inspection;
+        try
+        {
+            inspection = WorkflowPolicyInspector.InspectDetailed(originalPath);
+        }
+        finally
+        {
+            WorkflowPolicyInspector.BeforeInspectionForTests = previous;
+            if (swapped)
+            {
+                Directory.Delete(swappedPath, recursive: true);
+                Directory.Move(movedPath, swappedPath);
+            }
+        }
+
+        var diagnostics = string.Join(" | ", inspection.Failures.Select(failure => failure.Message));
+        Assert.Contains(inspection.Failures, failure => failure.IsError);
+        Assert.DoesNotContain("OUTSIDE_SENTINEL", diagnostics, StringComparison.Ordinal);
+        Assert.DoesNotContain(movedPath, diagnostics, StringComparison.OrdinalIgnoreCase);
+    }
+
     [Theory]
     [InlineData("validated-release-artifacts", "different-artifact")]
     [InlineData("path: artifacts/release", "path: artifacts/unvalidated")]
@@ -4539,6 +4640,74 @@ public sealed class WorkflowPolicyTests
         workflow = workflow.Replace("\r\n", "\n", StringComparison.Ordinal);
         Assert.Contains(original, workflow, StringComparison.Ordinal);
         return workflow.Replace(original, replacement, StringComparison.Ordinal);
+    }
+
+    private static void ConfigureReparseSurface(WorkflowRepository repository, string outsideRoot, int surface)
+    {
+        var workflowDirectory = Path.Combine(repository.Root.FullName, ".github", "workflows");
+        switch (surface)
+        {
+            case 0:
+                var outsideGitHub = Directory.CreateDirectory(Path.Combine(outsideRoot, ".github", "workflows"));
+                File.WriteAllText(Path.Combine(outsideGitHub.FullName, "release.yml"), "name: OUTSIDE_SENTINEL");
+                Directory.Delete(Path.Combine(repository.Root.FullName, ".github"), recursive: true);
+                Directory.CreateSymbolicLink(Path.Combine(repository.Root.FullName, ".github"), Path.Combine(outsideRoot, ".github"));
+                break;
+            case 1:
+                var outsideWorkflows = Directory.CreateDirectory(Path.Combine(outsideRoot, "workflows"));
+                File.WriteAllText(Path.Combine(outsideWorkflows.FullName, "release.yml"), "name: OUTSIDE_SENTINEL");
+                Directory.Delete(workflowDirectory, recursive: true);
+                Directory.CreateSymbolicLink(workflowDirectory, outsideWorkflows.FullName);
+                break;
+            case 2:
+                var outsideNested = Directory.CreateDirectory(Path.Combine(outsideRoot, "nested"));
+                File.WriteAllText(Path.Combine(outsideNested.FullName, "nested.yml"), "name: OUTSIDE_SENTINEL");
+                var nested = Directory.CreateDirectory(Path.Combine(workflowDirectory, "nested"));
+                Directory.Delete(nested.FullName, recursive: true);
+                Directory.CreateSymbolicLink(nested.FullName, outsideNested.FullName);
+                break;
+            case 3:
+                var outsideWorkflow = Path.Combine(outsideRoot, "release.yml");
+                File.WriteAllText(outsideWorkflow, "name: OUTSIDE_SENTINEL");
+                var releaseWorkflow = Path.Combine(workflowDirectory, "release.yml");
+                File.Delete(releaseWorkflow);
+                File.CreateSymbolicLink(releaseWorkflow, outsideWorkflow);
+                break;
+            case 4:
+                ReplaceWithSymbolicLink(repository.Root.FullName, "NuGet.config", outsideRoot);
+                break;
+            case 5:
+                ReplaceWithSymbolicLink(repository.Root.FullName, "global.json", outsideRoot);
+                break;
+            case 6:
+                ReplaceWithSymbolicLink(repository.Root.FullName, "nugetready.json", outsideRoot);
+                break;
+            case 7:
+                ReplaceWithSymbolicLink(repository.Root.FullName, "scripts/inspect-package.ps1", outsideRoot);
+                break;
+            case 8:
+                var outsideAction = Directory.CreateDirectory(Path.Combine(outsideRoot, "action"));
+                File.WriteAllText(Path.Combine(outsideAction.FullName, "action.yml"), "name: OUTSIDE_SENTINEL");
+                var actionPath = Path.Combine(repository.Root.FullName, ".github", "actions", "publish");
+                Directory.CreateDirectory(Path.GetDirectoryName(actionPath)!);
+                Directory.CreateSymbolicLink(actionPath, outsideAction.FullName);
+                File.WriteAllText(
+                    Path.Combine(workflowDirectory, "release.yml"),
+                    File.ReadAllText(Path.Combine(workflowDirectory, "release.yml"))
+                        .Replace("uses: actions/download-artifact@v4", "uses: ./.github/actions/publish", StringComparison.Ordinal));
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(surface));
+        }
+    }
+
+    private static void ReplaceWithSymbolicLink(string repositoryRoot, string relativePath, string outsideRoot)
+    {
+        var repositoryPath = Path.Combine(repositoryRoot, relativePath.Replace('/', Path.DirectorySeparatorChar));
+        var outsidePath = Path.Combine(outsideRoot, Path.GetFileName(repositoryPath));
+        File.WriteAllText(outsidePath, "OUTSIDE_SENTINEL");
+        File.Delete(repositoryPath);
+        File.CreateSymbolicLink(repositoryPath, outsidePath);
     }
 
     private static string ReplaceRunWithBlockScalar(string workflow, string command, string replacement)

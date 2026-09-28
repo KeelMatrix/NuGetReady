@@ -12,6 +12,10 @@ internal sealed record WorkflowInspectionResult(IReadOnlyList<Failure> Failures,
 
 internal static class WorkflowPolicyInspector
 {
+    private static readonly AsyncLocal<RepositoryInspectionContext?> ActiveRepository = new();
+
+    internal static Action<string>? BeforeInspectionForTests { get; set; }
+
     private readonly record struct ExactCommandToken(string Value, bool IsQuoted, char Quote);
 
     private readonly record struct ExpressionReferenceAnalysis(
@@ -121,6 +125,49 @@ internal static class WorkflowPolicyInspector
         NuGetReadyConfig? config = null,
         string? configPath = null)
     {
+        RepositoryInspectionContext repository;
+        try
+        {
+            repository = RepositoryInspectionContext.Open(repositoryPath);
+        }
+        catch (ArtifactTreeLimitExceededException)
+        {
+            return new WorkflowInspectionResult(
+                new[] { new Failure("workflow-policy", "Repository policy inspection could not safely pin the repository tree.", true) },
+                true);
+        }
+        catch (IOException)
+        {
+            return new WorkflowInspectionResult(
+                new[] { new Failure("workflow-policy", "Repository policy inspection could not safely open the repository tree.", true) },
+                true);
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return new WorkflowInspectionResult(
+                new[] { new Failure("workflow-policy", "Repository policy inspection could not safely open the repository tree.", true) },
+                true);
+        }
+
+        var previous = ActiveRepository.Value;
+        ActiveRepository.Value = repository;
+        try
+        {
+            BeforeInspectionForTests?.Invoke(repository.RootPath);
+            return InspectPinned(repository.RootPath, config, configPath);
+        }
+        finally
+        {
+            ActiveRepository.Value = previous;
+            repository.Dispose();
+        }
+    }
+
+    private static WorkflowInspectionResult InspectPinned(
+        string repositoryPath,
+        NuGetReadyConfig? config = null,
+        string? configPath = null)
+    {
         var workflowDirectoryStatus = GetExactRepositoryPath(
             repositoryPath,
             ".github/workflows",
@@ -138,29 +185,27 @@ internal static class WorkflowPolicyInspector
                 true);
         }
 
-        string[] paths;
-        try
+        var enumerationStatus = ActiveRepository.Value!.EnumerateFiles(
+            ".github/workflows",
+            out var relativePaths);
+        if (enumerationStatus != RepositoryPathStatus.Exact)
         {
-            paths = Directory.EnumerateFiles(workflowDirectory, "*", SearchOption.AllDirectories)
-                .Where(path => path.EndsWith(".yml", StringComparison.OrdinalIgnoreCase) || path.EndsWith(".yaml", StringComparison.OrdinalIgnoreCase))
-                .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
-                .ThenBy(path => path, StringComparer.Ordinal)
-                .ToArray();
+            return new WorkflowInspectionResult(
+                new[] { new Failure("workflow-policy", "Release workflow files could not be enumerated safely inside the repository tree.", true) },
+                true);
         }
-        catch (IOException)
-        {
-            return new WorkflowInspectionResult(new[] { new Failure("workflow-policy", "Release workflow files could not be enumerated.", true) }, true);
-        }
-        catch (UnauthorizedAccessException)
-        {
-            return new WorkflowInspectionResult(new[] { new Failure("workflow-policy", "Release workflow files could not be enumerated.", true) }, true);
-        }
+
+        var paths = relativePaths
+            .Where(path => path.EndsWith(".yml", StringComparison.OrdinalIgnoreCase) || path.EndsWith(".yaml", StringComparison.OrdinalIgnoreCase))
+            .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(path => path, StringComparer.Ordinal)
+            .ToArray();
 
         var failures = new List<Failure>();
         var evaluated = false;
-        foreach (var path in paths)
+        foreach (var relativePath in paths)
         {
-            var relativePath = Path.GetRelativePath(repositoryPath, path).Replace(Path.DirectorySeparatorChar, '/');
+            var path = Path.Combine(repositoryPath, relativePath.Replace('/', Path.DirectorySeparatorChar));
             if (GetExactRepositoryPath(repositoryPath, relativePath, expectDirectory: false, out _) != RepositoryPathStatus.Exact ||
                 (!relativePath.EndsWith(".yml", StringComparison.Ordinal) &&
                  !relativePath.EndsWith(".yaml", StringComparison.Ordinal)))
@@ -170,28 +215,9 @@ internal static class WorkflowPolicyInspector
                 continue;
             }
 
-            string content;
-            try
+            if (!ActiveRepository.Value!.TryReadText(path, MaxWorkflowBytes, out var content))
             {
-                var file = new FileInfo(path);
-                if (file.Length > MaxWorkflowBytes)
-                {
-                    failures.Add(new Failure("workflow-policy", "A release workflow file is too large to inspect safely.", true));
-                    evaluated = true;
-                    continue;
-                }
-
-                content = File.ReadAllText(path);
-            }
-            catch (IOException)
-            {
-                failures.Add(new Failure("workflow-policy", "A release workflow file could not be inspected.", true));
-                evaluated = true;
-                continue;
-            }
-            catch (UnauthorizedAccessException)
-            {
-                failures.Add(new Failure("workflow-policy", "A release workflow file could not be inspected.", true));
+                failures.Add(new Failure("workflow-policy", "A release workflow file could not be inspected safely inside the repository tree.", true));
                 evaluated = true;
                 continue;
             }
@@ -234,7 +260,7 @@ internal static class WorkflowPolicyInspector
             .Where(job => !IsExplicitlyDisabled(job.Condition))
             .ToArray();
         var boundary = new HashSet<WorkflowJob>();
-        var indirectContext = new IndirectInspectionContext();
+        var indirectContext = new IndirectInspectionContext(ActiveRepository.Value!);
 
         var hasReleaseControl = workflow.HasPublicationShapedTrigger ||
                                 workflow.HasPublicationInput;
@@ -345,7 +371,7 @@ internal static class WorkflowPolicyInspector
         List<Failure> failures)
     {
         var publicationBoundary = BuildPublicationBoundary(repositoryPath, workflow);
-        var indirectPathContext = new IndirectInspectionContext();
+        var indirectPathContext = new IndirectInspectionContext(ActiveRepository.Value!);
         var unsupportedPublicationPath = InspectUnsupportedPublicationPaths(
             repositoryPath,
             publicationBoundary,
@@ -807,7 +833,21 @@ internal static class WorkflowPolicyInspector
                 return false;
             }
 
-            var config = suppliedConfig ?? ConfigurationLoader.Load(configPath);
+            NuGetReadyConfig config;
+            if (suppliedConfig is not null)
+            {
+                config = suppliedConfig;
+            }
+            else
+            {
+                if (!ActiveRepository.Value!.TryReadText(configPath, 1024 * 1024, out var configJson))
+                {
+                    failures.Add(Unsupported("The repository-root nugetready.json could not be read safely inside the pinned repository tree."));
+                    return false;
+                }
+
+                config = ConfigurationLoader.LoadJson(configJson);
+            }
             var packages = config.Packages!;
             if (packages.Count != 1)
             {
@@ -1378,75 +1418,14 @@ internal static class WorkflowPolicyInspector
         bool expectDirectory,
         out string resolvedPath)
     {
-        resolvedPath = string.Empty;
-        if (Path.IsPathRooted(relativePath) || relativePath.Contains('\\', StringComparison.Ordinal))
+        var context = ActiveRepository.Value;
+        if (context is null || !string.Equals(context.RootPath, Path.GetFullPath(repositoryPath), StringComparison.OrdinalIgnoreCase))
         {
-            return RepositoryPathStatus.Invalid;
-        }
-
-        var segments = relativePath.Split('/');
-        if (segments.Length == 0 || segments.Any(segment => segment.Length == 0 || segment is "." or ".."))
-        {
-            return RepositoryPathStatus.Invalid;
-        }
-
-        try
-        {
-            var current = Path.GetFullPath(repositoryPath);
-            if (!Directory.Exists(current))
-            {
-                return RepositoryPathStatus.Missing;
-            }
-
-            foreach (var segment in segments)
-            {
-                var matches = Directory.EnumerateFileSystemEntries(current)
-                    .Where(entry => string.Equals(Path.GetFileName(entry), segment, StringComparison.OrdinalIgnoreCase))
-                    .ToArray();
-                if (matches.Length == 0)
-                {
-                    return RepositoryPathStatus.Missing;
-                }
-
-                if (matches.Length != 1 ||
-                    !string.Equals(Path.GetFileName(matches[0]), segment, StringComparison.Ordinal))
-                {
-                    return RepositoryPathStatus.InexactCasing;
-                }
-
-                current = matches[0];
-            }
-
-            if (expectDirectory ? !Directory.Exists(current) : !File.Exists(current))
-            {
-                return RepositoryPathStatus.WrongKind;
-            }
-
-            resolvedPath = current;
-            return RepositoryPathStatus.Exact;
-        }
-        catch (IOException)
-        {
+            resolvedPath = string.Empty;
             return RepositoryPathStatus.Unavailable;
         }
-        catch (UnauthorizedAccessException)
-        {
-            return RepositoryPathStatus.Unavailable;
-        }
-        catch (ArgumentException)
-        {
-            return RepositoryPathStatus.Invalid;
-        }
-    }
 
-    private enum RepositoryPathStatus
-    {
-        Exact,
-        Missing,
-        InexactCasing,
-        WrongKind,
-        Unavailable,
-        Invalid
+        return context.GetExact(relativePath, expectDirectory, out resolvedPath);
     }
 
     private static bool HasSupportedNuGetConfiguration(string repositoryPath)
@@ -1458,14 +1437,13 @@ internal static class WorkflowPolicyInspector
                 return false;
             }
 
-            var file = new FileInfo(path);
-            if (!file.Exists || file.Length > 32 * 1024)
+            if (!ActiveRepository.Value!.TryReadBytes(path, 32 * 1024, out var bytes))
             {
                 return false;
             }
 
             var settings = new XmlReaderSettings { DtdProcessing = DtdProcessing.Prohibit };
-            using var reader = XmlReader.Create(path, settings);
+            using var reader = XmlReader.Create(new MemoryStream(bytes, writable: false), settings);
             var document = XDocument.Load(reader, LoadOptions.None);
             var root = document.Root;
             if (root is null || root.Name != "configuration" || root.Attributes().Any())
@@ -1520,13 +1498,12 @@ internal static class WorkflowPolicyInspector
                 return false;
             }
 
-            var file = new FileInfo(path);
-            if (!file.Exists || file.Length > 32 * 1024)
+            if (!ActiveRepository.Value!.TryReadBytes(path, 32 * 1024, out var bytes))
             {
                 return false;
             }
 
-            using var document = JsonDocument.Parse(File.ReadAllBytes(path));
+            using var document = JsonDocument.Parse(bytes);
             var root = document.RootElement;
             if (root.ValueKind != JsonValueKind.Object ||
                 root.EnumerateObject().Count() != 1 ||
@@ -1614,7 +1591,7 @@ internal static class WorkflowPolicyInspector
 
     private static bool HasIndirectPublicationPath(string repositoryPath, WorkflowStep step)
     {
-        var result = InspectIndirectPublicationPath(repositoryPath, step, new IndirectInspectionContext());
+        var result = InspectIndirectPublicationPath(repositoryPath, step, new IndirectInspectionContext(ActiveRepository.Value!));
         return result is not null && result != IndirectPublicationPath.ProvenNonPublishing;
     }
 
@@ -1801,18 +1778,18 @@ internal static class WorkflowPolicyInspector
 
         try
         {
-            string? metadataPath = null;
+            string? metadata = null;
             foreach (var metadataName in new[] { "action.yml", "action.yaml" })
             {
                 var candidate = Path.Combine(actionDirectory, metadataName);
-                if (File.Exists(candidate))
+                if (context.TryReadText(candidate, out var candidateContent))
                 {
-                    metadataPath = candidate;
+                    metadata = candidateContent;
                     break;
                 }
             }
 
-            if (metadataPath is null || !context.TryReadText(metadataPath, out var metadata))
+            if (metadata is null)
             {
                 return CacheCompositeResult(context, actionDirectory, IndirectPublicationPath.Unknown);
             }
@@ -1953,6 +1930,13 @@ internal static class WorkflowPolicyInspector
 
     private sealed class IndirectInspectionContext
     {
+        public IndirectInspectionContext(RepositoryInspectionContext repository)
+        {
+            Repository = repository;
+        }
+
+        public RepositoryInspectionContext Repository { get; }
+
         public HashSet<string> ActiveScripts { get; } = new(StringComparer.OrdinalIgnoreCase);
 
         public Dictionary<string, IndirectPublicationPath> ScriptResults { get; } = new(StringComparer.OrdinalIgnoreCase);
@@ -1970,26 +1954,15 @@ internal static class WorkflowPolicyInspector
         public bool TryReadText(string path, out string content)
         {
             content = string.Empty;
-            try
-            {
-                var file = new FileInfo(path);
-                if (!file.Exists || file.Length > MaxWorkflowBytes || BytesRead + file.Length > MaxIndirectPathBytes)
-                {
-                    return false;
-                }
-
-                content = File.ReadAllText(path);
-                BytesRead += file.Length;
-                return true;
-            }
-            catch (IOException)
-            {
-                return false;
-            }
-            catch (UnauthorizedAccessException)
-            {
-                return false;
-            }
+            var bytesRead = BytesRead;
+            var result = Repository.TryReadText(
+                path,
+                MaxWorkflowBytes,
+                ref bytesRead,
+                MaxIndirectPathBytes,
+                out content);
+            BytesRead = bytesRead;
+            return result;
         }
     }
 

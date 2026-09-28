@@ -185,7 +185,11 @@ internal sealed class ArtifactDirectoryHandle : IDisposable
         return OpenChild(name, exclusiveForLaunch: false);
     }
 
-    internal ArtifactDirectoryHandle OpenChild(string name, bool exclusiveForLaunch, Action? beforeAttribute = null)
+    internal ArtifactDirectoryHandle OpenChild(
+        string name,
+        bool exclusiveForLaunch,
+        Action? beforeAttribute = null,
+        bool requireNonDirectory = false)
     {
         EnsureUsable();
         if (string.IsNullOrEmpty(name) || name is "." or ".." || name.Contains('/') || name.Contains('\\'))
@@ -196,7 +200,7 @@ internal sealed class ArtifactDirectoryHandle : IDisposable
         SafeFileHandle childHandle;
         try
         {
-            childHandle = ArtifactNative.OpenRelative(Handle, name, exclusiveForLaunch);
+            childHandle = ArtifactNative.OpenRelative(Handle, name, exclusiveForLaunch, requireNonDirectory);
         }
         catch (ArtifactReparsePointException)
         {
@@ -214,6 +218,11 @@ internal sealed class ArtifactDirectoryHandle : IDisposable
             childHandle.Dispose();
             throw;
         }
+    }
+
+    internal ArtifactDirectoryHandle OpenFileForLaunch(string name)
+    {
+        return OpenChild(name, exclusiveForLaunch: true, requireNonDirectory: true);
     }
 
     public bool VerifyBinding()
@@ -409,11 +418,15 @@ internal static class ArtifactNative
         return new SafeFileHandle((IntPtr)descriptor, ownsHandle: true);
     }
 
-    public static SafeFileHandle OpenRelative(SafeFileHandle parent, string name, bool exclusiveForLaunch = false)
+    public static SafeFileHandle OpenRelative(
+        SafeFileHandle parent,
+        string name,
+        bool exclusiveForLaunch = false,
+        bool requireNonDirectory = false)
     {
         if (OperatingSystem.IsWindows())
         {
-            return OpenWindowsRelative(parent, name, exclusiveForLaunch);
+            return OpenWindowsRelative(parent, name, exclusiveForLaunch, requireNonDirectory);
         }
 
         var flags = UnixReadOnly | (OperatingSystem.IsMacOS() ? UnixNoFollowMacOs : UnixNoFollowLinux);
@@ -627,7 +640,11 @@ internal static class ArtifactNative
         return names;
     }
 
-    private static SafeFileHandle OpenWindowsRelative(SafeFileHandle parent, string name, bool exclusiveForLaunch)
+    private static SafeFileHandle OpenWindowsRelative(
+        SafeFileHandle parent,
+        string name,
+        bool exclusiveForLaunch,
+        bool requireNonDirectory)
     {
         var namePointer = Marshal.StringToHGlobalUni(name);
         var objectName = new UnicodeString
@@ -651,14 +668,16 @@ internal static class ArtifactNative
             Marshal.StructureToPtr(attributes, attributesPointer, fDeleteOld: false);
             var status = NtCreateFile(
                 out var handle,
-                FileListDirectory | FileReadAttributes | Synchronize,
+                exclusiveForLaunch && requireNonDirectory
+                    ? GenericRead | Synchronize
+                    : FileListDirectory | FileReadAttributes | Synchronize,
                 attributesPointer,
                 out _,
                 IntPtr.Zero,
                 0,
                 exclusiveForLaunch ? FileShareRead : FileShareRead | FileShareWrite | FileShareDelete,
                 FileOpenExisting,
-                FileSynchronousIoNonalert | FileOpenReparsePoint,
+                FileSynchronousIoNonalert | FileOpenReparsePoint | (requireNonDirectory ? FileNonDirectoryFile : 0),
                 IntPtr.Zero,
                 0);
             if (status < 0)

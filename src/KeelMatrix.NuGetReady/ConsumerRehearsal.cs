@@ -33,6 +33,7 @@ internal static class ConsumerRehearsal
     private const int DiagnosticLimit = 16 * 1024;
     private static readonly string[] PublicPackagePatterns = { "*" };
     internal static Action<string>? BeforeToolLaunchForTests { get; set; }
+    internal static Action<string>? BeforeToolLaunchSnapshotForTests { get; set; }
 
     public static IReadOnlyList<RehearsalOutcome> RunDetailed(
         NuGetReadyConfig config,
@@ -429,6 +430,7 @@ internal static class ConsumerRehearsal
         ToolLaunchSnapshot launch;
         try
         {
+            BeforeToolLaunchSnapshotForTests?.Invoke(toolPath);
             launch = ToolLaunchSnapshot.Create(toolPath, packageRoot, Path.GetFileName(executable), executableIdentity);
         }
         catch (IOException)
@@ -442,7 +444,16 @@ internal static class ConsumerRehearsal
 
         using (launch)
         {
-            BeforeToolLaunchForTests?.Invoke(executable);
+            BeforeToolLaunchForTests?.Invoke(launch.ExecutablePath);
+            if (!ToolLaunchSnapshot.CanLaunchSafely)
+            {
+                return Failure(
+                    package,
+                    "The installed tool could not be launched safely on this host because the apphost and its path-loaded dependencies cannot be bound through process creation.",
+                    true,
+                    string.Empty);
+            }
+
             var smoke = package.Smoke?.ToArray() ?? Array.Empty<string>();
             var run = await BoundedProcess.RunAsync(launch.ExecutablePath, smoke, packageRoot, environment, timeout, cancellationToken: cancellationToken).ConfigureAwait(false);
             var runOutcome = ClassifyProcessResult(run, ProcessPhase.ToolSmoke);
@@ -519,14 +530,23 @@ internal static class ConsumerRehearsal
 
     private sealed class ToolLaunchSnapshot : IDisposable
     {
-        private ToolLaunchSnapshot(string root, string executablePath)
+        private ToolLaunchSnapshot(
+            string root,
+            string executablePath,
+            ArtifactTreeHandle launchTree,
+            IReadOnlyList<ArtifactDirectoryHandle> launchEntries)
         {
             Root = root;
             ExecutablePath = executablePath;
+            LaunchTree = launchTree;
+            LaunchEntries = launchEntries;
         }
 
         private string Root { get; }
+        private ArtifactTreeHandle LaunchTree { get; }
+        private IReadOnlyList<ArtifactDirectoryHandle> LaunchEntries { get; }
         public string ExecutablePath { get; }
+        public static bool CanLaunchSafely => OperatingSystem.IsWindows();
 
         public static ToolLaunchSnapshot Create(
             string toolPath,
@@ -563,7 +583,28 @@ internal static class ConsumerRehearsal
                     throw new IOException("The pinned tool executable was not created as a regular file.");
                 }
 
-                return new ToolLaunchSnapshot(root, executable);
+                var launchTree = ArtifactTreeHandle.Open(root);
+                var launchEntries = new List<ArtifactDirectoryHandle>();
+                try
+                {
+                    HoldLaunchEntries(launchTree, launchTree.Root, launchEntries);
+                    if (!launchTree.VerifyBinding())
+                    {
+                        throw new IOException("The pinned tool launch image changed before it could be launched.");
+                    }
+
+                    return new ToolLaunchSnapshot(root, executable, launchTree, launchEntries);
+                }
+                catch
+                {
+                    foreach (var entry in launchEntries)
+                    {
+                        entry.Dispose();
+                    }
+
+                    launchTree.Dispose();
+                    throw;
+                }
             }
             catch
             {
@@ -625,8 +666,63 @@ internal static class ConsumerRehearsal
             }
         }
 
+        private static void HoldLaunchEntries(
+            ArtifactTreeHandle tree,
+            ArtifactDirectoryHandle directory,
+            ICollection<ArtifactDirectoryHandle> heldEntries)
+        {
+            foreach (var name in directory.EnumerateNames().OrderBy(name => name, StringComparer.Ordinal))
+            {
+                if (!tree.VerifyBinding() || !directory.VerifyBinding())
+                {
+                    throw new IOException("The pinned tool launch image changed while launch handles were being acquired.");
+                }
+
+                var observed = directory.OpenChild(name);
+                if (observed.IsReparsePoint)
+                {
+                    observed.Dispose();
+                    throw new IOException("The pinned tool launch image contains a reparse point.");
+                }
+
+                if (!observed.IsDirectory)
+                {
+                    ArtifactDirectoryHandle? launchEntry = null;
+                    try
+                    {
+                        launchEntry = directory.OpenFileForLaunch(name);
+                        if (launchEntry.IsReparsePoint || launchEntry.IsDirectory ||
+                            !string.Equals(launchEntry.Identity, observed.Identity, StringComparison.Ordinal))
+                        {
+                            launchEntry.Dispose();
+                            throw new IOException("The pinned tool launch image changed while launch handles were being acquired.");
+                        }
+
+                        heldEntries.Add(launchEntry);
+                        launchEntry = null;
+                    }
+                    finally
+                    {
+                        launchEntry?.Dispose();
+                        observed.Dispose();
+                    }
+
+                    continue;
+                }
+
+                heldEntries.Add(observed);
+                HoldLaunchEntries(tree, observed, heldEntries);
+            }
+        }
+
         public void Dispose()
         {
+            foreach (var entry in LaunchEntries)
+            {
+                entry.Dispose();
+            }
+
+            LaunchTree.Dispose();
             DeleteDirectory(new DirectoryInfo(Root));
         }
     }

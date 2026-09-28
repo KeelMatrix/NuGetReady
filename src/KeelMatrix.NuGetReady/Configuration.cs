@@ -50,6 +50,11 @@ internal static partial class ConfigurationLoader
             throw new NuGetReadyInfrastructureException("Configuration file could not be read.");
         }
 
+        return LoadJson(json);
+    }
+
+    public static NuGetReadyConfig LoadJson(string json)
+    {
         try
         {
             using var document = JsonDocument.Parse(json, new JsonDocumentOptions
