@@ -29,3 +29,8 @@ The 0.1.0 release is planned and unreleased.
 - Accepts customer-owned Trusted Publishing usernames in the supported workflow profile, with an optional explicit expected username for repositories that require one.
 - Snapshots counted package archives before inspection, uses one immutable snapshot for archive, dependency, feed, consumer, and provenance checks, and verifies the source files remain unchanged after the rehearsal.
 - Rejects tool smoke arguments outside `dotnetTool` expectations or containing embedded NUL characters, isolates generated consumers from ambient `Directory.Build.*` imports, escapes control characters in human-readable diagnostics, and inspects the exact release-built package bytes before release upload.
+
+### Fixed
+
+- Fails closed when an artifact root or any ancestor is rebound through a reparse point or rename-swap while the bounded archive snapshot is being established.
+- Restricts tool commands to one non-reserved executable basename and verifies the installed command is a direct child of the isolated tool directory before smoke execution.

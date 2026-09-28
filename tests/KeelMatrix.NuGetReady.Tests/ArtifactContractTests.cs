@@ -145,6 +145,26 @@ public sealed class ArtifactContractTests
     }
 
     [Fact]
+    public void Artifact_tree_rejects_a_reparse_point_in_an_ancestor_above_the_artifact_root()
+    {
+        using var fixture = PackageFixture.Create();
+        var package = fixture.AddPackage("Example.Core.1.2.3.nupkg", "Example.Core", "1.2.3");
+        var outside = Directory.CreateDirectory(Path.Combine(fixture.Root.FullName, "outside"));
+        var outsideArtifacts = Directory.CreateDirectory(Path.Combine(outside.FullName, "artifacts"));
+        File.Copy(package, Path.Combine(outsideArtifacts.FullName, Path.GetFileName(package)));
+
+        var apparentParent = Path.Combine(fixture.Root.FullName, "parent");
+        Directory.CreateSymbolicLink(apparentParent, outside.FullName);
+        var apparentArtifacts = Path.Combine(apparentParent, "artifacts");
+
+        var report = CheckRunner.Run(Config("Example.Core", "Example.Core.1.2.3.nupkg"), apparentArtifacts);
+
+        Assert.Equal(2, report.ExitCode);
+        Assert.Contains(report.Failures, failure => failure.CheckId == "artifact-set" && failure.IsError);
+        Assert.DoesNotContain(report.Failures, failure => failure.CheckId is "archive-metadata" or "archive-layout" or "archive-security" or "archive-parse");
+    }
+
+    [Fact]
     public void Artifact_tree_aggregate_compressed_size_is_bounded_before_snapshotting()
     {
         var current = ArtifactTreeLimits.MaxTotalCompressedArchiveBytes - 1;
@@ -254,6 +274,90 @@ public sealed class ArtifactContractTests
         }
     }
 
+    [Fact]
+    public void Rebound_artifact_root_after_snapshot_scan_is_rejected_before_opening_outside_bytes()
+    {
+        using var fixture = PackageFixture.Create();
+        var package = fixture.AddPackage("Example.Core.1.2.3.nupkg", "Example.Core", "1.2.3");
+        var symbols = fixture.AddSymbols("Example.Core.1.2.3.snupkg", "Example.Core", "1.2.3");
+        var outside = Directory.CreateDirectory(Path.Combine(fixture.Root.FullName, "outside-after-snapshot"));
+        File.WriteAllBytes(Path.Combine(outside.FullName, Path.GetFileName(package)), [1, 2, 3]);
+        File.WriteAllBytes(Path.Combine(outside.FullName, Path.GetFileName(symbols)), [4, 5, 6]);
+        var moved = fixture.ArtifactsPath + ".after-snapshot-original";
+        var linked = false;
+
+        var previous = ArtifactSnapshotSet.AfterScanForTests;
+        ArtifactSnapshotSet.AfterScanForTests = root =>
+        {
+            Directory.Move(root, moved);
+            Directory.CreateSymbolicLink(root, outside.FullName);
+            linked = true;
+        };
+
+        try
+        {
+            var report = CheckRunner.Run(Config("Example.Core", "Example.Core.1.2.3.nupkg", "Example.Core.1.2.3.snupkg"), fixture.ArtifactsPath);
+
+            Assert.True(linked, "The test filesystem must support a post-snapshot symbolic-link rebind seam.");
+            AssertSnapshotMutationFailure(report);
+        }
+        finally
+        {
+            ArtifactSnapshotSet.AfterScanForTests = previous;
+            if (linked && Directory.Exists(fixture.ArtifactsPath))
+            {
+                Directory.Delete(fixture.ArtifactsPath);
+            }
+
+            if (Directory.Exists(moved))
+            {
+                Directory.Move(moved, fixture.ArtifactsPath);
+            }
+        }
+    }
+
+    [Fact]
+    public void Rebound_regular_ancestor_after_snapshot_scan_is_rejected_before_opening_outside_bytes()
+    {
+        using var fixture = PackageFixture.Create();
+        var package = fixture.AddPackage("Example.Core.1.2.3.nupkg", "Example.Core", "1.2.3");
+        var parent = Directory.CreateDirectory(Path.Combine(fixture.Root.FullName, "nested-parent"));
+        var artifacts = Directory.CreateDirectory(Path.Combine(parent.FullName, "artifacts"));
+        File.Copy(package, Path.Combine(artifacts.FullName, Path.GetFileName(package)));
+        var moved = parent.FullName + ".original";
+        var rebound = false;
+
+        var previous = ArtifactSnapshotSet.AfterScanForTests;
+        ArtifactSnapshotSet.AfterScanForTests = root =>
+        {
+            Directory.Move(parent.FullName, moved);
+            var replacement = Directory.CreateDirectory(Path.Combine(parent.FullName, "artifacts"));
+            File.WriteAllBytes(Path.Combine(replacement.FullName, Path.GetFileName(package)), [1, 2, 3]);
+            rebound = true;
+        };
+
+        try
+        {
+            var report = CheckRunner.Run(Config("Example.Core", "Example.Core.1.2.3.nupkg"), artifacts.FullName);
+
+            Assert.True(rebound, "The test filesystem must support a regular ancestor rename-swap seam.");
+            AssertSnapshotMutationFailure(report);
+        }
+        finally
+        {
+            ArtifactSnapshotSet.AfterScanForTests = previous;
+            if (Directory.Exists(parent.FullName))
+            {
+                Directory.Delete(parent.FullName, recursive: true);
+            }
+
+            if (Directory.Exists(moved))
+            {
+                Directory.Move(moved, parent.FullName);
+            }
+        }
+    }
+
     private static ReadinessReport RunAfterScanMutation(PackageFixture fixture, Action<string> mutation)
     {
         var previous = ArtifactTreeScanner.AfterScanForTests;
@@ -276,14 +380,14 @@ public sealed class ArtifactContractTests
         Assert.All(report.Checks.Where(check => check.Id != "artifact-set"), check => Assert.Equal("not-run", check.Status));
     }
 
-    private static NuGetReadyConfig Config(string id, string artifact)
+    private static NuGetReadyConfig Config(string id, params string[] artifacts)
     {
         return new NuGetReadyConfig
         {
             SchemaVersion = 1,
             Packages = new List<PackageExpectation>
             {
-                new() { Id = id, Kind = "library", Version = "1.2.3", Artifacts = new List<string> { artifact } }
+                new() { Id = id, Kind = "library", Version = "1.2.3", Artifacts = artifacts.ToList() }
             }
         };
     }

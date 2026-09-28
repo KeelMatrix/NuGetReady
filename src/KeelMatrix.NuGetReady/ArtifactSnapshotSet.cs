@@ -9,20 +9,19 @@ internal sealed class ArtifactSnapshotSet : IDisposable
     private readonly string sourceRoot;
     private readonly string snapshotRoot;
     private readonly Dictionary<string, string> snapshotByRelativePath;
-    private readonly Dictionary<string, string> sourceHashes;
     private readonly ArtifactTreeScanResult sourceScan;
+
+    internal static Action<string>? AfterScanForTests { get; set; }
 
     private ArtifactSnapshotSet(
         string sourceRoot,
         string snapshotRoot,
         Dictionary<string, string> snapshotByRelativePath,
-        Dictionary<string, string> sourceHashes,
         ArtifactTreeScanResult sourceScan)
     {
         this.sourceRoot = sourceRoot;
         this.snapshotRoot = snapshotRoot;
         this.snapshotByRelativePath = snapshotByRelativePath;
-        this.sourceHashes = sourceHashes;
         this.sourceScan = sourceScan;
     }
 
@@ -32,14 +31,19 @@ internal sealed class ArtifactSnapshotSet : IDisposable
     {
         var sourceRoot = Path.GetFullPath(artifactsPath);
         var currentScan = ArtifactTreeScanner.Scan(sourceRoot);
+        AfterScanForTests?.Invoke(sourceRoot);
         if (!sourceScan.HasSameTree(currentScan))
         {
             throw new IOException("The artifact tree changed after it was scanned and could not be snapshotted consistently.");
         }
 
+        if (!ArtifactTreeScanner.PathMatchesIdentity(sourceRoot, currentScan))
+        {
+            throw new IOException("The artifact tree path identity changed after it was scanned and could not be snapshotted consistently.");
+        }
+
         var snapshotRoot = Directory.CreateTempSubdirectory("nugetready-artifacts-").FullName;
         var snapshots = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        var hashes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         var aggregateBytes = 0L;
         try
         {
@@ -49,24 +53,34 @@ internal sealed class ArtifactSnapshotSet : IDisposable
                          .ThenBy(path => path, StringComparer.Ordinal))
             {
                 var normalized = Normalize(relativePath);
-                var sourcePath = Path.GetFullPath(Path.Combine(sourceRoot, normalized.Replace('/', Path.DirectorySeparatorChar)));
-                if (!File.Exists(sourcePath))
+                var sourcePath = Path.Combine(sourceRoot, normalized.Replace('/', Path.DirectorySeparatorChar));
+                var expectedEntry = currentScan.Entries
+                    .Single(entry => string.Equals(entry.RelativePath, normalized, StringComparison.Ordinal));
+                if (!ArtifactTreeScanner.PathMatchesIdentity(sourceRoot, currentScan))
                 {
-                    throw new IOException($"Artifact '{normalized}' was not found while taking the artifact snapshot.");
-                }
-
-                if ((File.GetAttributes(sourcePath) & FileAttributes.ReparsePoint) != 0)
-                {
-                    throw new IOException($"Artifact '{normalized}' is a reparse point and cannot be snapshotted.");
+                    throw new IOException("The artifact tree path identity changed while the immutable artifact snapshot was being taken.");
                 }
 
                 var snapshotPath = Path.Combine(snapshotRoot, normalized.Replace('/', Path.DirectorySeparatorChar));
                 Directory.CreateDirectory(Path.GetDirectoryName(snapshotPath)!);
-                hashes[normalized] = CopyAndHashBounded(sourcePath, snapshotPath, ref aggregateBytes);
+                using var source = ArtifactPathIdentityProvider.OpenReadNoFollow(sourcePath);
+                var openedIdentity = ArtifactPathIdentityProvider.Capture(sourcePath);
+                if (openedIdentity.IsReparsePoint || !string.Equals(openedIdentity.Value, expectedEntry.Identity, StringComparison.Ordinal))
+                {
+                    throw new IOException($"Artifact '{normalized}' changed identity while the immutable artifact snapshot was being taken.");
+                }
+
+                var copiedHash = CopyAndHash(source, snapshotPath, ref aggregateBytes);
+                var expectedHash = expectedEntry.ContentHash;
+                if (!string.Equals(copiedHash, expectedHash, StringComparison.Ordinal))
+                {
+                    throw new IOException($"Artifact '{normalized}' changed while the immutable artifact snapshot was taken.");
+                }
+
                 snapshots[normalized] = snapshotPath;
             }
 
-            return new ArtifactSnapshotSet(sourceRoot, snapshotRoot, snapshots, hashes, sourceScan);
+            return new ArtifactSnapshotSet(sourceRoot, snapshotRoot, snapshots, sourceScan);
         }
         catch
         {
@@ -98,7 +112,8 @@ internal sealed class ArtifactSnapshotSet : IDisposable
     {
         try
         {
-            if (!sourceScan.HasSameTree(ArtifactTreeScanner.Scan(sourceRoot)))
+            if (!ArtifactTreeScanner.PathMatchesIdentity(sourceRoot, sourceScan) ||
+                !sourceScan.HasSameTree(ArtifactTreeScanner.Scan(sourceRoot)))
             {
                 return false;
             }
@@ -110,28 +125,6 @@ internal sealed class ArtifactSnapshotSet : IDisposable
         catch (UnauthorizedAccessException)
         {
             return false;
-        }
-
-        foreach (var pair in sourceHashes)
-        {
-            var sourcePath = Path.Combine(sourceRoot, pair.Key.Replace('/', Path.DirectorySeparatorChar));
-            try
-            {
-                if (!File.Exists(sourcePath) ||
-                    (File.GetAttributes(sourcePath) & FileAttributes.ReparsePoint) != 0 ||
-                    !string.Equals(ComputeHash(sourcePath), pair.Value, StringComparison.Ordinal))
-                {
-                    return false;
-                }
-            }
-            catch (IOException)
-            {
-                return false;
-            }
-            catch (UnauthorizedAccessException)
-            {
-                return false;
-            }
         }
 
         return true;
@@ -175,37 +168,10 @@ internal sealed class ArtifactSnapshotSet : IDisposable
         return Convert.ToBase64String(hash.GetHashAndReset());
     }
 
-    private static string CopyAndHashBounded(string sourcePath, string destinationPath, ref long aggregateBytes)
+    private static string CopyAndHash(Stream source, string destinationPath, ref long aggregateBytes)
     {
-        using var source = File.OpenRead(sourcePath);
         using var destination = File.Create(destinationPath);
         return CopyAndHash(source, destination, ref aggregateBytes);
-    }
-
-    private static string ComputeHash(string path)
-    {
-        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA512);
-        using var stream = File.OpenRead(path);
-        var buffer = new byte[64 * 1024];
-        var total = 0L;
-        while (true)
-        {
-            var read = stream.Read(buffer, 0, buffer.Length);
-            if (read == 0)
-            {
-                break;
-            }
-
-            total = checked(total + read);
-            if (total > MaxCompressedArtifactBytes)
-            {
-                throw new ArchiveLimitExceededException($"Artifact exceeds the {MaxCompressedArtifactBytes} byte compressed-artifact limit.");
-            }
-
-            hash.AppendData(buffer, 0, read);
-        }
-
-        return Convert.ToBase64String(hash.GetHashAndReset());
     }
 
     private static string Normalize(string path) => path.Replace('\\', '/').TrimStart('/');

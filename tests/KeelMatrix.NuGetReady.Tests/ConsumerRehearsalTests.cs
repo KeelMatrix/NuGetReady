@@ -201,6 +201,88 @@ public sealed class ConsumerRehearsalTests
     }
 
     [Fact]
+    public void Tool_rehearsal_rejects_a_command_that_does_not_match_the_installed_tool_metadata()
+    {
+        using var corpus = PackedCorpus.Create();
+        var package = corpus.Pack("Tool/Tool.csproj");
+        var config = Config(new PackageExpectation
+        {
+            Id = "Fixture.Tool",
+            Kind = "dotnetTool",
+            Version = "1.0.0",
+            Artifacts = Artifacts(package),
+            Command = "not-the-tool",
+            Smoke = new List<string> { "--help" }
+        });
+
+        var outcomes = ConsumerRehearsal.RunDetailed(
+            config,
+            corpus.OutputPath,
+            TimeSpan.FromMinutes(2),
+            new ConsumerRehearsalOptions(PublicFeedPath: Directory.CreateDirectory(Path.Combine(corpus.Root.FullName, "empty-public-feed")).FullName));
+
+        Assert.Single(outcomes);
+        Assert.NotEqual("pass", outcomes[0].Result.Status);
+        Assert.Contains("command", outcomes[0].Result.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Tool_rehearsal_accepts_the_platform_executable_extension_boundary()
+    {
+        using var corpus = PackedCorpus.Create();
+        var package = corpus.Pack("Tool/Tool.csproj");
+        var command = OperatingSystem.IsWindows() ? "fixture-tool" : "fixture-tool";
+        var config = Config(new PackageExpectation
+        {
+            Id = "Fixture.Tool",
+            Kind = "dotnetTool",
+            Version = "1.0.0",
+            Artifacts = Artifacts(package),
+            Command = command,
+            Smoke = new List<string> { "--help" }
+        });
+
+        var outcomes = ConsumerRehearsal.RunDetailed(
+            config,
+            corpus.OutputPath,
+            TimeSpan.FromMinutes(2),
+            new ConsumerRehearsalOptions(PublicFeedPath: Directory.CreateDirectory(Path.Combine(corpus.Root.FullName, "empty-public-feed")).FullName));
+
+        Assert.Single(outcomes);
+        Assert.Equal("pass", outcomes[0].Result.Status);
+    }
+
+    [Fact]
+    public void Windows_tool_rehearsal_accepts_an_explicit_exe_command_name()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        using var corpus = PackedCorpus.Create();
+        var package = corpus.Pack("Tool/Tool.csproj");
+        var config = Config(new PackageExpectation
+        {
+            Id = "Fixture.Tool",
+            Kind = "dotnetTool",
+            Version = "1.0.0",
+            Artifacts = Artifacts(package),
+            Command = "fixture-tool.exe",
+            Smoke = new List<string> { "--help" }
+        });
+
+        var outcomes = ConsumerRehearsal.RunDetailed(
+            config,
+            corpus.OutputPath,
+            TimeSpan.FromMinutes(2),
+            new ConsumerRehearsalOptions(PublicFeedPath: Directory.CreateDirectory(Path.Combine(corpus.Root.FullName, "empty-public-feed")).FullName));
+
+        Assert.Single(outcomes);
+        Assert.Equal("pass", outcomes[0].Result.Status);
+    }
+
+    [Fact]
     public void Tool_install_rejects_changed_non_dll_payload_even_when_the_smoke_command_still_succeeds()
     {
         using var corpus = PackedCorpus.Create();

@@ -209,14 +209,20 @@ internal static partial class ConfigurationLoader
                 throw new NuGetReadyInputException("Tool smoke arguments are too large or contain an embedded NUL character.");
             }
 
-            if (package.Command is not null && (package.Command.Length is 0 or > 100 || package.Command.Any(char.IsWhiteSpace)))
+            if (package.Command is not null && !ToolCommandPolicy.IsValid(package.Command))
             {
-                throw new NuGetReadyInputException("A tool command must be a single non-empty name.");
+                throw new NuGetReadyInputException("A tool command must be a single non-reserved executable name.");
             }
 
             if (package.Command is not null && !package.Kind.Equals("dotnetTool", StringComparison.OrdinalIgnoreCase))
             {
                 throw new NuGetReadyInputException("Only dotnetTool packages may declare a tool command.");
+            }
+
+            if (package.Kind.Equals("dotnetTool", StringComparison.OrdinalIgnoreCase) &&
+                !ToolCommandPolicy.IsValid(package.Command ?? package.Id))
+            {
+                throw new NuGetReadyInputException("A tool command must be a single non-reserved executable name.");
             }
         }
     }

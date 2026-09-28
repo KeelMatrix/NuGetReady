@@ -416,15 +416,9 @@ internal static class ConsumerRehearsal
         }
 
         var command = package.Command ?? package.Id!;
-        var executable = Path.Combine(toolPath, OperatingSystem.IsWindows() ? command + ".exe" : command);
-        if (!File.Exists(executable))
+        if (!TryResolveToolExecutable(toolPath, command, out var executable))
         {
-            executable = Path.Combine(toolPath, command);
-        }
-
-        if (!File.Exists(executable))
-        {
-            return Failure(package, "The installed tool command was not created.", false, string.Empty);
+            return Failure(package, "The configured tool command was not created as a single executable child of the isolated tool directory.", false, string.Empty);
         }
 
         var smoke = package.Smoke?.ToArray() ?? Array.Empty<string>();
@@ -433,6 +427,57 @@ internal static class ConsumerRehearsal
         return runOutcome.Passed
             ? Success(package, "Isolated tool installed and safe smoke command succeeded.", runOutcome.Diagnostic)
             : Failure(package, "The installed tool safe smoke command failed.", runOutcome.IsError, runOutcome.Diagnostic);
+    }
+
+    private static bool TryResolveToolExecutable(string toolPath, string command, out string executable)
+    {
+        executable = string.Empty;
+        if (!ToolCommandPolicy.IsValid(command))
+        {
+            return false;
+        }
+
+        var isolatedRoot = Path.GetFullPath(toolPath).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        var candidates = OperatingSystem.IsWindows()
+            ? new[] { command.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) ? command : command + ".exe", command }
+            : new[] { command };
+
+        foreach (var candidate in candidates.Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            var path = Path.GetFullPath(Path.Combine(isolatedRoot, candidate));
+            if (!string.Equals(Path.GetDirectoryName(path)?.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar), isolatedRoot, OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal) ||
+                !string.Equals(Path.GetFileName(path), candidate, OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            if (!File.Exists(path))
+            {
+                continue;
+            }
+
+            try
+            {
+                var attributes = File.GetAttributes(path);
+                if ((attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0)
+                {
+                    return false;
+                }
+            }
+            catch (IOException)
+            {
+                return false;
+            }
+            catch (UnauthorizedAccessException)
+            {
+                return false;
+            }
+
+            executable = path;
+            return true;
+        }
+
+        return false;
     }
 
     private static async Task<ProcessResult> RunDotnetAsync(

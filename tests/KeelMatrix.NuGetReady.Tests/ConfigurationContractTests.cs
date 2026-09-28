@@ -156,6 +156,55 @@ public sealed class ConfigurationContractTests
         Assert.Contains("embedded NUL", nulException.Message, StringComparison.Ordinal);
     }
 
+    [Theory]
+    [InlineData("../outside.exe")]
+    [InlineData("..\\outside.exe")]
+    [InlineData("./tool")]
+    [InlineData(".\\tool")]
+    [InlineData("/bin/sh")]
+    [InlineData("\\\\server\\share\\tool.exe")]
+    [InlineData("C:/Windows/System32/cmd.exe")]
+    [InlineData("C:\\Windows\\System32\\cmd.exe")]
+    [InlineData("C:tool.exe")]
+    [InlineData("tool:name")]
+    [InlineData("CON")]
+    [InlineData("nul.exe")]
+    [InlineData("COM¹")]
+    [InlineData("LPT³.exe")]
+    public void Tool_command_must_be_a_single_non_reserved_executable_name(string command)
+    {
+        using var fixture = PackageFixture.Create();
+        var jsonCommand = command.Replace("\\", "\\\\", StringComparison.Ordinal);
+        var path = WriteConfig(fixture, $$"""
+            {
+              "schemaVersion": 1,
+              "packages": [{ "id": "Example", "kind": "dotnetTool", "version": "1.0.0", "artifacts": ["Example.1.0.0.nupkg"], "command": "{{jsonCommand}}" }]
+            }
+            """);
+
+        var exception = Assert.Throws<NuGetReadyInputException>(() => ConfigurationLoader.Load(path));
+
+        Assert.Contains("single", exception.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("fixture-tool")]
+    [InlineData("fixture-tool.exe")]
+    public void Tool_command_accepts_a_single_basename_with_an_optional_executable_extension(string command)
+    {
+        using var fixture = PackageFixture.Create();
+        var path = WriteConfig(fixture, $$"""
+            {
+              "schemaVersion": 1,
+              "packages": [{ "id": "Example", "kind": "dotnetTool", "version": "1.0.0", "artifacts": ["Example.1.0.0.nupkg"], "command": "{{command}}" }]
+            }
+            """);
+
+        var config = ConfigurationLoader.Load(path);
+
+        Assert.Equal(command, config.Packages!.Single().Command);
+    }
+
     private static string WriteConfig(PackageFixture fixture, string json)
     {
         var path = Path.Combine(fixture.Root.FullName, "nugetready.json");
