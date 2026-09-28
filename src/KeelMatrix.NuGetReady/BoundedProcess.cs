@@ -631,6 +631,11 @@ internal static class UnixProcessSupervisor
                 return 125;
             }
 
+            if (setpgid(child, child) != 0 && getpgid(child) != child)
+            {
+                return 125;
+            }
+
             var processGroupId = getpgid(child);
             if (processGroupId <= 0 || processGroupId == getpgrp())
             {
@@ -705,6 +710,9 @@ internal static class UnixProcessSupervisor
     [DllImport("libc", SetLastError = true)]
     private static extern int getpgid(int processId);
 
+    [DllImport("libc", SetLastError = true)]
+    private static extern int setpgid(int processId, int processGroupId);
+
     private const short PosixSpawnSetProcessGroup = 0x2;
     private const int PosixSpawnAttributeStorageSize = 512;
 
@@ -766,7 +774,7 @@ internal static class UnixProcessSupervisor
 
     private static bool KillAndVerifyProcessGroup(int processGroupId)
     {
-        _ = kill(-processGroupId, SigKill);
+        _ = killpg(processGroupId, SigKill);
         var deadline = DateTime.UtcNow + (OperatingSystem.IsMacOS()
             ? TimeSpan.FromSeconds(5)
             : TimeSpan.FromMilliseconds(250));
@@ -775,7 +783,7 @@ internal static class UnixProcessSupervisor
             // A descendant can fork into the target group between the initial
             // signal and the first observation. Re-issue the group kill while
             // the bounded verification window remains open.
-            _ = kill(-processGroupId, SigKill);
+            _ = killpg(processGroupId, SigKill);
 
             if (OperatingSystem.IsLinux())
             {
@@ -784,7 +792,7 @@ internal static class UnixProcessSupervisor
                 }
             }
 
-            var groupProbe = kill(-processGroupId, 0);
+            var groupProbe = killpg(processGroupId, 0);
             if (groupProbe != 0)
             {
                 var groupError = Marshal.GetLastWin32Error();
@@ -805,7 +813,7 @@ internal static class UnixProcessSupervisor
             return true;
         }
 
-        return kill(-processGroupId, 0) != 0 &&
+        return killpg(processGroupId, 0) != 0 &&
             Marshal.GetLastWin32Error() == NoSuchProcessError &&
             (!OperatingSystem.IsLinux() || ReapDescendants());
     }
@@ -869,6 +877,9 @@ internal static class UnixProcessSupervisor
 
     [DllImport("libc", SetLastError = true)]
     private static extern int kill(int processId, int signal);
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int killpg(int processGroupId, int signal);
 
     [DllImport("libc", SetLastError = true)]
     private static extern int waitpid(int processId, out int status, int options);
