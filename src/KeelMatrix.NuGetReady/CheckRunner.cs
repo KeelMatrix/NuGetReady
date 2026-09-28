@@ -125,6 +125,7 @@ internal static class CheckRunner
         if (!artifactTreeMatchesTheDeclaration)
         {
             MarkDownstreamChecksNotRun(checkStates);
+            artifactScan.Dispose();
             return BuildReport(expectedArtifacts.Length, actualArtifacts.Values.Sum(paths => paths.Count), failures, Array.Empty<RehearsalResult>(), checkStates);
         }
 
@@ -137,180 +138,190 @@ internal static class CheckRunner
         {
             failures["artifact-set"].Add(new Failure("artifact-set", exception.Message, true));
             MarkDownstreamChecksNotRun(checkStates);
+            artifactScan.Dispose();
             return BuildReport(expectedArtifacts.Length, actualArtifacts.Values.Sum(paths => paths.Count), failures, Array.Empty<RehearsalResult>(), checkStates);
         }
         catch (IOException)
         {
             failures["artifact-set"].Add(new Failure("artifact-set", "Artifact files could not be snapshotted for immutable inspection.", true));
             MarkDownstreamChecksNotRun(checkStates);
+            artifactScan.Dispose();
             return BuildReport(expectedArtifacts.Length, actualArtifacts.Values.Sum(paths => paths.Count), failures, Array.Empty<RehearsalResult>(), checkStates);
         }
         catch (UnauthorizedAccessException)
         {
             failures["artifact-set"].Add(new Failure("artifact-set", "Artifact files could not be snapshotted for immutable inspection.", true));
             MarkDownstreamChecksNotRun(checkStates);
+            artifactScan.Dispose();
             return BuildReport(expectedArtifacts.Length, actualArtifacts.Values.Sum(paths => paths.Count), failures, Array.Empty<RehearsalResult>(), checkStates);
         }
 
         using (snapshots)
         {
-            if (!snapshots.VerifySourcesUnchanged())
+            try
             {
-                failures["artifact-set"].Add(new Failure(
-                    "artifact-set",
-                    "The artifact tree changed after it was scanned; the check result is unproven.",
-                    true));
-                MarkDownstreamChecksNotRun(checkStates);
-                return BuildReport(expectedArtifacts.Length, actualArtifacts.Values.Sum(paths => paths.Count), failures, Array.Empty<RehearsalResult>(), checkStates);
-            }
-
-            foreach (var expected in expectedArtifacts.OrderBy(name => name, StringComparer.OrdinalIgnoreCase).ThenBy(name => name, StringComparer.Ordinal))
-            {
-                if (!actualArtifacts.TryGetValue(expected, out var paths) || paths.Count != 1 || paths[0].Contains('/', StringComparison.Ordinal))
+                if (!snapshots.VerifySourcesUnchanged())
                 {
-                    continue;
+                    failures["artifact-set"].Add(new Failure(
+                        "artifact-set",
+                        "The artifact tree changed after it was scanned; the check result is unproven.",
+                        true));
+                    MarkDownstreamChecksNotRun(checkStates);
+                    return BuildReport(expectedArtifacts.Length, actualArtifacts.Values.Sum(paths => paths.Count), failures, Array.Empty<RehearsalResult>(), checkStates);
                 }
 
-                var package = expectations[expected];
-                if (!snapshots.TryGetByRelativePath(paths[0], out var absolutePath))
+                foreach (var expected in expectedArtifacts.OrderBy(name => name, StringComparer.OrdinalIgnoreCase).ThenBy(name => name, StringComparer.Ordinal))
                 {
-                    failures["artifact-set"].Add(new Failure("artifact-set", $"Expected artifact '{expected}' was not available in the immutable artifact snapshot.", true));
-                    continue;
-                }
-                try
-                {
-                    string? mainPackagePath = null;
-                    if (expected.EndsWith(".snupkg", StringComparison.OrdinalIgnoreCase))
+                    if (!actualArtifacts.TryGetValue(expected, out var paths) || paths.Count != 1 || paths[0].Contains('/', StringComparison.Ordinal))
                     {
-                        var mainArtifact = PackageArtifacts.Primary(package);
-                        if (mainArtifact is not null && actualArtifacts.TryGetValue(mainArtifact, out var mainPaths) && mainPaths.Count == 1)
+                        continue;
+                    }
+
+                    var package = expectations[expected];
+                    if (!snapshots.TryGetByRelativePath(paths[0], out var absolutePath))
+                    {
+                        failures["artifact-set"].Add(new Failure("artifact-set", $"Expected artifact '{expected}' was not available in the immutable artifact snapshot.", true));
+                        continue;
+                    }
+                    try
+                    {
+                        string? mainPackagePath = null;
+                        if (expected.EndsWith(".snupkg", StringComparison.OrdinalIgnoreCase))
                         {
-                            snapshots.TryGetByRelativePath(mainPaths[0], out mainPackagePath);
+                            var mainArtifact = PackageArtifacts.Primary(package);
+                            if (mainArtifact is not null && actualArtifacts.TryGetValue(mainArtifact, out var mainPaths) && mainPaths.Count == 1)
+                            {
+                                snapshots.TryGetByRelativePath(mainPaths[0], out mainPackagePath);
+                            }
+                        }
+
+                        var inspectionFailures = ArchiveInspector.Inspect(
+                            absolutePath,
+                            package,
+                            expected.EndsWith(".snupkg", StringComparison.OrdinalIgnoreCase),
+                            mainPackagePath,
+                            expected);
+                        foreach (var failure in inspectionFailures)
+                        {
+                            failures[failure.CheckId].Add(failure);
                         }
                     }
-
-                    var inspectionFailures = ArchiveInspector.Inspect(
-                        absolutePath,
-                        package,
-                        expected.EndsWith(".snupkg", StringComparison.OrdinalIgnoreCase),
-                        mainPackagePath,
-                        expected);
-                    foreach (var failure in inspectionFailures)
+                    catch (NuGetReadyInputException exception)
                     {
-                        failures[failure.CheckId].Add(failure);
+                        failures["archive-parse"].Add(FailureContext.ForArchive(
+                            new Failure("archive-parse", exception.Message, true),
+                            package,
+                            expected));
+                    }
+                    catch (ArchiveLimitExceededException exception)
+                    {
+                        failures["archive-parse"].Add(FailureContext.ForArchive(
+                            new Failure("archive-parse", exception.Message, true),
+                            package,
+                            expected));
+                    }
+                    catch (Exception)
+                    {
+                        failures["archive-parse"].Add(FailureContext.ForArchive(
+                            new Failure("archive-parse", "A package archive could not be parsed as a NuGet archive.", true),
+                            package,
+                            expected));
                     }
                 }
-                catch (NuGetReadyInputException exception)
-                {
-                    failures["archive-parse"].Add(FailureContext.ForArchive(
-                        new Failure("archive-parse", exception.Message, true),
-                        package,
-                        expected));
-                }
-                catch (ArchiveLimitExceededException exception)
-                {
-                    failures["archive-parse"].Add(FailureContext.ForArchive(
-                        new Failure("archive-parse", exception.Message, true),
-                        package,
-                        expected));
-                }
-                catch (Exception)
-                {
-                    failures["archive-parse"].Add(FailureContext.ForArchive(
-                        new Failure("archive-parse", "A package archive could not be parsed as a NuGet archive.", true),
-                        package,
-                        expected));
-                }
-            }
 
-            var archiveContractBlocked = failures
-                .Where(pair => pair.Key is "archive-metadata" or "archive-layout" or "dependency-groups" or "archive-security" or "archive-parse")
-                .SelectMany(pair => pair.Value)
-                .Any(failure => !failure.IsWarning);
-            if (!archiveContractBlocked)
-            {
-                AddDuplicatePrimaryIdentityFailures(snapshots, actualArtifacts, failures["artifact-set"]);
-            }
-
-            if (!archiveContractBlocked)
-            {
-                foreach (var failure in DependencyCoherence.Inspect(config, snapshots, actualArtifacts))
+                var archiveContractBlocked = failures
+                    .Where(pair => pair.Key is "archive-metadata" or "archive-layout" or "dependency-groups" or "archive-security" or "archive-parse")
+                    .SelectMany(pair => pair.Value)
+                    .Any(failure => !failure.IsWarning);
+                if (!archiveContractBlocked)
                 {
-                    failures["dependency-coherence"].Add(failure);
-                }
-            }
-            else
-            {
-                MarkIfEmpty(failures, checkStates, "archive-metadata");
-                MarkIfEmpty(failures, checkStates, "archive-layout");
-                MarkIfEmpty(failures, checkStates, "dependency-groups");
-                MarkIfEmpty(failures, checkStates, "archive-security");
-                checkStates["dependency-coherence"] = CheckContract.NotRun;
-            }
-
-            var releaseIdentityBlocked = HasBlockingFailure(failures["archive-metadata"]);
-            if (repositoryPath is not null && !archiveContractBlocked && !releaseIdentityBlocked)
-            {
-                var workflowInspection = WorkflowPolicyInspector.InspectDetailed(repositoryPath, config, configPath);
-                foreach (var failure in workflowInspection.Failures)
-                {
-                    failures["workflow-policy"].Add(failure);
+                    AddDuplicatePrimaryIdentityFailures(snapshots, actualArtifacts, failures["artifact-set"]);
                 }
 
-                if (!workflowInspection.Evaluated)
+                if (!archiveContractBlocked)
+                {
+                    foreach (var failure in DependencyCoherence.Inspect(config, snapshots, actualArtifacts))
+                    {
+                        failures["dependency-coherence"].Add(failure);
+                    }
+                }
+                else
+                {
+                    MarkIfEmpty(failures, checkStates, "archive-metadata");
+                    MarkIfEmpty(failures, checkStates, "archive-layout");
+                    MarkIfEmpty(failures, checkStates, "dependency-groups");
+                    MarkIfEmpty(failures, checkStates, "archive-security");
+                    checkStates["dependency-coherence"] = CheckContract.NotRun;
+                }
+
+                var releaseIdentityBlocked = HasBlockingFailure(failures["archive-metadata"]);
+                if (repositoryPath is not null && !archiveContractBlocked && !releaseIdentityBlocked)
+                {
+                    var workflowInspection = WorkflowPolicyInspector.InspectDetailed(repositoryPath, config, configPath);
+                    foreach (var failure in workflowInspection.Failures)
+                    {
+                        failures["workflow-policy"].Add(failure);
+                    }
+
+                    if (!workflowInspection.Evaluated)
+                    {
+                        checkStates["workflow-policy"] = CheckContract.NotApplicable;
+                    }
+                }
+                else if (repositoryPath is null)
                 {
                     checkStates["workflow-policy"] = CheckContract.NotApplicable;
                 }
-            }
-            else if (repositoryPath is null)
-            {
-                checkStates["workflow-policy"] = CheckContract.NotApplicable;
-            }
-            else
-            {
-                checkStates["workflow-policy"] = CheckContract.NotRun;
-            }
-
-            var rehearsals = Array.Empty<RehearsalResult>();
-            var blockingArchiveFailure = failures.Values.SelectMany(items => items).Any(failure => !failure.IsWarning);
-            if (repositoryPath is not null && timeout is not null && blockingArchiveFailure)
-            {
-                checkStates["consumer-rehearsal"] = CheckContract.NotRun;
-            }
-            else if (repositoryPath is not null && timeout is null)
-            {
-                checkStates["consumer-rehearsal"] = CheckContract.NotApplicable;
-            }
-            else if (repositoryPath is null)
-            {
-                checkStates["consumer-rehearsal"] = CheckContract.NotApplicable;
-            }
-
-            if (repositoryPath is not null && timeout is not null && !blockingArchiveFailure)
-            {
-                var detailedRehearsals = ConsumerRehearsal.RunDetailed(config, snapshots, actualArtifacts, timeout.Value, rehearsalOptions, cancellationToken);
-                rehearsals = detailedRehearsals.Select(outcome => outcome.Result).ToArray();
-                foreach (var outcome in detailedRehearsals)
+                else
                 {
-                    if (!outcome.Result.Status.Equals(CheckContract.Pass, StringComparison.Ordinal))
+                    checkStates["workflow-policy"] = CheckContract.NotRun;
+                }
+
+                var rehearsals = Array.Empty<RehearsalResult>();
+                var blockingArchiveFailure = failures.Values.SelectMany(items => items).Any(failure => !failure.IsWarning);
+                if (repositoryPath is not null && timeout is not null && blockingArchiveFailure)
+                {
+                    checkStates["consumer-rehearsal"] = CheckContract.NotRun;
+                }
+                else if (repositoryPath is not null && timeout is null)
+                {
+                    checkStates["consumer-rehearsal"] = CheckContract.NotApplicable;
+                }
+                else if (repositoryPath is null)
+                {
+                    checkStates["consumer-rehearsal"] = CheckContract.NotApplicable;
+                }
+
+                if (repositoryPath is not null && timeout is not null && !blockingArchiveFailure)
+                {
+                    var detailedRehearsals = ConsumerRehearsal.RunDetailed(config, snapshots, actualArtifacts, timeout.Value, rehearsalOptions, cancellationToken);
+                    rehearsals = detailedRehearsals.Select(outcome => outcome.Result).ToArray();
+                    foreach (var outcome in detailedRehearsals)
                     {
-                        failures["consumer-rehearsal"].Add(new Failure(
-                            "consumer-rehearsal",
-                            $"{outcome.Result.PackageId}: {outcome.Result.Message}{FormatDiagnostic(outcome.Diagnostic)}",
-                            outcome.Result.IsError));
+                        if (!outcome.Result.Status.Equals(CheckContract.Pass, StringComparison.Ordinal))
+                        {
+                            failures["consumer-rehearsal"].Add(new Failure(
+                                "consumer-rehearsal",
+                                $"{outcome.Result.PackageId}: {outcome.Result.Message}{FormatDiagnostic(outcome.Diagnostic)}",
+                                outcome.Result.IsError));
+                        }
                     }
                 }
-            }
 
-            if (!snapshots.VerifySourcesUnchanged())
+                if (!snapshots.VerifySourcesUnchanged())
+                {
+                    failures["artifact-set"].Add(new Failure(
+                        "artifact-set",
+                        "An artifact changed after the immutable snapshot was taken; the check result is unproven.",
+                        true));
+                }
+
+                return BuildReport(expectedArtifacts.Length, actualArtifacts.Values.Sum(paths => paths.Count), failures, rehearsals, checkStates);
+            }
+            finally
             {
-                failures["artifact-set"].Add(new Failure(
-                    "artifact-set",
-                    "An artifact changed after the immutable snapshot was taken; the check result is unproven.",
-                    true));
+                artifactScan.Dispose();
             }
-
-            return BuildReport(expectedArtifacts.Length, actualArtifacts.Values.Sum(paths => paths.Count), failures, rehearsals, checkStates);
         }
     }
 

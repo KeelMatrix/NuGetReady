@@ -165,6 +165,212 @@ public sealed class ArtifactContractTests
     }
 
     [Fact]
+    public void Artifact_tree_scans_a_nested_artifact_root_with_pinned_ancestors()
+    {
+        using var fixture = PackageFixture.Create();
+        var package = fixture.AddPackage("Example.Core.1.2.3.nupkg", "Example.Core", "1.2.3");
+        var parent = Directory.CreateDirectory(Path.Combine(fixture.Root.FullName, "nested-parent"));
+        var artifacts = Directory.CreateDirectory(Path.Combine(parent.FullName, "artifacts"));
+        File.Copy(package, Path.Combine(artifacts.FullName, Path.GetFileName(package)));
+
+        using var scan = ArtifactTreeScanner.Scan(artifacts.FullName);
+
+        Assert.Equal(new[] { "Example.Core.1.2.3.nupkg" }, scan.Artifacts.Keys);
+        Assert.True(scan.Handle.VerifyBinding());
+    }
+
+    [Theory]
+    [InlineData("enumeration")]
+    [InlineData("child-open")]
+    [InlineData("child-attribute")]
+    [InlineData("snapshot-copy")]
+    [InlineData("final-verification")]
+    public void Artifact_tree_rejects_a_regular_root_rebind_at_each_validation_to_use_boundary(string boundary)
+    {
+        using var fixture = PackageFixture.Create();
+        var package = fixture.AddPackage("Example.Core.1.2.3.nupkg", "Example.Core", "1.2.3");
+        var moved = fixture.ArtifactsPath + ".regular-original";
+        var rebound = false;
+
+        void Rebind(string _)
+        {
+            rebound = true;
+            Directory.Move(fixture.ArtifactsPath, moved);
+            var replacement = Directory.CreateDirectory(fixture.ArtifactsPath);
+            File.WriteAllBytes(Path.Combine(replacement.FullName, Path.GetFileName(package)), [1, 2, 3]);
+        }
+
+        var previousEnumeration = ArtifactTreeScanner.BeforeDirectoryEnumerationForTests;
+        var previousChildOpen = ArtifactTreeScanner.BeforeChildOpenForTests;
+        var previousChildAttribute = ArtifactTreeScanner.BeforeChildAttributeForTests;
+        var previousArchiveOpen = ArtifactTreeScanner.BeforeArchiveOpenForTests;
+        var previousCopy = ArtifactSnapshotSet.BeforeCopyForTests;
+        var previousVerification = ArtifactSnapshotSet.BeforeVerificationOpenForTests;
+        switch (boundary)
+        {
+            case "enumeration":
+                ArtifactTreeScanner.BeforeDirectoryEnumerationForTests = Rebind;
+                break;
+            case "child-open":
+                ArtifactTreeScanner.BeforeChildOpenForTests = Rebind;
+                break;
+            case "child-attribute":
+                ArtifactTreeScanner.BeforeChildAttributeForTests = Rebind;
+                break;
+            case "snapshot-copy":
+                ArtifactSnapshotSet.BeforeCopyForTests = Rebind;
+                break;
+            case "final-verification":
+                ArtifactSnapshotSet.BeforeVerificationOpenForTests = Rebind;
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(boundary));
+        }
+
+        try
+        {
+            var report = CheckRunner.Run(Config("Example.Core", "Example.Core.1.2.3.nupkg"), fixture.ArtifactsPath);
+
+            Assert.True(rebound, $"The {boundary} rebind probe did not run.");
+            AssertSnapshotMutationFailure(report);
+        }
+        finally
+        {
+            ArtifactTreeScanner.BeforeDirectoryEnumerationForTests = previousEnumeration;
+            ArtifactTreeScanner.BeforeChildOpenForTests = previousChildOpen;
+            ArtifactTreeScanner.BeforeChildAttributeForTests = previousChildAttribute;
+            ArtifactTreeScanner.BeforeArchiveOpenForTests = previousArchiveOpen;
+            ArtifactSnapshotSet.BeforeCopyForTests = previousCopy;
+            ArtifactSnapshotSet.BeforeVerificationOpenForTests = previousVerification;
+            if (Directory.Exists(fixture.ArtifactsPath))
+            {
+                Directory.Delete(fixture.ArtifactsPath, recursive: true);
+            }
+
+            if (Directory.Exists(moved))
+            {
+                Directory.Move(moved, fixture.ArtifactsPath);
+            }
+        }
+    }
+
+    [Fact]
+    public void Artifact_tree_rejects_a_regular_file_replacement_before_no_follow_open()
+    {
+        using var fixture = PackageFixture.Create();
+        var package = fixture.AddPackage("Example.Core.1.2.3.nupkg", "Example.Core", "1.2.3");
+        var artifact = Path.Combine(fixture.ArtifactsPath, Path.GetFileName(package));
+        var outside = Path.Combine(fixture.Root.FullName, "outside.nupkg");
+        File.Copy(package, outside);
+        var replaced = false;
+        var previous = ArtifactTreeScanner.BeforeArchiveOpenForTests;
+        ArtifactTreeScanner.BeforeArchiveOpenForTests = _ =>
+        {
+            File.Delete(artifact);
+            File.Copy(outside, artifact);
+            replaced = true;
+        };
+
+        try
+        {
+            var report = CheckRunner.Run(Config("Example.Core", "Example.Core.1.2.3.nupkg"), fixture.ArtifactsPath);
+
+            Assert.True(replaced, "The regular file replacement probe did not run.");
+            AssertSnapshotMutationFailure(report);
+        }
+        finally
+        {
+            ArtifactTreeScanner.BeforeArchiveOpenForTests = previous;
+        }
+    }
+
+    [Theory]
+    [InlineData("enumeration")]
+    [InlineData("child-open")]
+    [InlineData("child-attribute")]
+    [InlineData("snapshot-copy")]
+    [InlineData("final-verification")]
+    public void Artifact_tree_rejects_a_reparse_root_rebind_at_each_validation_to_use_boundary(string boundary)
+    {
+        using var fixture = PackageFixture.Create();
+        var package = fixture.AddPackage("Example.Core.1.2.3.nupkg", "Example.Core", "1.2.3");
+        var outside = Directory.CreateDirectory(Path.Combine(fixture.Root.FullName, "outside-reparse-boundary"));
+        File.WriteAllBytes(Path.Combine(outside.FullName, Path.GetFileName(package)), [1, 2, 3]);
+        var linkProbe = Path.Combine(fixture.Root.FullName, "symlink-probe");
+        try
+        {
+            Directory.CreateSymbolicLink(linkProbe, outside.FullName);
+            Directory.Delete(linkProbe);
+        }
+        catch (Exception linkException) when (linkException is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
+        {
+            return;
+        }
+
+        var moved = fixture.ArtifactsPath + ".reparse-original";
+        var rebound = false;
+        void Rebind(string _)
+        {
+            rebound = true;
+            Directory.Move(fixture.ArtifactsPath, moved);
+            Directory.CreateSymbolicLink(fixture.ArtifactsPath, outside.FullName);
+        }
+
+        var previousEnumeration = ArtifactTreeScanner.BeforeDirectoryEnumerationForTests;
+        var previousChildOpen = ArtifactTreeScanner.BeforeChildOpenForTests;
+        var previousChildAttribute = ArtifactTreeScanner.BeforeChildAttributeForTests;
+        var previousArchiveOpen = ArtifactTreeScanner.BeforeArchiveOpenForTests;
+        var previousCopy = ArtifactSnapshotSet.BeforeCopyForTests;
+        var previousVerification = ArtifactSnapshotSet.BeforeVerificationOpenForTests;
+        switch (boundary)
+        {
+            case "enumeration":
+                ArtifactTreeScanner.BeforeDirectoryEnumerationForTests = Rebind;
+                break;
+            case "child-open":
+                ArtifactTreeScanner.BeforeChildOpenForTests = Rebind;
+                break;
+            case "child-attribute":
+                ArtifactTreeScanner.BeforeChildAttributeForTests = Rebind;
+                break;
+            case "snapshot-copy":
+                ArtifactSnapshotSet.BeforeCopyForTests = Rebind;
+                break;
+            case "final-verification":
+                ArtifactSnapshotSet.BeforeVerificationOpenForTests = Rebind;
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(boundary));
+        }
+
+        try
+        {
+            var report = CheckRunner.Run(Config("Example.Core", "Example.Core.1.2.3.nupkg"), fixture.ArtifactsPath);
+
+            Assert.True(rebound, $"The {boundary} reparse rebind probe did not run.");
+            AssertSnapshotMutationFailure(report);
+        }
+        finally
+        {
+            ArtifactTreeScanner.BeforeDirectoryEnumerationForTests = previousEnumeration;
+            ArtifactTreeScanner.BeforeChildOpenForTests = previousChildOpen;
+            ArtifactTreeScanner.BeforeChildAttributeForTests = previousChildAttribute;
+            ArtifactTreeScanner.BeforeArchiveOpenForTests = previousArchiveOpen;
+            ArtifactSnapshotSet.BeforeCopyForTests = previousCopy;
+            ArtifactSnapshotSet.BeforeVerificationOpenForTests = previousVerification;
+            if (Directory.Exists(fixture.ArtifactsPath))
+            {
+                Directory.Delete(fixture.ArtifactsPath, recursive: true);
+            }
+
+            if (Directory.Exists(moved))
+            {
+                Directory.Move(moved, fixture.ArtifactsPath);
+            }
+        }
+    }
+
+    [Fact]
     public void Artifact_tree_aggregate_compressed_size_is_bounded_before_snapshotting()
     {
         var current = ArtifactTreeLimits.MaxTotalCompressedArchiveBytes - 1;
@@ -317,21 +523,21 @@ public sealed class ArtifactContractTests
     }
 
     [Fact]
-    public void Rebound_regular_ancestor_after_snapshot_scan_is_rejected_before_opening_outside_bytes()
+    public void Rebound_regular_artifact_root_after_snapshot_scan_is_rejected_before_opening_outside_bytes()
     {
         using var fixture = PackageFixture.Create();
         var package = fixture.AddPackage("Example.Core.1.2.3.nupkg", "Example.Core", "1.2.3");
         var parent = Directory.CreateDirectory(Path.Combine(fixture.Root.FullName, "nested-parent"));
         var artifacts = Directory.CreateDirectory(Path.Combine(parent.FullName, "artifacts"));
         File.Copy(package, Path.Combine(artifacts.FullName, Path.GetFileName(package)));
-        var moved = parent.FullName + ".original";
+        var moved = artifacts.FullName + ".original";
         var rebound = false;
 
         var previous = ArtifactSnapshotSet.AfterScanForTests;
         ArtifactSnapshotSet.AfterScanForTests = root =>
         {
-            Directory.Move(parent.FullName, moved);
-            var replacement = Directory.CreateDirectory(Path.Combine(parent.FullName, "artifacts"));
+            Directory.Move(artifacts.FullName, moved);
+            var replacement = Directory.CreateDirectory(artifacts.FullName);
             File.WriteAllBytes(Path.Combine(replacement.FullName, Path.GetFileName(package)), [1, 2, 3]);
             rebound = true;
         };
@@ -340,7 +546,7 @@ public sealed class ArtifactContractTests
         {
             var report = CheckRunner.Run(Config("Example.Core", "Example.Core.1.2.3.nupkg"), artifacts.FullName);
 
-            Assert.True(rebound, "The test filesystem must support a regular ancestor rename-swap seam.");
+            Assert.True(rebound, "The test filesystem must support a regular root rename-swap seam.");
             AssertSnapshotMutationFailure(report);
         }
         finally

@@ -63,7 +63,7 @@ public sealed class CliContractTests
 
         Assert.Equal(0, process.ExitCode);
         Assert.Empty(error);
-        Assert.Contains("snapshotted before inspection", output, StringComparison.Ordinal);
+        Assert.Contains("copied into a bounded snapshot before inspection", output, StringComparison.Ordinal);
         Assert.Contains("embedded NUL characters are rejected before process launch", output, StringComparison.Ordinal);
     }
 
@@ -119,7 +119,7 @@ public sealed class CliContractTests
         Assert.Contains("without a recognized credential binding stays outside", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("error/exit 2", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("warnings never create release confidence", CliParser.HelpText, StringComparison.Ordinal);
-        Assert.Contains("snapshotted before inspection", CliParser.HelpText, StringComparison.Ordinal);
+        Assert.Contains("copied into a bounded snapshot before inspection", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("embedded NUL characters are rejected before process launch", CliParser.HelpText, StringComparison.Ordinal);
     }
 

@@ -6,7 +6,6 @@ namespace KeelMatrix.NuGetReady;
 internal sealed class ArtifactSnapshotSet : IDisposable
 {
     private const long MaxCompressedArtifactBytes = 512L * 1024 * 1024;
-    private readonly string sourceRoot;
     private readonly string snapshotRoot;
     private readonly Dictionary<string, string> snapshotByRelativePath;
     private readonly ArtifactTreeScanResult sourceScan;
@@ -14,12 +13,10 @@ internal sealed class ArtifactSnapshotSet : IDisposable
     internal static Action<string>? AfterScanForTests { get; set; }
 
     private ArtifactSnapshotSet(
-        string sourceRoot,
         string snapshotRoot,
         Dictionary<string, string> snapshotByRelativePath,
         ArtifactTreeScanResult sourceScan)
     {
-        this.sourceRoot = sourceRoot;
         this.snapshotRoot = snapshotRoot;
         this.snapshotByRelativePath = snapshotByRelativePath;
         this.sourceScan = sourceScan;
@@ -30,14 +27,17 @@ internal sealed class ArtifactSnapshotSet : IDisposable
         ArtifactTreeScanResult sourceScan)
     {
         var sourceRoot = Path.GetFullPath(artifactsPath);
-        var currentScan = ArtifactTreeScanner.Scan(sourceRoot);
+        // Re-scan through the already accepted ancestor-pinned handle. Re-opening
+        // sourceRoot here would recreate the validation-to-use window this class
+        // is responsible for closing.
+        using var currentScan = ArtifactTreeScanner.Scan(sourceScan.Handle, hashArchives: true);
         AfterScanForTests?.Invoke(sourceRoot);
         if (!sourceScan.HasSameTree(currentScan))
         {
             throw new IOException("The artifact tree changed after it was scanned and could not be snapshotted consistently.");
         }
 
-        if (!ArtifactTreeScanner.PathMatchesIdentity(sourceRoot, currentScan))
+        if (!currentScan.Handle.VerifyBinding())
         {
             throw new IOException("The artifact tree path identity changed after it was scanned and could not be snapshotted consistently.");
         }
@@ -53,23 +53,23 @@ internal sealed class ArtifactSnapshotSet : IDisposable
                          .ThenBy(path => path, StringComparer.Ordinal))
             {
                 var normalized = Normalize(relativePath);
-                var sourcePath = Path.Combine(sourceRoot, normalized.Replace('/', Path.DirectorySeparatorChar));
                 var expectedEntry = currentScan.Entries
                     .Single(entry => string.Equals(entry.RelativePath, normalized, StringComparison.Ordinal));
-                if (!ArtifactTreeScanner.PathMatchesIdentity(sourceRoot, currentScan))
+                if (!currentScan.Handle.VerifyBinding())
                 {
                     throw new IOException("The artifact tree path identity changed while the immutable artifact snapshot was being taken.");
                 }
 
                 var snapshotPath = Path.Combine(snapshotRoot, normalized.Replace('/', Path.DirectorySeparatorChar));
                 Directory.CreateDirectory(Path.GetDirectoryName(snapshotPath)!);
-                using var source = ArtifactPathIdentityProvider.OpenReadNoFollow(sourcePath);
-                var openedIdentity = ArtifactPathIdentityProvider.Capture(sourcePath);
-                if (openedIdentity.IsReparsePoint || !string.Equals(openedIdentity.Value, expectedEntry.Identity, StringComparison.Ordinal))
+                BeforeCopyForTests?.Invoke(normalized);
+                if (!currentScan.Handle.VerifyBinding())
                 {
-                    throw new IOException($"Artifact '{normalized}' changed identity while the immutable artifact snapshot was being taken.");
+                    throw new IOException("The artifact tree path identity changed while the immutable artifact snapshot was being taken.");
                 }
 
+                using var sourceFile = currentScan.OpenFile(normalized);
+                using var source = sourceFile.OpenRead();
                 var copiedHash = CopyAndHash(source, snapshotPath, ref aggregateBytes);
                 var expectedHash = expectedEntry.ContentHash;
                 if (!string.Equals(copiedHash, expectedHash, StringComparison.Ordinal))
@@ -80,7 +80,7 @@ internal sealed class ArtifactSnapshotSet : IDisposable
                 snapshots[normalized] = snapshotPath;
             }
 
-            return new ArtifactSnapshotSet(sourceRoot, snapshotRoot, snapshots, sourceScan);
+            return new ArtifactSnapshotSet(snapshotRoot, snapshots, sourceScan);
         }
         catch
         {
@@ -112,10 +112,33 @@ internal sealed class ArtifactSnapshotSet : IDisposable
     {
         try
         {
-            if (!ArtifactTreeScanner.PathMatchesIdentity(sourceRoot, sourceScan) ||
-                !sourceScan.HasSameTree(ArtifactTreeScanner.Scan(sourceRoot)))
+            if (!sourceScan.Handle.VerifyBinding())
             {
                 return false;
+            }
+
+            using var currentScan = ArtifactTreeScanner.Scan(sourceScan.Handle, hashArchives: false);
+            if (!sourceScan.HasSameMetadata(currentScan))
+            {
+                return false;
+            }
+
+            var aggregateBytes = 0L;
+            foreach (var entry in sourceScan.Entries.Where(entry => !entry.IsDirectory && entry.ContentHash.Length > 0))
+            {
+                BeforeVerificationOpenForTests?.Invoke(entry.RelativePath);
+                if (!sourceScan.Handle.VerifyBinding())
+                {
+                    return false;
+                }
+
+                using var file = sourceScan.OpenFile(entry.RelativePath);
+                using var source = file.OpenRead();
+                var hash = CopyAndHash(source, Stream.Null, ref aggregateBytes);
+                if (!string.Equals(hash, entry.ContentHash, StringComparison.Ordinal))
+                {
+                    return false;
+                }
             }
         }
         catch (IOException)
@@ -173,6 +196,9 @@ internal sealed class ArtifactSnapshotSet : IDisposable
         using var destination = File.Create(destinationPath);
         return CopyAndHash(source, destination, ref aggregateBytes);
     }
+
+    internal static Action<string>? BeforeCopyForTests { get; set; }
+    internal static Action<string>? BeforeVerificationOpenForTests { get; set; }
 
     private static string Normalize(string path) => path.Replace('\\', '/').TrimStart('/');
 

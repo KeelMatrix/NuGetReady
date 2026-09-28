@@ -20,7 +20,7 @@ dotnet run --project src/KeelMatrix.NuGetReady -- check --artifacts artifacts/pa
 - Configuration schema version is `1`; expected package artifacts are explicit filenames, never inferred from a wildcard.
 - Exit code `0` is a trustworthy pass, `1` is a completed readiness failure, and `2` is invalid input or an infrastructure failure.
 - Reports contain stable ordering and no timestamps or machine-specific paths.
-- Artifact scans are reverified against the counted tree and archive hashes before any downstream inspection; ancestor/root/file identities are checked without following reparse points, source bytes are copied only after the opened identity matches the accepted tree, and additions, replacements, deletions, limit bypasses, and reparse-point rebinding fail closed.
+- Artifact scans pin the accepted root and traversed ancestors without following reparse points; enumeration, attribute inspection, archive opens, hashing, snapshot copies, and final verification are handle-relative, and additions, replacements, deletions, limit bypasses, and reparse-point rebinding fail closed before outside-root bytes are read.
 - Archive entries must be unique canonical relative paths; rooted names, dot segments, separator aliases, case collisions, and Unicode-normalization collisions fail before metadata, layout, or sensitive-path decisions.
 - Library rehearsals restore/build package assets; tool rehearsals execute only a configured single-name executable child with bounded processes. The tool does not publish packages or run private CI. Completed trustworthy rehearsals use the required `KeelMatrix.Telemetry` dependency; local development and CI set the established telemetry opt-out.
 

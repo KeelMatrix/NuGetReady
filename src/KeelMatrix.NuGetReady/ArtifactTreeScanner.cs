@@ -20,18 +20,70 @@ internal sealed record ArtifactTreeEntry(
     string Identity,
     string ContentHash);
 
-internal sealed record ArtifactTreeScanResult(
-    Dictionary<string, List<string>> Artifacts,
-    int EntryCount,
-    int ArchiveCount,
-    long CompressedArchiveBytes,
-    IReadOnlyList<ArtifactTreeEntry> Entries,
-    string RootIdentity)
+internal sealed class ArtifactTreeScanResult : IDisposable
 {
+    private readonly bool ownsHandle;
+    private bool disposed;
+
+    internal ArtifactTreeScanResult(
+        Dictionary<string, List<string>> artifacts,
+        int entryCount,
+        int archiveCount,
+        long compressedArchiveBytes,
+        IReadOnlyList<ArtifactTreeEntry> entries,
+        ArtifactTreeHandle handle,
+        bool ownsHandle)
+    {
+        Artifacts = artifacts;
+        EntryCount = entryCount;
+        ArchiveCount = archiveCount;
+        CompressedArchiveBytes = compressedArchiveBytes;
+        Entries = entries;
+        Handle = handle;
+        RootIdentity = handle.Root.Identity;
+        this.ownsHandle = ownsHandle;
+    }
+
+    public Dictionary<string, List<string>> Artifacts { get; }
+    public int EntryCount { get; }
+    public int ArchiveCount { get; }
+    public long CompressedArchiveBytes { get; }
+    public IReadOnlyList<ArtifactTreeEntry> Entries { get; }
+    public string RootIdentity { get; }
+    internal ArtifactTreeHandle Handle { get; }
+
     public bool HasSameTree(ArtifactTreeScanResult other)
     {
+        return HasSameMetadata(other) && Entries.SequenceEqual(other.Entries);
+    }
+
+    public bool HasSameMetadata(ArtifactTreeScanResult other)
+    {
         return string.Equals(RootIdentity, other.RootIdentity, StringComparison.Ordinal) &&
-               Entries.SequenceEqual(other.Entries);
+               Entries.Select(entry => entry with { ContentHash = string.Empty }).SequenceEqual(
+                   other.Entries.Select(entry => entry with { ContentHash = string.Empty }));
+    }
+
+    internal IReadOnlyDictionary<string, ArtifactTreeEntry> EntriesByPath()
+    {
+        return Entries.ToDictionary(entry => entry.RelativePath, StringComparer.Ordinal);
+    }
+
+    internal ArtifactFileHandle OpenFile(string relativePath)
+    {
+        return Handle.OpenFile(relativePath, EntriesByPath());
+    }
+
+    public void Dispose()
+    {
+        if (!disposed)
+        {
+            disposed = true;
+            if (ownsHandle)
+            {
+                Handle.Dispose();
+            }
+        }
     }
 }
 
@@ -47,186 +99,246 @@ internal static class ArtifactTreeLimits
 internal static class ArtifactTreeScanner
 {
     internal static Action<string>? AfterScanForTests { get; set; }
+    internal static Action<string>? BeforeDirectoryEnumerationForTests { get; set; }
+    internal static Action<string>? BeforeChildOpenForTests { get; set; }
+    internal static Action<string>? BeforeChildAttributeForTests { get; set; }
+    internal static Action<string>? BeforeArchiveOpenForTests { get; set; }
 
     public static ArtifactTreeScanResult Scan(string artifactsPath)
     {
         var root = Path.GetFullPath(artifactsPath);
-        if (!Directory.Exists(root))
+        var handle = ArtifactTreeHandle.Open(root);
+        try
         {
-            throw new DirectoryNotFoundException("Artifact directory was not found.");
+            return Scan(handle, ownsHandle: true, hashArchives: true);
         }
-
-        EnsureNoReparseAncestors(root);
-        EnsureSafeEntry(root, root, isDirectory: true);
-        var rootIdentity = ArtifactPathIdentityProvider.Capture(root);
-        if (rootIdentity.IsReparsePoint)
+        catch
         {
-            throw new ArtifactTreeLimitExceededException("Artifact tree root is a reparse point; links and junctions are not followed.");
+            handle.Dispose();
+            throw;
+        }
+    }
+
+    internal static ArtifactTreeScanResult Scan(
+        ArtifactTreeHandle handle,
+        bool ownsHandle = false,
+        bool hashArchives = true)
+    {
+        if (!handle.VerifyBinding())
+        {
+            throw new ArtifactTreeLimitExceededException("Artifact tree path identity changed; links and junctions are not followed.");
         }
 
         var artifacts = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
         var entries = new List<ArtifactTreeEntry>();
-        var pending = new Queue<(string Path, string RelativePath, int Depth, ArtifactPathIdentity Identity)>();
-        pending.Enqueue((root, string.Empty, 0, rootIdentity));
+        var pending = new Queue<(ArtifactDirectoryHandle Directory, string RelativePath, int Depth)>();
+        var openDirectories = new List<ArtifactDirectoryHandle>();
+        pending.Enqueue((handle.Root, string.Empty, 0));
+        openDirectories.Add(handle.Root);
         var entryCount = 0;
         var archiveCount = 0;
         var compressedBytes = 0L;
 
-
-        while (pending.Count > 0)
+        try
         {
-            var (directory, relativeDirectory, depth, directoryIdentity) = pending.Dequeue();
-            if (!RootIdentityMatches(root, rootIdentity) ||
-                !IdentityMatches(directory, directoryIdentity) ||
-                !EnsureNoReparseChain(root, relativeDirectory))
+            while (pending.Count > 0)
             {
-                throw new ArtifactTreeLimitExceededException("Artifact tree path identity changed; links and junctions are not followed.");
-            }
-
-            IEnumerable<string> childEntries;
-            try
-            {
-                childEntries = Directory.EnumerateFileSystemEntries(
-                    directory,
-                    "*",
-                    new EnumerationOptions
-                    {
-                        RecurseSubdirectories = false,
-                        IgnoreInaccessible = false,
-                        ReturnSpecialDirectories = false,
-                        AttributesToSkip = 0
-                    });
-            }
-            catch (IOException exception)
-            {
-                throw new IOException("Artifact directory could not be enumerated.", exception);
-            }
-            catch (UnauthorizedAccessException exception)
-            {
-                throw new IOException("Artifact directory could not be enumerated.", exception);
-            }
-
-            foreach (var entry in childEntries.OrderBy(path => path, StringComparer.Ordinal))
-            {
-                entryCount = checked(entryCount + 1);
-                if (entryCount > ArtifactTreeLimits.MaxEntryCount)
+                var (directory, relativeDirectory, depth) = pending.Dequeue();
+                if (!handle.VerifyBinding() || !directory.VerifyBinding())
                 {
-                    throw new ArtifactTreeLimitExceededException(
-                        $"Artifact tree exceeds the {ArtifactTreeLimits.MaxEntryCount} entry limit.");
+                    throw new ArtifactTreeLimitExceededException("Artifact tree path identity changed; links and junctions are not followed.");
                 }
 
-                var name = Path.GetFileName(entry);
-                var relative = string.IsNullOrEmpty(relativeDirectory)
-                    ? name
-                    : relativeDirectory + "/" + name;
-                EnsureSafeEntry(root, entry, isDirectory: false);
-                if (!EnsureNoReparseChain(root, relative))
-                {
-                    throw new ArtifactTreeLimitExceededException(
-                        $"Artifact tree contains a reparse point at '{relative}'; links and junctions are not followed.");
-                }
-
-                FileAttributes attributes;
-                ArtifactPathIdentity identity;
+                IReadOnlyList<string> childNames;
                 try
                 {
-                    attributes = StableAttributes(File.GetAttributes(entry));
-                    identity = ArtifactPathIdentityProvider.Capture(entry);
+                    BeforeDirectoryEnumerationForTests?.Invoke(relativeDirectory);
+                    if (!handle.VerifyBinding() || !directory.VerifyBinding())
+                    {
+                        throw new ArtifactTreeLimitExceededException("Artifact tree path identity changed before directory enumeration.");
+                    }
+
+                    childNames = directory.EnumerateNames();
                 }
                 catch (IOException exception)
                 {
-                    throw new IOException("Artifact directory could not be inspected.", exception);
-                }
-                catch (UnauthorizedAccessException exception)
-                {
-                    throw new IOException("Artifact directory could not be inspected.", exception);
+                    throw new IOException("Artifact directory could not be enumerated.", exception);
                 }
 
-                if ((attributes & FileAttributes.ReparsePoint) != 0 || identity.IsReparsePoint)
+                foreach (var name in childNames.OrderBy(path => path, StringComparer.Ordinal))
                 {
-                    throw new ArtifactTreeLimitExceededException(
-                        $"Artifact tree contains a reparse point at '{relative}'; links and junctions are not followed.");
-                }
-
-                if ((attributes & FileAttributes.Directory) != 0)
-                {
-                    var childDepth = depth + 1;
-                    if (childDepth > ArtifactTreeLimits.MaxTraversalDepth)
+                    entryCount = checked(entryCount + 1);
+                    if (entryCount > ArtifactTreeLimits.MaxEntryCount)
                     {
                         throw new ArtifactTreeLimitExceededException(
-                            $"Artifact tree exceeds the {ArtifactTreeLimits.MaxTraversalDepth}-level traversal-depth limit.");
+                            $"Artifact tree exceeds the {ArtifactTreeLimits.MaxEntryCount} entry limit.");
                     }
 
-                    var info = new DirectoryInfo(entry);
-                    entries.Add(new ArtifactTreeEntry(relative, true, 0, info.LastWriteTimeUtc.Ticks, info.CreationTimeUtc.Ticks, attributes, identity.Value, string.Empty));
-                    pending.Enqueue((entry, relative, childDepth, identity));
-                    continue;
-                }
-
-                long length;
-                try
-                {
-                    length = new FileInfo(entry).Length;
-                }
-                catch (IOException exception)
-                {
-                    throw new IOException("Artifact archive could not be inspected.", exception);
-                }
-
-                var hash = string.Empty;
-                if (IsArchive(entry))
-                {
-                    archiveCount = checked(archiveCount + 1);
-                    if (archiveCount > ArtifactTreeLimits.MaxArchiveCount)
+                    var relative = string.IsNullOrEmpty(relativeDirectory)
+                        ? name
+                        : relativeDirectory + "/" + name;
+                    if (relative.Length > ArtifactTreeLimits.MaxPathCharacters)
                     {
                         throw new ArtifactTreeLimitExceededException(
-                            $"Artifact tree exceeds the {ArtifactTreeLimits.MaxArchiveCount} archive count limit.");
+                            $"Artifact tree contains a path longer than the {ArtifactTreeLimits.MaxPathCharacters}-character limit.");
                     }
 
-                    using (var stream = ArtifactPathIdentityProvider.OpenReadNoFollow(entry))
+                    if (!handle.VerifyBinding() || !directory.VerifyBinding())
                     {
-                        var openedIdentity = ArtifactPathIdentityProvider.Capture(entry);
-                        if (openedIdentity.IsReparsePoint ||
-                            !string.Equals(openedIdentity.Value, identity.Value, StringComparison.Ordinal))
+                        throw new ArtifactTreeLimitExceededException("Artifact tree path identity changed; links and junctions are not followed.");
+                    }
+
+                    ArtifactDirectoryHandle child;
+                    try
+                    {
+                        BeforeChildOpenForTests?.Invoke(relative);
+                        if (!handle.VerifyBinding() || !directory.VerifyBinding())
                         {
-                            throw new IOException("Artifact archive path identity changed while it was being scanned.");
+                            throw new ArtifactTreeLimitExceededException("Artifact tree path identity changed before a child entry could be opened.");
                         }
 
-                        hash = ComputeHash(stream, ref compressedBytes);
+                        child = directory.OpenChild(
+                            name,
+                            exclusiveForLaunch: false,
+                            beforeAttribute: () => BeforeChildAttributeForTests?.Invoke(relative));
                     }
-                }
-
-                var fileInfo = new FileInfo(entry);
-                entries.Add(new ArtifactTreeEntry(relative, false, length, fileInfo.LastWriteTimeUtc.Ticks, fileInfo.CreationTimeUtc.Ticks, attributes, identity.Value, hash));
-                if (IsArchive(entry))
-                {
-                    if (!artifacts.TryGetValue(name, out var paths))
+                    catch (ArtifactTreeLimitExceededException)
                     {
-                        paths = new List<string>();
-                        artifacts[name] = paths;
+                        throw;
+                    }
+                    catch (IOException exception)
+                    {
+                        throw new IOException("Artifact directory entry could not be inspected.", exception);
                     }
 
-                    paths.Add(relative);
+                    openDirectories.Add(child);
+                    try
+                    {
+                        var info = child.GetInfo();
+                        if (info.Identity.IsReparsePoint || child.IsReparsePoint)
+                        {
+                            throw new ArtifactTreeLimitExceededException(
+                                $"Artifact tree contains a reparse point at '{relative}'; links and junctions are not followed.");
+                        }
+
+                        if (info.IsDirectory)
+                        {
+                            var childDepth = depth + 1;
+                            if (childDepth > ArtifactTreeLimits.MaxTraversalDepth)
+                            {
+                                throw new ArtifactTreeLimitExceededException(
+                                    $"Artifact tree exceeds the {ArtifactTreeLimits.MaxTraversalDepth}-level traversal-depth limit.");
+                            }
+
+                            entries.Add(new ArtifactTreeEntry(
+                                relative,
+                                true,
+                                0,
+                                info.LastWriteUtcTicks,
+                                info.CreationUtcTicks,
+                                StableAttributes(info.Attributes),
+                                info.Identity.Value,
+                                string.Empty));
+                            pending.Enqueue((child, relative, childDepth));
+                            continue;
+                        }
+
+                        var hash = string.Empty;
+                        if (IsArchive(name))
+                        {
+                            archiveCount = checked(archiveCount + 1);
+                            if (archiveCount > ArtifactTreeLimits.MaxArchiveCount)
+                            {
+                                throw new ArtifactTreeLimitExceededException(
+                                    $"Artifact tree exceeds the {ArtifactTreeLimits.MaxArchiveCount} archive count limit.");
+                            }
+
+                            if (hashArchives)
+                            {
+                                BeforeArchiveOpenForTests?.Invoke(relative);
+                                if (!handle.VerifyBinding() || !child.VerifyBinding())
+                                {
+                                    throw new IOException("Artifact archive identity changed before it was opened.");
+                                }
+
+                                using var file = new ArtifactFileHandle(child);
+                                using var stream = file.OpenRead();
+                                hash = ComputeHash(stream, ref compressedBytes);
+                            }
+                        }
+
+                        entries.Add(new ArtifactTreeEntry(
+                            relative,
+                            false,
+                            info.Length,
+                            info.LastWriteUtcTicks,
+                            info.CreationUtcTicks,
+                            StableAttributes(info.Attributes),
+                            info.Identity.Value,
+                            hash));
+                        if (IsArchive(name))
+                        {
+                            if (!artifacts.TryGetValue(name, out var paths))
+                            {
+                                paths = new List<string>();
+                                artifacts[name] = paths;
+                            }
+
+                            paths.Add(relative);
+                        }
+
+                        child.Dispose();
+                    }
+                    catch
+                    {
+                        if (!child.IsDirectory)
+                        {
+                            child.Dispose();
+                        }
+
+                        throw;
+                    }
                 }
             }
-        }
 
-        foreach (var paths in artifacts.Values)
-        {
-            paths.Sort(static (left, right) =>
+            foreach (var paths in artifacts.Values)
             {
-                var comparison = StringComparer.OrdinalIgnoreCase.Compare(left, right);
-                return comparison != 0 ? comparison : StringComparer.Ordinal.Compare(left, right);
-            });
-        }
+                paths.Sort(static (left, right) =>
+                {
+                    var comparison = StringComparer.OrdinalIgnoreCase.Compare(left, right);
+                    return comparison != 0 ? comparison : StringComparer.Ordinal.Compare(left, right);
+                });
+            }
 
-        return new ArtifactTreeScanResult(
-            artifacts,
-            entryCount,
-            archiveCount,
-            compressedBytes,
-            entries.OrderBy(entry => entry.RelativePath, StringComparer.Ordinal).ToArray(),
-            rootIdentity.Value);
+            foreach (var directory in openDirectories.AsEnumerable().Reverse().Distinct())
+            {
+                if (!ReferenceEquals(directory, handle.Root))
+                {
+                    directory.Dispose();
+                }
+            }
+
+            return new ArtifactTreeScanResult(
+                artifacts,
+                entryCount,
+                archiveCount,
+                compressedBytes,
+                entries.OrderBy(entry => entry.RelativePath, StringComparer.Ordinal).ToArray(),
+                handle,
+                ownsHandle);
+        }
+        catch
+        {
+            foreach (var directory in openDirectories.AsEnumerable().Reverse().Distinct())
+            {
+                if (!ReferenceEquals(directory, handle.Root))
+                {
+                    directory.Dispose();
+                }
+            }
+
+            throw;
+        }
     }
 
     internal static long AddCompressedBytes(long current, long next)
@@ -257,153 +369,6 @@ internal static class ArtifactTreeScanner
         }
 
         return Convert.ToBase64String(hash.GetHashAndReset());
-    }
-
-    private static void EnsureSafeEntry(string root, string path, bool isDirectory)
-    {
-        if (path.Length > ArtifactTreeLimits.MaxPathCharacters)
-        {
-            throw new ArtifactTreeLimitExceededException(
-                $"Artifact tree contains a path longer than the {ArtifactTreeLimits.MaxPathCharacters}-character limit.");
-        }
-
-        var relative = Path.GetRelativePath(root, path);
-        if (isDirectory && relative == ".")
-        {
-            return;
-        }
-
-        if (Path.IsPathRooted(relative) || relative == ".." || relative.StartsWith($"..{Path.DirectorySeparatorChar}", StringComparison.Ordinal))
-        {
-            throw new ArtifactTreeLimitExceededException("Artifact tree entry escaped the artifact directory.");
-        }
-    }
-
-    private static bool EnsureNoReparseChain(string root, string relativePath)
-    {
-        if (IsReparsePoint(root))
-        {
-            return false;
-        }
-
-        var current = root;
-        foreach (var segment in relativePath.Split('/', StringSplitOptions.RemoveEmptyEntries))
-        {
-            current = Path.Combine(current, segment);
-            if (IsReparsePoint(current))
-            {
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    internal static bool PathMatchesIdentity(string root, ArtifactTreeScanResult expected)
-    {
-        try
-        {
-            EnsureNoReparseAncestors(root);
-            var currentRoot = ArtifactPathIdentityProvider.Capture(root);
-            if (currentRoot.IsReparsePoint || !string.Equals(currentRoot.Value, expected.RootIdentity, StringComparison.Ordinal))
-            {
-                return false;
-            }
-
-            foreach (var entry in expected.Entries)
-            {
-                if (!EnsureNoReparseChain(root, entry.RelativePath))
-                {
-                    return false;
-                }
-
-                var path = Path.Combine(root, entry.RelativePath.Replace('/', Path.DirectorySeparatorChar));
-                var current = ArtifactPathIdentityProvider.Capture(path);
-                if (current.IsReparsePoint || !string.Equals(current.Value, entry.Identity, StringComparison.Ordinal))
-                {
-                    return false;
-                }
-            }
-
-            return true;
-        }
-        catch (IOException)
-        {
-            return false;
-        }
-        catch (UnauthorizedAccessException)
-        {
-            return false;
-        }
-    }
-
-    private static bool RootIdentityMatches(string root, ArtifactPathIdentity expected)
-    {
-        try
-        {
-            EnsureNoReparseAncestors(root);
-            var current = ArtifactPathIdentityProvider.Capture(root);
-            return !current.IsReparsePoint && string.Equals(current.Value, expected.Value, StringComparison.Ordinal);
-        }
-        catch (IOException)
-        {
-            return false;
-        }
-        catch (UnauthorizedAccessException)
-        {
-            return false;
-        }
-    }
-
-    private static bool IdentityMatches(string path, ArtifactPathIdentity expected)
-    {
-        try
-        {
-            var current = ArtifactPathIdentityProvider.Capture(path);
-            return !current.IsReparsePoint && string.Equals(current.Value, expected.Value, StringComparison.Ordinal);
-        }
-        catch (IOException)
-        {
-            return false;
-        }
-        catch (UnauthorizedAccessException)
-        {
-            return false;
-        }
-    }
-
-    private static void EnsureNoReparseAncestors(string root)
-    {
-        var current = new DirectoryInfo(root);
-        while (current is not null)
-        {
-            if (IsReparsePoint(current.FullName) && !IsMacOsSystemPathAlias(current.FullName))
-            {
-                throw new ArtifactTreeLimitExceededException("Artifact tree has a reparse-point ancestor; links and junctions are not followed.");
-            }
-
-            current = current.Parent;
-        }
-    }
-
-    private static bool IsMacOsSystemPathAlias(string path)
-    {
-        if (!OperatingSystem.IsMacOS())
-        {
-            return false;
-        }
-
-        var normalized = path.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-        // macOS exposes these fixed aliases for system temporary locations. They
-        // are outside the caller-controlled artifact tree and resolve only to
-        // their corresponding /private paths.
-        return normalized is "/var" or "/tmp";
-    }
-
-    private static bool IsReparsePoint(string path)
-    {
-        return ArtifactPathIdentityProvider.Capture(path).IsReparsePoint ||
-               (File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0;
     }
 
     private static FileAttributes StableAttributes(FileAttributes attributes)

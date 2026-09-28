@@ -227,6 +227,122 @@ public sealed class ConsumerRehearsalTests
     }
 
     [Fact]
+    public void Tool_rehearsal_launches_the_pinned_image_when_the_installed_child_is_rebound_after_validation()
+    {
+        using var corpus = PackedCorpus.Create();
+        var package = corpus.Pack("Tool/Tool.csproj");
+        var failingPackage = corpus.Pack("ToolFailure/ToolFailure.csproj");
+        var config = Config(new PackageExpectation
+        {
+            Id = "Fixture.Tool",
+            Kind = "dotnetTool",
+            Version = "1.0.0",
+            Artifacts = Artifacts(package),
+            Command = "fixture-tool",
+            Smoke = new List<string> { "--help" }
+        });
+
+        var previous = ConsumerRehearsal.BeforeToolLaunchForTests;
+        ConsumerRehearsal.BeforeToolLaunchForTests = executable =>
+        {
+            var toolDirectory = Path.GetDirectoryName(executable)!;
+            using var archive = ZipFile.OpenRead(failingPackage);
+            foreach (var entry in archive.Entries.Where(entry => entry.FullName.StartsWith("tools/net8.0/any/", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrEmpty(entry.Name)))
+            {
+                var targetName = Path.GetFileName(entry.FullName)
+                    .Replace("fixture-tool-failure", "fixture-tool", StringComparison.OrdinalIgnoreCase)
+                    .Replace("Fixture.ToolFailure", "Fixture.Tool", StringComparison.OrdinalIgnoreCase);
+                using var source = entry.Open();
+                using var target = new FileStream(Path.Combine(toolDirectory, targetName), FileMode.Create, FileAccess.Write, FileShare.None);
+                source.CopyTo(target);
+            }
+        };
+
+        try
+        {
+            var outcomes = ConsumerRehearsal.RunDetailed(
+                config,
+                corpus.OutputPath,
+                TimeSpan.FromMinutes(2),
+                new ConsumerRehearsalOptions(PublicFeedPath: Directory.CreateDirectory(Path.Combine(corpus.Root.FullName, "empty-public-feed")).FullName));
+
+            Assert.Equal("pass", outcomes.Single().Result.Status);
+        }
+        finally
+        {
+            ConsumerRehearsal.BeforeToolLaunchForTests = previous;
+        }
+    }
+
+    [Fact]
+    public void Tool_rehearsal_does_not_launch_a_rebound_reparse_child()
+    {
+        using var corpus = PackedCorpus.Create();
+        var package = corpus.Pack("Tool/Tool.csproj");
+        var failingPackage = corpus.Pack("ToolFailure/ToolFailure.csproj");
+        var linkTargetProbe = Path.Combine(corpus.Root.FullName, "link-target-probe");
+        var linkProbe = Path.Combine(corpus.Root.FullName, "link-probe");
+        File.WriteAllText(linkTargetProbe, "probe");
+        try
+        {
+            File.CreateSymbolicLink(linkProbe, linkTargetProbe);
+            File.Delete(linkProbe);
+        }
+        catch (Exception linkException) when (linkException is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
+        {
+            return;
+        }
+
+        var config = Config(new PackageExpectation
+        {
+            Id = "Fixture.Tool",
+            Kind = "dotnetTool",
+            Version = "1.0.0",
+            Artifacts = Artifacts(package),
+            Command = "fixture-tool",
+            Smoke = new List<string> { "--help" }
+        });
+
+        var rebound = false;
+        var previous = ConsumerRehearsal.BeforeToolLaunchForTests;
+        ConsumerRehearsal.BeforeToolLaunchForTests = executable =>
+        {
+            var outside = Directory.CreateDirectory(Path.Combine(corpus.Root.FullName, "outside-tool-sentinel"));
+            using var archive = ZipFile.OpenRead(failingPackage);
+            foreach (var entry in archive.Entries.Where(entry => entry.FullName.StartsWith("tools/net8.0/any/", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrEmpty(entry.Name)))
+            {
+                var targetName = Path.GetFileName(entry.FullName)
+                    .Replace("fixture-tool-failure", "fixture-tool", StringComparison.OrdinalIgnoreCase)
+                    .Replace("Fixture.ToolFailure", "Fixture.Tool", StringComparison.OrdinalIgnoreCase);
+                using var source = entry.Open();
+                using var target = new FileStream(Path.Combine(outside.FullName, targetName), FileMode.Create, FileAccess.Write, FileShare.None);
+                source.CopyTo(target);
+            }
+
+            var outsideExecutable = Path.Combine(outside.FullName, Path.GetFileName(executable));
+            File.Delete(executable);
+            File.CreateSymbolicLink(executable, outsideExecutable);
+            rebound = true;
+        };
+
+        try
+        {
+            var outcomes = ConsumerRehearsal.RunDetailed(
+                config,
+                corpus.OutputPath,
+                TimeSpan.FromMinutes(2),
+                new ConsumerRehearsalOptions(PublicFeedPath: Directory.CreateDirectory(Path.Combine(corpus.Root.FullName, "empty-public-feed")).FullName));
+
+            Assert.True(rebound, "The reparse-child rebind probe did not run.");
+            Assert.Equal("pass", outcomes.Single().Result.Status);
+        }
+        finally
+        {
+            ConsumerRehearsal.BeforeToolLaunchForTests = previous;
+        }
+    }
+
+    [Fact]
     public void Tool_rehearsal_accepts_the_platform_executable_extension_boundary()
     {
         using var corpus = PackedCorpus.Create();

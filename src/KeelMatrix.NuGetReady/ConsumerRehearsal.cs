@@ -32,6 +32,7 @@ internal static class ConsumerRehearsal
 {
     private const int DiagnosticLimit = 16 * 1024;
     private static readonly string[] PublicPackagePatterns = { "*" };
+    internal static Action<string>? BeforeToolLaunchForTests { get; set; }
 
     public static IReadOnlyList<RehearsalOutcome> RunDetailed(
         NuGetReadyConfig config,
@@ -81,6 +82,10 @@ internal static class ConsumerRehearsal
             return config.Packages!
                 .Select(package => Failure(package, "Artifact files could not be snapshotted for immutable inspection.", isError: true))
                 .ToArray();
+        }
+        finally
+        {
+            artifactScan.Dispose();
         }
     }
 
@@ -416,22 +421,45 @@ internal static class ConsumerRehearsal
         }
 
         var command = package.Command ?? package.Id!;
-        if (!TryResolveToolExecutable(toolPath, command, out var executable))
+        if (!TryResolveToolExecutable(toolPath, command, out var executable, out var executableIdentity))
         {
             return Failure(package, "The configured tool command was not created as a single executable child of the isolated tool directory.", false, string.Empty);
         }
 
-        var smoke = package.Smoke?.ToArray() ?? Array.Empty<string>();
-        var run = await BoundedProcess.RunAsync(executable, smoke, packageRoot, environment, timeout, cancellationToken: cancellationToken).ConfigureAwait(false);
-        var runOutcome = ClassifyProcessResult(run, ProcessPhase.ToolSmoke);
-        return runOutcome.Passed
-            ? Success(package, "Isolated tool installed and safe smoke command succeeded.", runOutcome.Diagnostic)
-            : Failure(package, "The installed tool safe smoke command failed.", runOutcome.IsError, runOutcome.Diagnostic);
+        ToolLaunchSnapshot launch;
+        try
+        {
+            launch = ToolLaunchSnapshot.Create(toolPath, packageRoot, Path.GetFileName(executable), executableIdentity);
+        }
+        catch (IOException)
+        {
+            return Failure(package, "The installed tool executable could not be pinned for the safe smoke command.", true, string.Empty);
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return Failure(package, "The installed tool executable could not be pinned for the safe smoke command.", true, string.Empty);
+        }
+
+        using (launch)
+        {
+            BeforeToolLaunchForTests?.Invoke(executable);
+            var smoke = package.Smoke?.ToArray() ?? Array.Empty<string>();
+            var run = await BoundedProcess.RunAsync(launch.ExecutablePath, smoke, packageRoot, environment, timeout, cancellationToken: cancellationToken).ConfigureAwait(false);
+            var runOutcome = ClassifyProcessResult(run, ProcessPhase.ToolSmoke);
+            return runOutcome.Passed
+                ? Success(package, "Isolated tool installed and safe smoke command succeeded.", runOutcome.Diagnostic)
+                : Failure(package, "The installed tool safe smoke command failed.", runOutcome.IsError, runOutcome.Diagnostic);
+        }
     }
 
-    private static bool TryResolveToolExecutable(string toolPath, string command, out string executable)
+    private static bool TryResolveToolExecutable(
+        string toolPath,
+        string command,
+        out string executable,
+        out string executableIdentity)
     {
         executable = string.Empty;
+        executableIdentity = string.Empty;
         if (!ToolCommandPolicy.IsValid(command))
         {
             return false;
@@ -463,6 +491,15 @@ internal static class ConsumerRehearsal
                 {
                     return false;
                 }
+
+                using var tree = ArtifactTreeHandle.Open(isolatedRoot);
+                using var child = tree.Root.OpenChild(candidate, exclusiveForLaunch: true);
+                if (child.IsDirectory || child.IsReparsePoint || !tree.VerifyBinding())
+                {
+                    return false;
+                }
+
+                executableIdentity = child.Identity;
             }
             catch (IOException)
             {
@@ -478,6 +515,105 @@ internal static class ConsumerRehearsal
         }
 
         return false;
+    }
+
+    private sealed class ToolLaunchSnapshot : IDisposable
+    {
+        private ToolLaunchSnapshot(string root, string executablePath)
+        {
+            Root = root;
+            ExecutablePath = executablePath;
+        }
+
+        private string Root { get; }
+        public string ExecutablePath { get; }
+
+        public static ToolLaunchSnapshot Create(
+            string toolPath,
+            string packageRoot,
+            string executableName,
+            string expectedExecutableIdentity)
+        {
+            using var source = ArtifactTreeHandle.Open(toolPath);
+            if (!source.VerifyBinding())
+            {
+                throw new IOException("The installed tool directory changed before it could be pinned.");
+            }
+
+            var root = Directory.CreateDirectory(Path.Combine(packageRoot, ".nugetready-tool-launch")).FullName;
+            try
+            {
+                using var verifiedExecutable = source.Root.OpenChild(executableName, exclusiveForLaunch: true);
+                if (verifiedExecutable.IsDirectory || verifiedExecutable.IsReparsePoint ||
+                    !string.Equals(verifiedExecutable.Identity, expectedExecutableIdentity, StringComparison.Ordinal))
+                {
+                    throw new IOException("The installed tool executable changed before it could be pinned.");
+                }
+
+                CopyDirectory(source, source.Root, root, executableName, verifiedExecutable, topLevel: true);
+                if (!source.VerifyBinding())
+                {
+                    throw new IOException("The installed tool directory changed while it was being pinned.");
+                }
+
+                var executable = Path.Combine(root, executableName);
+                if (!File.Exists(executable) ||
+                    (File.GetAttributes(executable) & (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0)
+                {
+                    throw new IOException("The pinned tool executable was not created as a regular file.");
+                }
+
+                return new ToolLaunchSnapshot(root, executable);
+            }
+            catch
+            {
+                DeleteDirectory(new DirectoryInfo(root));
+                throw;
+            }
+        }
+
+        private static void CopyDirectory(
+            ArtifactTreeHandle tree,
+            ArtifactDirectoryHandle source,
+            string destination,
+            string executableName,
+            ArtifactDirectoryHandle pinnedExecutable,
+            bool topLevel)
+        {
+            Directory.CreateDirectory(destination);
+            foreach (var name in source.EnumerateNames().OrderBy(name => name, StringComparer.Ordinal))
+            {
+                if (!tree.VerifyBinding() || !source.VerifyBinding())
+                {
+                    throw new IOException("The installed tool directory changed while it was being pinned.");
+                }
+
+                using var child = topLevel && string.Equals(name, executableName, StringComparison.Ordinal)
+                    ? pinnedExecutable
+                    : source.OpenChild(name, exclusiveForLaunch: false);
+                if (child.IsReparsePoint)
+                {
+                    throw new IOException("The installed tool directory contains a reparse point.");
+                }
+
+                var target = Path.Combine(destination, name);
+                if (child.IsDirectory)
+                {
+                    CopyDirectory(tree, child, target, executableName, pinnedExecutable, topLevel: false);
+                    continue;
+                }
+
+                using var file = new ArtifactFileHandle(child);
+                using var input = file.OpenRead();
+                using var output = new FileStream(target, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+                input.CopyTo(output);
+            }
+        }
+
+        public void Dispose()
+        {
+            DeleteDirectory(new DirectoryInfo(Root));
+        }
     }
 
     private static async Task<ProcessResult> RunDotnetAsync(

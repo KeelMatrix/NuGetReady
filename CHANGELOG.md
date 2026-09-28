@@ -32,5 +32,5 @@ The 0.1.0 release is planned and unreleased.
 
 ### Fixed
 
-- Fails closed when an artifact root or any ancestor is rebound through a reparse point or rename-swap while the bounded archive snapshot is being established.
-- Restricts tool commands to one non-reserved executable basename and verifies the installed command is a direct child of the isolated tool directory before smoke execution.
+- Pins the accepted artifact root and traversed ancestors for handle-relative enumeration, attribute inspection, archive opens, hashing, snapshot copies, and final verification, failing closed before outside-root bytes are read during rebinds.
+- Keeps tool-command validation bound to a direct non-reparse installed child and launches a private handle-bound snapshot of the complete installed tool directory, closing the validation-to-launch replacement window.
