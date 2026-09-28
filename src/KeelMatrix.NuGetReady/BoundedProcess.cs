@@ -561,6 +561,12 @@ internal static class UnixProcessSupervisor
         var filePointer = IntPtr.Zero;
         var argumentPointers = new IntPtr[request.Arguments.Length + 2];
         var argumentVector = IntPtr.Zero;
+        var anchorFilePointer = IntPtr.Zero;
+        var anchorArgumentPointers = new IntPtr[3];
+        var anchorArgumentVector = IntPtr.Zero;
+        var anchorProcess = 0;
+        var anchorGroup = 0;
+        var anchorReaped = false;
         var environmentPointers = new List<IntPtr>();
         var environmentVector = IntPtr.Zero;
         var spawnAttributes = IntPtr.Zero;
@@ -631,20 +637,38 @@ internal static class UnixProcessSupervisor
                 return 125;
             }
 
-            var initialProcessGroupId = getpgid(child);
-            var setProcessGroupResult = setpgid(child, child);
-            var processGroupId = getpgid(child);
-            if (setProcessGroupResult != 0 && processGroupId != child)
+            // Keep the target group alive after the target exits so its identity
+            // cannot be reused before verification. The anchor joins the group
+            // created for the target and is killed with the complete group.
+            if (posix_spawnattr_setpgroup(spawnAttributes, child) != 0)
             {
-                Console.Error.WriteLine($"Unix process-group setup failed: child={child}, initial={initialProcessGroupId}, actual={processGroupId}, set-result={setProcessGroupResult}, errno={Marshal.GetLastWin32Error()}, supervisor={getpgrp()}");
+                _ = killpg(child, SigKill);
                 return 125;
             }
 
-            if (processGroupId <= 0 || processGroupId == getpgrp())
+            anchorFilePointer = Marshal.StringToCoTaskMemUTF8("/bin/sleep");
+            anchorArgumentPointers[0] = anchorFilePointer;
+            anchorArgumentPointers[1] = Marshal.StringToCoTaskMemUTF8("600");
+            anchorArgumentVector = Marshal.AllocHGlobal(anchorArgumentPointers.Length * IntPtr.Size);
+            for (var index = 0; index < anchorArgumentPointers.Length; index++)
             {
-                Console.Error.WriteLine($"Unix process-group identity was not dedicated: child={child}, initial={initialProcessGroupId}, actual={processGroupId}, set-result={setProcessGroupResult}, errno={Marshal.GetLastWin32Error()}, supervisor={getpgrp()}");
+                Marshal.WriteIntPtr(anchorArgumentVector, index * IntPtr.Size, anchorArgumentPointers[index]);
+            }
+
+            var anchorResult = posix_spawnp(
+                out anchorProcess,
+                anchorFilePointer,
+                IntPtr.Zero,
+                spawnAttributes,
+                anchorArgumentVector,
+                environmentVector);
+            if (anchorResult != 0 || anchorProcess <= 0)
+            {
+                _ = killpg(child, SigKill);
                 return 125;
             }
+
+            anchorGroup = child;
 
             SignalReady();
             var status = 0;
@@ -653,14 +677,21 @@ internal static class UnixProcessSupervisor
                 return 125;
             }
 
-            // The target has its own process group. Kill and verify that group before
+            // The target and its anchor share a dedicated process group. Kill and verify that group before
             // claiming cleanup; on Linux also require the subreaper to have no adopted
             // child remaining, which keeps detached/reparented descendants unproven.
-            var descendantsClean = KillAndVerifyProcessGroup(processGroupId);
+            var descendantsClean = KillAndVerifyProcessGroup(child);
             if (!descendantsClean)
             {
                 return 125;
             }
+
+            if (!ReapAnchor(anchorProcess))
+            {
+                return 125;
+            }
+
+            anchorReaped = true;
 
             SignalCleanupConfirmed();
             return DecodeExitStatus(status);
@@ -682,12 +713,25 @@ internal static class UnixProcessSupervisor
                 Marshal.FreeHGlobal(argumentVector);
             }
 
+            if (anchorArgumentVector != IntPtr.Zero)
+            {
+                Marshal.FreeHGlobal(anchorArgumentVector);
+            }
+
             if (environmentVector != IntPtr.Zero)
             {
                 Marshal.FreeHGlobal(environmentVector);
             }
 
             foreach (var pointer in argumentPointers)
+            {
+                if (pointer != IntPtr.Zero)
+                {
+                    Marshal.FreeCoTaskMem(pointer);
+                }
+            }
+
+            foreach (var pointer in anchorArgumentPointers)
             {
                 if (pointer != IntPtr.Zero)
                 {
@@ -702,20 +746,17 @@ internal static class UnixProcessSupervisor
                     Marshal.FreeCoTaskMem(pointer);
                 }
             }
+
+            if (anchorProcess > 0 && !anchorReaped)
+            {
+                _ = KillAndVerifyProcessGroup(anchorGroup);
+                _ = ReapAnchor(anchorProcess);
+            }
         }
     }
 
     [DllImport("libc", SetLastError = true)]
     private static extern int setsid();
-
-    [DllImport("libc", SetLastError = true)]
-    private static extern int getpgrp();
-
-    [DllImport("libc", SetLastError = true)]
-    private static extern int getpgid(int processId);
-
-    [DllImport("libc", SetLastError = true)]
-    private static extern int setpgid(int processId, int processGroupId);
 
     private const short PosixSpawnSetProcessGroup = 0x2;
     private const int PosixSpawnAttributeStorageSize = 512;
@@ -774,6 +815,12 @@ internal static class UnixProcessSupervisor
         }
 
         return waitpid(-1, out _, WaitNoHang) < 0 && Marshal.GetLastWin32Error() == NoChildrenError;
+    }
+
+    private static bool ReapAnchor(int processId)
+    {
+        var result = waitpid(processId, out _, 0);
+        return result == processId || result < 0 && Marshal.GetLastWin32Error() == NoChildrenError;
     }
 
     private static bool KillAndVerifyProcessGroup(int processGroupId)
