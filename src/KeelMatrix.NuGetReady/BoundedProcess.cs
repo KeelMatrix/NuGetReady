@@ -772,9 +772,16 @@ internal static class UnixProcessSupervisor
                 }
             }
 
-            if (kill(-processGroupId, 0) != 0)
+            var groupProbe = kill(-processGroupId, 0);
+            if (groupProbe != 0)
             {
-                return Marshal.GetLastWin32Error() == NoSuchProcessError &&
+                var groupError = Marshal.GetLastWin32Error();
+                if (OperatingSystem.IsMacOS() && groupError != NoSuchProcessError)
+                {
+                    Console.Error.WriteLine($"macOS process-group cleanup probe failed for group {processGroupId}: errno={groupError}");
+                }
+
+                return groupError == NoSuchProcessError &&
                     (!OperatingSystem.IsLinux() || ReapDescendants());
             }
 
@@ -791,8 +798,15 @@ internal static class UnixProcessSupervisor
             return true;
         }
 
-        return kill(-processGroupId, 0) != 0 &&
-            Marshal.GetLastWin32Error() == NoSuchProcessError &&
+        var finalProbe = kill(-processGroupId, 0);
+        var finalError = Marshal.GetLastWin32Error();
+        if (OperatingSystem.IsMacOS() && (finalProbe == 0 || finalError != NoSuchProcessError))
+        {
+            Console.Error.WriteLine($"macOS process-group cleanup remained unproven for group {processGroupId}: probe={finalProbe}, errno={finalError}");
+        }
+
+        return finalProbe != 0 &&
+            finalError == NoSuchProcessError &&
             (!OperatingSystem.IsLinux() || ReapDescendants());
     }
 
