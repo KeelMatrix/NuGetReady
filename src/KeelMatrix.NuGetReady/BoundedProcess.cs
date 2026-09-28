@@ -327,38 +327,10 @@ internal static class BoundedProcess
         processJob?.Dispose();
         try
         {
-            if (unixProcessGroup && OperatingSystem.IsMacOS())
+            if (unixProcessGroup)
             {
                 process.Kill(entireProcessTree: true);
                 return WaitForDirectExit(process);
-            }
-
-            if (unixProcessGroup)
-            {
-                var groupKill = kill(-process.Id, SigKill);
-                if (groupKill == 0)
-                {
-                    return WaitForUnixProcessGroupExit(process.Id) && WaitForDirectExit(process);
-                }
-
-                var groupError = Marshal.GetLastWin32Error();
-                var directExited = WaitForDirectExit(process);
-                if (!directExited)
-                {
-                    try
-                    {
-                        process.Kill();
-                    }
-                    catch (InvalidOperationException)
-                    {
-                    }
-
-                    directExited = WaitForDirectExit(process);
-                }
-
-                // ESRCH alone does not establish that descendants were cleaned up. A naturally
-                // completed process may use it only after readiness and direct-exit proof.
-                return groupError == NoSuchProcessError && naturalCompletion && processGroupReady && directExited;
             }
 
             if (windowsSupervisor)
@@ -388,26 +360,6 @@ internal static class BoundedProcess
         }
     }
 
-    private const int SigKill = 9;
-    private const int NoSuchProcessError = 3;
-
-    private static bool WaitForUnixProcessGroupExit(int processGroupId)
-    {
-        var deadline = DateTime.UtcNow + TerminationGracePeriod;
-        while (DateTime.UtcNow < deadline)
-        {
-            if (kill(-processGroupId, 0) != 0)
-            {
-                return true;
-            }
-
-            _ = kill(-processGroupId, SigKill);
-            Thread.Sleep(10);
-        }
-
-        return kill(-processGroupId, 0) != 0;
-    }
-
     private static bool WaitForDirectExit(Process process)
     {
         try
@@ -424,9 +376,6 @@ internal static class BoundedProcess
             return false;
         }
     }
-
-    [DllImport("libc", SetLastError = true)]
-    private static extern int kill(int processId, int signal);
 
     private sealed class WindowsProcessJob : IDisposable
     {
@@ -609,10 +558,11 @@ internal static class UnixProcessSupervisor
             return 125;
         }
 
-        var isMacOs = OperatingSystem.IsMacOS();
         var filePointer = IntPtr.Zero;
         var argumentPointers = new IntPtr[request.Arguments.Length + 2];
         var argumentVector = IntPtr.Zero;
+        var spawnAttributes = IntPtr.Zero;
+        var spawnAttributesInitialized = false;
         try
         {
             filePointer = Marshal.StringToCoTaskMemUTF8(request.FileName);
@@ -641,26 +591,29 @@ internal static class UnixProcessSupervisor
                 return 125;
             }
 
-            var child = fork();
-            if (child < 0)
+            spawnAttributes = Marshal.AllocHGlobal(PosixSpawnAttributeStorageSize);
+            if (posix_spawnattr_init(spawnAttributes) != 0)
             {
                 return 125;
             }
 
-            if (child == 0)
+            spawnAttributesInitialized = true;
+            if (posix_spawnattr_setflags(spawnAttributes, PosixSpawnSetProcessGroup) != 0 ||
+                posix_spawnattr_setpgroup(spawnAttributes, 0) != 0)
             {
-                // macOS has no Linux-style child subreaper. Put the target in a
-                // separate process group so the supervisor can still remove
-                // descendants after the target exits without killing itself.
-                if (isMacOs && setpgid(0, 0) != 0)
-                {
-                    _exit(125);
-                    return 125;
-                }
+                return 125;
+            }
 
-                _ = execvp(filePointer, argumentVector);
-                _exit(127);
-                return 127;
+            var spawnResult = posix_spawnp(
+                out var child,
+                filePointer,
+                IntPtr.Zero,
+                spawnAttributes,
+                argumentVector,
+                IntPtr.Zero);
+            if (spawnResult != 0 || child <= 0)
+            {
+                return 125;
             }
 
             SignalReady();
@@ -670,11 +623,11 @@ internal static class UnixProcessSupervisor
                 return 125;
             }
 
-            // Reap any descendants adopted by this supervisor. A child that remains
-            // after the target exits is not a confirmed-clean process tree.
-            var descendantsClean = OperatingSystem.IsMacOS()
-                ? KillAndVerifyMacProcessGroup(child)
-                : ReapDescendants();
+            // The target has its own process group. Kill and verify that group before
+            // claiming cleanup; on Linux also require the subreaper to have no adopted
+            // child remaining, which keeps detached/reparented descendants unproven.
+            var descendantsClean = KillAndVerifyProcessGroup(child) &&
+                (!OperatingSystem.IsLinux() || ReapDescendants());
             if (!descendantsClean)
             {
                 return 125;
@@ -685,6 +638,16 @@ internal static class UnixProcessSupervisor
         }
         finally
         {
+            if (spawnAttributesInitialized)
+            {
+                _ = posix_spawnattr_destroy(spawnAttributes);
+            }
+
+            if (spawnAttributes != IntPtr.Zero)
+            {
+                Marshal.FreeHGlobal(spawnAttributes);
+            }
+
             if (argumentVector != IntPtr.Zero)
             {
                 Marshal.FreeHGlobal(argumentVector);
@@ -703,8 +666,29 @@ internal static class UnixProcessSupervisor
     [DllImport("libc", SetLastError = true)]
     private static extern int setsid();
 
+    private const short PosixSpawnSetProcessGroup = 0x2;
+    private const int PosixSpawnAttributeStorageSize = 512;
+
     [DllImport("libc", SetLastError = true)]
-    private static extern int execvp(IntPtr file, IntPtr argumentVector);
+    private static extern int posix_spawnattr_init(IntPtr attributes);
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int posix_spawnattr_destroy(IntPtr attributes);
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int posix_spawnattr_setflags(IntPtr attributes, short flags);
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int posix_spawnattr_setpgroup(IntPtr attributes, int processGroupId);
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int posix_spawnp(
+        out int processId,
+        IntPtr file,
+        IntPtr fileActions,
+        IntPtr attributes,
+        IntPtr argumentVector,
+        IntPtr environment);
 
     private static void SignalReady()
     {
@@ -739,7 +723,7 @@ internal static class UnixProcessSupervisor
         return waitpid(-1, out _, WaitNoHang) < 0 && Marshal.GetLastWin32Error() == NoChildrenError;
     }
 
-    private static bool KillAndVerifyMacProcessGroup(int processGroupId)
+    private static bool KillAndVerifyProcessGroup(int processGroupId)
     {
         _ = kill(-processGroupId, SigKill);
         var deadline = DateTime.UtcNow + TimeSpan.FromMilliseconds(250);
@@ -771,13 +755,7 @@ internal static class UnixProcessSupervisor
     private static extern int prctl(int option, int arg2, int arg3, int arg4, int arg5);
 
     [DllImport("libc", SetLastError = true)]
-    private static extern int setpgid(int processId, int processGroupId);
-
-    [DllImport("libc", SetLastError = true)]
     private static extern int kill(int processId, int signal);
-
-    [DllImport("libc", SetLastError = true)]
-    private static extern int fork();
 
     [DllImport("libc", SetLastError = true)]
     private static extern int waitpid(int processId, out int status, int options);
@@ -785,8 +763,6 @@ internal static class UnixProcessSupervisor
     [DllImport("libc", SetLastError = true)]
     private static extern nint write(int fileDescriptor, byte[] buffer, nuint count);
 
-    [DllImport("libc")]
-    private static extern void _exit(int status);
 }
 
 internal static class WindowsProcessSupervisor
