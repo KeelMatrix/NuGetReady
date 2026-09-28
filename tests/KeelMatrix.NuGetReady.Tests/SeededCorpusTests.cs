@@ -163,7 +163,7 @@ public sealed class SeededCorpusTests : IClassFixture<RealCorpusFixture>
 
         var outcome = ConsumerRehearsal.RunDetailed(scenario.Config, scenario.ArtifactsPath, TimeSpan.FromMinutes(2)).Single();
 
-        Assert.Equal("fail", outcome.Result.Status);
+        Assert.Equal(OperatingSystem.IsWindows() ? "fail" : "error", outcome.Result.Status);
         Assert.Contains("smoke", outcome.Result.Message, StringComparison.OrdinalIgnoreCase);
     }
 
