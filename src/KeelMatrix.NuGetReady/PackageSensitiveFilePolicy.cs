@@ -51,6 +51,11 @@ internal static class PackageSensitiveFilePolicy
 
     public static bool IsSensitive(string path)
     {
+        return IsSensitive(path, Array.Empty<string>());
+    }
+
+    public static bool IsSensitive(string path, IReadOnlyCollection<string> siblingPaths)
+    {
         var normalized = path.Replace('\\', '/').TrimStart('/');
         var lower = normalized.ToLowerInvariant();
         if (Manifest.PathFragments.Any(fragment => lower.Contains(fragment, StringComparison.Ordinal)))
@@ -106,6 +111,11 @@ internal static class PackageSensitiveFilePolicy
         }
 
         var name = lower[(lower.LastIndexOf('/') + 1)..];
+        if (IsAssemblyDocumentationRole(normalized, name, siblingPaths))
+        {
+            return false;
+        }
+
         var nameWithoutLeadingDots = name.TrimStart('.');
         return Manifest.ExactFileNames.Any(exact => IsExactNameFamily(name, exact) || IsExactNameFamily(nameWithoutLeadingDots, exact)) ||
                Manifest.FileNamePrefixes.Any(prefix => name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) ||
@@ -113,6 +123,37 @@ internal static class PackageSensitiveFilePolicy
                Manifest.FileExtensions.Any(extension => ContainsExtensionFamily(name, extension)) ||
                Manifest.FileNameFragments.Any(fragment =>
                    ContainsFamilyValue(name, fragment, "endOrSeparator") && !IsBinaryAssemblyLike(name));
+    }
+
+    private static bool IsAssemblyDocumentationRole(
+        string normalizedPath,
+        string name,
+        IReadOnlyCollection<string> siblingPaths)
+    {
+        if (!name.EndsWith(".xml", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var stem = name[..^4];
+        var nameSeparator = normalizedPath.LastIndexOf('/');
+        var nameDirectory = nameSeparator < 0 ? string.Empty : normalizedPath[..nameSeparator];
+        return siblingPaths.Any(path =>
+        {
+            var sibling = path.Replace('\\', '/').TrimStart('/');
+            var siblingSeparator = sibling.LastIndexOf('/');
+            var siblingDirectory = siblingSeparator < 0 ? string.Empty : sibling[..siblingSeparator];
+            if (!string.Equals(nameDirectory, siblingDirectory, StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            var siblingName = sibling[(sibling.LastIndexOf('/') + 1)..];
+            var extension = siblingName.LastIndexOf('.');
+            return extension > 0 &&
+                   IsBinaryAssemblyLike(siblingName) &&
+                   string.Equals(siblingName[..extension], stem, StringComparison.OrdinalIgnoreCase);
+        });
     }
 
     private static bool IsExactNameFamily(string name, string exact)

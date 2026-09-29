@@ -2697,6 +2697,11 @@ internal static class WorkflowPolicyInspector
 
     private static CommandAnalysis AnalyzeCommandLine(string line, HashSet<string>? safePowerShellFunctions = null)
     {
+        if (HasUnmodeledExecutionSyntax(line))
+        {
+            return CommandAnalysis.Unresolved;
+        }
+
         var tokens = TokenizeCommandLineForDiscovery(line);
         if (tokens.Length == 0)
         {
@@ -2819,6 +2824,61 @@ internal static class WorkflowPolicyInspector
             : CommandAnalysis.Unresolved;
     }
 
+    private static bool HasUnmodeledExecutionSyntax(string line)
+    {
+        var quote = '\0';
+        for (var index = 0; index < line.Length; index++)
+        {
+            var character = line[index];
+            if (quote == '\'')
+            {
+                if (character == '\'' && index + 1 < line.Length && line[index + 1] == '\'')
+                {
+                    index++;
+                }
+                else if (character == '\'')
+                {
+                    quote = '\0';
+                }
+
+                continue;
+            }
+
+            if (quote == '"')
+            {
+                if (character == '"')
+                {
+                    quote = '\0';
+                }
+                else if (character == '$' && index + 1 < line.Length && line[index + 1] == '(')
+                {
+                    return true;
+                }
+
+                continue;
+            }
+
+            if (character is '\'' or '"')
+            {
+                quote = character;
+                continue;
+            }
+
+            if (character == '`' ||
+                (character == '$' && index + 1 < line.Length && line[index + 1] == '(') ||
+                ((character is '<' or '@') && index + 1 < line.Length && line[index + 1] == '(') ||
+                (character == '&' && (index + 1 >= line.Length || line[index + 1] != '&')))
+            {
+                return true;
+            }
+        }
+
+        return Regex.IsMatch(
+            line,
+            @"^\s*(?:echo|printf|write-output|write-host)\b.*[{}]",
+            RegexOptions.IgnoreCase);
+    }
+
     private static HashSet<string> FindSafePowerShellFunctions(
         string content,
         HashSet<string>? inheritedSafePowerShellFunctions = null)
@@ -2897,6 +2957,7 @@ internal static class WorkflowPolicyInspector
 
     private static bool IsSafePowerShellStatement(string line, HashSet<string>? safePowerShellFunctions)
     {
+        var executableText = RemoveSingleQuotedLiterals(line);
         if (Regex.IsMatch(line, @"^\s*[""']", RegexOptions.IgnoreCase))
         {
             return true;
@@ -2905,12 +2966,12 @@ internal static class WorkflowPolicyInspector
         if (Regex.IsMatch(line, @"^\s*@\{", RegexOptions.IgnoreCase))
         {
             return !Regex.IsMatch(
-                line,
+                executableText,
                 @"(?i)\b(?:dotnet\s+nuget(?:\.exe)?\s+push|nuget(?:\.exe)?\s+push|gh\s+release\s+create|(?:curl|wget|Invoke-WebRequest|Invoke-RestMethod|Start-Process))\b");
         }
 
         if (Regex.IsMatch(
-                line,
+                executableText,
                 @"(?i)\b(?:dotnet\s+nuget(?:\.exe)?\s+push|nuget(?:\.exe)?\s+push|gh\s+release\s+create|(?:curl|wget|Invoke-WebRequest|Invoke-RestMethod|Start-Process))\b"))
         {
             return false;
@@ -2930,9 +2991,9 @@ internal static class WorkflowPolicyInspector
                 }
             }
 
-            return !line.Contains("$({", StringComparison.Ordinal) &&
-                   !line.Contains("& ", StringComparison.Ordinal) &&
-                   !Regex.IsMatch(line, @"(?i)\b(?:System\.Diagnostics\.Process|Invoke-Expression|Invoke-Command|Start-Job|Start-ThreadJob)\b|::Start\s*\(|\.(?:Start|Invoke|Execute|Publish|Push|Run)\s*\(");
+            return !executableText.Contains("$({", StringComparison.Ordinal) &&
+                   !executableText.Contains("& ", StringComparison.Ordinal) &&
+                   !Regex.IsMatch(executableText, @"(?i)\b(?:System\.Diagnostics\.Process|Invoke-Expression|Invoke-Command|Start-Job|Start-ThreadJob)\b|::Start\s*\(|\.(?:Start|Invoke|Execute|Publish|Push|Run)\s*\(");
         }
 
         if (Regex.IsMatch(line, @"^\s*[A-Za-z_][A-Za-z0-9_-]*\s*=\s*", RegexOptions.IgnoreCase))
@@ -2979,6 +3040,41 @@ internal static class WorkflowPolicyInspector
         }
 
         return true;
+    }
+
+    private static string RemoveSingleQuotedLiterals(string line)
+    {
+        var result = new StringBuilder(line.Length);
+        var inLiteral = false;
+        for (var index = 0; index < line.Length; index++)
+        {
+            var character = line[index];
+            if (!inLiteral && character == '\'')
+            {
+                inLiteral = true;
+                result.Append(' ');
+                continue;
+            }
+
+            if (inLiteral)
+            {
+                if (character == '\'' && index + 1 < line.Length && line[index + 1] == '\'')
+                {
+                    index++;
+                }
+                else if (character == '\'')
+                {
+                    inLiteral = false;
+                }
+
+                result.Append(' ');
+                continue;
+            }
+
+            result.Append(character);
+        }
+
+        return result.ToString();
     }
 
     private static List<string> FindInlineBraceBodies(string line)
@@ -3282,7 +3378,7 @@ internal static class WorkflowPolicyInspector
     {
         return Regex.IsMatch(line, @"^(?:echo|printf|write-output|write-host)\b", RegexOptions.IgnoreCase) &&
                !line.Contains("$((", StringComparison.Ordinal) &&
-               !line.Contains("$(", StringComparison.Ordinal) &&
+               !HasUnmodeledExecutionSyntax(line) &&
                !line.Contains('`') &&
                !line.Contains("<(", StringComparison.Ordinal) &&
                !line.Contains("@(", StringComparison.Ordinal);
@@ -3447,6 +3543,8 @@ internal static class WorkflowPolicyInspector
             "name", "run-name", "on", "permissions", "env", "defaults", "concurrency", "jobs"
         };
 
+        private const int MaxYamlTraversalNodes = 50_000;
+
         public static CompositeActionDocument ParseCompositeAction(string content)
         {
             var action = new CompositeActionDocument();
@@ -3500,6 +3598,15 @@ internal static class WorkflowPolicyInspector
 
             workflow.HasParseFailure = HasDuplicateMappingKeys(root);
             workflow.HasUninspectableStructure = unsupported;
+            // Duplicate keys, anchors/aliases, and over-depth graphs are
+            // rejected by the bounded loader. Do not dispatch any modeled
+            // fields after that decision: the same graph may be cyclic or
+            // shared and downstream walkers must never traverse it again.
+            if (workflow.HasParseFailure || unsupported)
+            {
+                workflow.HasUninspectableControlStructure = true;
+                return workflow;
+            }
             foreach (var pair in root.Children)
             {
                 if (!TryScalar(pair.Key, out var key))
@@ -3582,12 +3689,18 @@ internal static class WorkflowPolicyInspector
 
         private static bool HasDuplicateMappingKeys(YamlNode node)
         {
-            return HasDuplicateMappingKeys(node, new HashSet<YamlNode>(ReferenceEqualityComparer.Instance), depth: 0);
+            var visited = new HashSet<YamlNode>(ReferenceEqualityComparer.Instance);
+            var nodeCount = 0;
+            return HasDuplicateMappingKeys(node, visited, depth: 0, ref nodeCount);
         }
 
-        private static bool HasDuplicateMappingKeys(YamlNode node, HashSet<YamlNode> visited, int depth)
+        private static bool HasDuplicateMappingKeys(
+            YamlNode node,
+            HashSet<YamlNode> visited,
+            int depth,
+            ref int nodeCount)
         {
-            if (depth > 128 || !visited.Add(node))
+            if (depth > 128 || nodeCount++ >= MaxYamlTraversalNodes || !visited.Add(node))
             {
                 return true;
             }
@@ -3602,8 +3715,8 @@ internal static class WorkflowPolicyInspector
                         return true;
                     }
 
-                    if (HasDuplicateMappingKeys(pair.Key, visited, depth + 1) ||
-                        HasDuplicateMappingKeys(pair.Value, visited, depth + 1))
+                    if (HasDuplicateMappingKeys(pair.Key, visited, depth + 1, ref nodeCount) ||
+                        HasDuplicateMappingKeys(pair.Value, visited, depth + 1, ref nodeCount))
                     {
                         return true;
                     }
@@ -3614,7 +3727,15 @@ internal static class WorkflowPolicyInspector
 
             if (node is YamlSequenceNode sequence)
             {
-                return sequence.Children.Any(child => HasDuplicateMappingKeys(child, visited, depth + 1));
+                foreach (var child in sequence.Children)
+                {
+                    if (HasDuplicateMappingKeys(child, visited, depth + 1, ref nodeCount))
+                    {
+                        return true;
+                    }
+                }
+
+                return false;
             }
 
             return false;
@@ -3634,7 +3755,9 @@ internal static class WorkflowPolicyInspector
                 }
 
                 root = mapping;
-                unsupported = ContainsUnsupportedYamlShape(mapping, new HashSet<YamlNode>(ReferenceEqualityComparer.Instance), depth: 0);
+                var visited = new HashSet<YamlNode>(ReferenceEqualityComparer.Instance);
+                var nodeCount = 0;
+                unsupported = ContainsUnsupportedYamlShape(mapping, visited, depth: 0, ref nodeCount);
                 return true;
             }
             catch (YamlException)
@@ -3651,9 +3774,13 @@ internal static class WorkflowPolicyInspector
             }
         }
 
-        private static bool ContainsUnsupportedYamlShape(YamlNode node, HashSet<YamlNode> visited, int depth)
+        private static bool ContainsUnsupportedYamlShape(
+            YamlNode node,
+            HashSet<YamlNode> visited,
+            int depth,
+            ref int nodeCount)
         {
-            if (depth > 128 || !visited.Add(node))
+            if (depth > 128 || nodeCount++ >= MaxYamlTraversalNodes || !visited.Add(node))
             {
                 return true;
             }
@@ -3665,14 +3792,29 @@ internal static class WorkflowPolicyInspector
 
             if (node is YamlMappingNode mapping)
             {
-                return mapping.Children.Any(pair =>
-                    ContainsUnsupportedYamlShape(pair.Key, visited, depth + 1) ||
-                    ContainsUnsupportedYamlShape(pair.Value, visited, depth + 1));
+                foreach (var pair in mapping.Children)
+                {
+                    if (ContainsUnsupportedYamlShape(pair.Key, visited, depth + 1, ref nodeCount) ||
+                        ContainsUnsupportedYamlShape(pair.Value, visited, depth + 1, ref nodeCount))
+                    {
+                        return true;
+                    }
+                }
+
+                return false;
             }
 
             if (node is YamlSequenceNode sequence)
             {
-                return sequence.Children.Any(child => ContainsUnsupportedYamlShape(child, visited, depth + 1));
+                foreach (var child in sequence.Children)
+                {
+                    if (ContainsUnsupportedYamlShape(child, visited, depth + 1, ref nodeCount))
+                    {
+                        return true;
+                    }
+                }
+
+                return false;
             }
 
             return false;

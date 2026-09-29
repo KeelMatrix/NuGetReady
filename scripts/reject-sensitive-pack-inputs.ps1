@@ -16,6 +16,7 @@ $root = (Resolve-Path -LiteralPath $ProjectDirectory).Path
 $repositoryRoot = (Resolve-Path -LiteralPath (Join-Path $root "..\..")).Path
 $itemsPath = (Resolve-Path -LiteralPath $PackItemsFile).Path
 $offenders = @()
+$items = @()
 
 foreach ($line in Get-Content -LiteralPath $itemsPath) {
     if ([string]::IsNullOrWhiteSpace($line)) { continue }
@@ -37,9 +38,17 @@ foreach ($line in Get-Content -LiteralPath $itemsPath) {
         $destination = [IO.Path]::GetFileName($source)
     }
 
-    $generatedSource = $sourceRelative -match '(?:^|/)(?:bin|obj)(?:/|$)'
-    if ((-not $generatedSource -and (Test-SensitivePackagePath $sourceRelative)) -or (Test-SensitivePackagePath $destination)) {
-        $offenders += "$sourceRelative -> $destination"
+    $items += [pscustomobject]@{
+        SourceRelative = $sourceRelative
+        Destination = $destination
+    }
+}
+
+$siblings = @($items | ForEach-Object { $_.SourceRelative })
+foreach ($item in $items) {
+    if ((Test-SensitivePackSourcePath $item.SourceRelative -SiblingPaths $siblings) -or
+        (Test-SensitivePackagePath $item.Destination -SiblingPaths @($items | ForEach-Object { $_.Destination }))) {
+        $offenders += "$($item.SourceRelative) -> $($item.Destination)"
     }
 }
 

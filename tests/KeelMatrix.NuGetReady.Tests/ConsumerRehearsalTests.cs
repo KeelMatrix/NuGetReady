@@ -53,6 +53,57 @@ public sealed class ConsumerRehearsalTests
     }
 
     [Fact]
+    public void Public_cli_cancellation_returns_a_structured_error_report_and_exit_two()
+    {
+        using var corpus = PackedCorpus.Create();
+        var package = corpus.Pack("Standard/Standard.csproj");
+        File.Delete(Path.ChangeExtension(package, ".snupkg"));
+        var configPath = Path.Combine(corpus.Root.FullName, "nugetready.json");
+        File.WriteAllText(configPath, $$"""
+            {
+              "schemaVersion": 1,
+              "packages": [
+                {
+                  "id": "Fixture.Standard",
+                  "kind": "library",
+                  "version": "1.0.0",
+                  "artifacts": ["{{Path.GetFileName(package)}}"]
+                }
+              ]
+            }
+            """);
+
+        using var telemetryOptOut = new EnvironmentVariableScope("KEELMATRIX_NO_TELEMETRY", "1");
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+        var originalOutput = Console.Out;
+        using var output = new StringWriter();
+        Console.SetOut(output);
+        try
+        {
+            var exitCode = NuGetReadyApplication.Run(
+                ["check", "--config", configPath, "--artifacts", corpus.OutputPath, "--format", "json"],
+                new NuGetReadyTelemetry(),
+                cancellation.Token);
+
+            Assert.True(exitCode == 2, $"exitCode={exitCode}; report={output}");
+            using var report = System.Text.Json.JsonDocument.Parse(output.ToString());
+            Assert.Equal("error", report.RootElement.GetProperty("status").GetString());
+            Assert.Equal(2, report.RootElement.GetProperty("exitCode").GetInt32());
+            var checks = report.RootElement.GetProperty("checks");
+            Assert.Equal(CheckContract.Order.Length, checks.GetArrayLength());
+            Assert.Equal("error", checks.EnumerateArray().Single(check => check.GetProperty("id").GetString() == "consumer-rehearsal").GetProperty("status").GetString());
+            Assert.All(
+                checks.EnumerateArray().Where(check => check.GetProperty("id").GetString() != "consumer-rehearsal"),
+                check => Assert.Equal("not-run", check.GetProperty("status").GetString()));
+        }
+        finally
+        {
+            Console.SetOut(originalOutput);
+        }
+    }
+
+    [Fact]
     public void Obsolete_first_public_type_is_not_selected_for_the_consumer_probe()
     {
         using var corpus = PackedCorpus.Create();
@@ -109,6 +160,40 @@ public sealed class ConsumerRehearsalTests
     }
 
     [Fact]
+    public void Consumer_rehearsal_is_not_influenced_by_custom_or_user_extension_imports()
+    {
+        using var corpus = PackedCorpus.Create();
+        var package = corpus.Pack("Standard/Standard.csproj");
+        var importRoot = Directory.CreateDirectory(Path.Combine(corpus.Root.FullName, "ambient-msbuild-imports"));
+        var before = Path.Combine(importRoot.FullName, "before.targets");
+        var after = Path.Combine(importRoot.FullName, "after.targets");
+        var userExtension = Path.Combine(importRoot.FullName, "Current", "Imports", "Microsoft.Common.props", "ImportBefore", "ambient.targets");
+        Directory.CreateDirectory(Path.GetDirectoryName(userExtension)!);
+        var failureTarget = "<Project><Target Name=\"AmbientImportMustNotRun\" BeforeTargets=\"CoreCompile\"><Error Text=\"ambient MSBuild import executed\" /></Target></Project>";
+        File.WriteAllText(before, failureTarget);
+        File.WriteAllText(after, failureTarget);
+        File.WriteAllText(userExtension, failureTarget);
+
+        using var beforeScope = new EnvironmentVariableScope("CustomBeforeMicrosoftCommonTargets", before);
+        using var afterScope = new EnvironmentVariableScope("CustomAfterMicrosoftCommonTargets", after);
+        using var userScope = new EnvironmentVariableScope("MSBuildUserExtensionsPath", importRoot.FullName);
+        var outcomes = ConsumerRehearsal.RunDetailed(
+            Config(new PackageExpectation
+            {
+                Id = "Fixture.Standard",
+                Kind = "library",
+                Version = "1.0.0",
+                Artifacts = Artifacts(package)
+            }),
+            corpus.OutputPath,
+            TimeSpan.FromMinutes(2),
+            new ConsumerRehearsalOptions(PublicFeedPath: corpus.OutputPath));
+
+        Assert.Equal("pass", outcomes.Single().Result.Status);
+        Assert.DoesNotContain("ambient MSBuild import", outcomes.Single().Diagnostic, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public void Unavailable_sdk_is_an_infrastructure_error_before_package_failure_classification()
     {
         using var corpus = PackedCorpus.Create();
@@ -138,8 +223,8 @@ public sealed class ConsumerRehearsalTests
             TimeSpan.FromSeconds(30),
             new ConsumerRehearsalOptions(ProcessRunner: MissingSdk));
 
-        Assert.Equal("fail", outcomes.Single().Result.Status);
-        Assert.Contains("exit code 1", outcomes.Single().Diagnostic, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal("error", outcomes.Single().Result.Status);
+        Assert.Contains("infrastructure", outcomes.Single().Diagnostic, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -164,17 +249,7 @@ public sealed class ConsumerRehearsalTests
 
         Assert.Equal(4, outcomes.Count);
         Assert.All(outcomes.Where(outcome => outcome.Result.PackageId != "Fixture.Tool"), outcome => Assert.Equal("pass", outcome.Result.Status));
-        if (OperatingSystem.IsWindows())
-        {
-            Assert.Equal("pass", outcomes.Single(outcome => outcome.Result.PackageId == "Fixture.Tool").Result.Status);
-        }
-        else
-        {
-            var toolOutcome = outcomes.Single(outcome => outcome.Result.PackageId == "Fixture.Tool").Result;
-            Assert.Equal("error", toolOutcome.Status);
-            Assert.Contains("cannot be bound", toolOutcome.Message, StringComparison.OrdinalIgnoreCase);
-            Assert.Contains("configured smoke command", toolOutcome.Message, StringComparison.OrdinalIgnoreCase);
-        }
+        Assert.Equal("pass", outcomes.Single(outcome => outcome.Result.PackageId == "Fixture.Tool").Result.Status);
         Assert.Contains("net8.0", outcomes.Single(outcome => outcome.Result.PackageId == "Fixture.MultiTarget").Result.Message, StringComparison.Ordinal);
         Assert.Contains("netstandard2.1", outcomes.Single(outcome => outcome.Result.PackageId == "Fixture.MultiTarget").Result.Message, StringComparison.Ordinal);
         Assert.DoesNotContain("consumer-api:", outcomes.Single(outcome => outcome.Result.PackageId == "Fixture.Standard").Diagnostic, StringComparison.Ordinal);
@@ -238,7 +313,43 @@ public sealed class ConsumerRehearsalTests
     }
 
     [Fact]
-    public void Tool_rehearsal_blocks_apphost_and_dependency_replacement_after_validation()
+    public void Tool_rehearsal_rejects_a_new_launch_file_after_provenance_validation()
+    {
+        using var corpus = PackedCorpus.Create();
+        var package = corpus.Pack("Tool/Tool.csproj");
+        var config = Config(new PackageExpectation
+        {
+            Id = "Fixture.Tool",
+            Kind = "dotnetTool",
+            Version = "1.0.0",
+            Artifacts = Artifacts(package),
+            Command = "fixture-tool",
+            Smoke = new List<string> { "--help" }
+        });
+
+        var previousSnapshot = ConsumerRehearsal.BeforeToolLaunchSnapshotForTests;
+        ConsumerRehearsal.BeforeToolLaunchSnapshotForTests = toolDirectory =>
+            File.WriteAllText(Path.Combine(toolDirectory, "Fixture.Tool.Dependency.dll"), "pinned dependency");
+
+        try
+        {
+            var outcomes = ConsumerRehearsal.RunDetailed(
+                config,
+                corpus.OutputPath,
+                TimeSpan.FromMinutes(2),
+                new ConsumerRehearsalOptions(PublicFeedPath: Directory.CreateDirectory(Path.Combine(corpus.Root.FullName, "empty-public-feed")).FullName));
+
+            Assert.Equal("error", outcomes.Single().Result.Status);
+            Assert.Contains("pinned", outcomes.Single().Result.Message, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            ConsumerRehearsal.BeforeToolLaunchSnapshotForTests = previousSnapshot;
+        }
+    }
+
+    [Fact]
+    public void Tool_rehearsal_rejects_an_in_place_apphost_edit_after_snapshot()
     {
         using var corpus = PackedCorpus.Create();
         var package = corpus.Pack("Tool/Tool.csproj");
@@ -253,14 +364,9 @@ public sealed class ConsumerRehearsalTests
         });
 
         var previous = ConsumerRehearsal.BeforeToolLaunchForTests;
-        var previousSnapshot = ConsumerRehearsal.BeforeToolLaunchSnapshotForTests;
-        var apphostReplacementBlocked = false;
-        var dependencyReplacementBlocked = false;
-        ConsumerRehearsal.BeforeToolLaunchSnapshotForTests = toolDirectory =>
-            File.WriteAllText(Path.Combine(toolDirectory, "Fixture.Tool.Dependency.dll"), "pinned dependency");
+        var replacementBlocked = false;
         ConsumerRehearsal.BeforeToolLaunchForTests = executable =>
         {
-            var toolDirectory = Path.GetDirectoryName(executable)!;
             try
             {
                 using var apphost = new FileStream(executable, FileMode.Create, FileAccess.Write, FileShare.None);
@@ -268,24 +374,11 @@ public sealed class ConsumerRehearsalTests
             }
             catch (IOException) when (OperatingSystem.IsWindows())
             {
-                apphostReplacementBlocked = true;
+                replacementBlocked = true;
             }
             catch (UnauthorizedAccessException) when (OperatingSystem.IsWindows())
             {
-                apphostReplacementBlocked = true;
-            }
-            try
-            {
-                using var dependency = new FileStream(Path.Combine(toolDirectory, "Fixture.Tool.Dependency.dll"), FileMode.Create, FileAccess.Write, FileShare.None);
-                dependency.WriteByte(0);
-            }
-            catch (IOException) when (OperatingSystem.IsWindows())
-            {
-                dependencyReplacementBlocked = true;
-            }
-            catch (UnauthorizedAccessException) when (OperatingSystem.IsWindows())
-            {
-                dependencyReplacementBlocked = true;
+                replacementBlocked = true;
             }
         };
 
@@ -297,23 +390,19 @@ public sealed class ConsumerRehearsalTests
                 TimeSpan.FromMinutes(2),
                 new ConsumerRehearsalOptions(PublicFeedPath: Directory.CreateDirectory(Path.Combine(corpus.Root.FullName, "empty-public-feed")).FullName));
 
-            if (OperatingSystem.IsWindows())
+            if (OperatingSystem.IsWindows() && replacementBlocked)
             {
-                Assert.True(apphostReplacementBlocked, "The held launch handle did not block apphost replacement.");
-                Assert.True(dependencyReplacementBlocked, "The held launch handle did not block dependency replacement.");
                 Assert.Equal("pass", outcomes.Single().Result.Status);
             }
             else
             {
                 Assert.Equal("error", outcomes.Single().Result.Status);
-                Assert.Contains("cannot be bound", outcomes.Single().Result.Message, StringComparison.OrdinalIgnoreCase);
-                Assert.Contains("configured smoke command", outcomes.Single().Result.Message, StringComparison.OrdinalIgnoreCase);
+                Assert.Contains("changed", outcomes.Single().Result.Message, StringComparison.OrdinalIgnoreCase);
             }
         }
         finally
         {
             ConsumerRehearsal.BeforeToolLaunchForTests = previous;
-            ConsumerRehearsal.BeforeToolLaunchSnapshotForTests = previousSnapshot;
         }
     }
 
@@ -391,14 +480,20 @@ public sealed class ConsumerRehearsalTests
             Assert.True(rebound || replacementBlocked, "The reparse-child rebind probe did not run.");
             if (OperatingSystem.IsWindows())
             {
-                Assert.True(replacementBlocked, "The held launch handles did not block reparse replacement.");
-                Assert.Equal("pass", outcomes.Single().Result.Status);
+                if (replacementBlocked)
+                {
+                    Assert.Equal("pass", outcomes.Single().Result.Status);
+                }
+                else
+                {
+                    Assert.Equal("error", outcomes.Single().Result.Status);
+                    Assert.Contains("changed", outcomes.Single().Result.Message, StringComparison.OrdinalIgnoreCase);
+                }
             }
             else
             {
                 Assert.Equal("error", outcomes.Single().Result.Status);
-                Assert.Contains("cannot be bound", outcomes.Single().Result.Message, StringComparison.OrdinalIgnoreCase);
-                Assert.Contains("configured smoke command", outcomes.Single().Result.Message, StringComparison.OrdinalIgnoreCase);
+                Assert.Contains("changed", outcomes.Single().Result.Message, StringComparison.OrdinalIgnoreCase);
             }
         }
         finally
@@ -412,7 +507,7 @@ public sealed class ConsumerRehearsalTests
     {
         using var corpus = PackedCorpus.Create();
         var package = corpus.Pack("Tool/Tool.csproj");
-        var command = OperatingSystem.IsWindows() ? "fixture-tool" : "fixture-tool";
+        var command = OperatingSystem.IsWindows() ? "fixture-tool.exe" : "fixture-tool";
         var config = Config(new PackageExpectation
         {
             Id = "Fixture.Tool",
@@ -430,16 +525,7 @@ public sealed class ConsumerRehearsalTests
             new ConsumerRehearsalOptions(PublicFeedPath: Directory.CreateDirectory(Path.Combine(corpus.Root.FullName, "empty-public-feed")).FullName));
 
         Assert.Single(outcomes);
-        if (OperatingSystem.IsWindows())
-        {
-            Assert.Equal("pass", outcomes[0].Result.Status);
-        }
-        else
-        {
-            Assert.Equal("error", outcomes[0].Result.Status);
-            Assert.Contains("cannot be bound", outcomes[0].Result.Message, StringComparison.OrdinalIgnoreCase);
-            Assert.Contains("configured smoke command", outcomes[0].Result.Message, StringComparison.OrdinalIgnoreCase);
-        }
+        Assert.Equal("pass", outcomes[0].Result.Status);
     }
 
     [Fact]
@@ -539,16 +625,7 @@ public sealed class ConsumerRehearsalTests
                 PublicFeedPath: Directory.CreateDirectory(Path.Combine(corpus.Root.FullName, "empty-public-feed")).FullName));
 
         Assert.Single(outcomes);
-        if (OperatingSystem.IsWindows())
-        {
-            Assert.Equal("pass", outcomes[0].Result.Status);
-        }
-        else
-        {
-            Assert.Equal("error", outcomes[0].Result.Status);
-            Assert.Contains("cannot be bound", outcomes[0].Result.Message, StringComparison.OrdinalIgnoreCase);
-            Assert.Contains("configured smoke command", outcomes[0].Result.Message, StringComparison.OrdinalIgnoreCase);
-        }
+        Assert.Equal("pass", outcomes[0].Result.Status);
     }
 
     [Fact]
@@ -801,7 +878,7 @@ public sealed class ConsumerRehearsalTests
         var package = corpus.Pack("PublicDependency/PublicDependency.csproj", corpus.OutputPath);
         var artifactsPath = Directory.CreateDirectory(Path.Combine(corpus.Root.FullName, "unavailable-public-artifacts"));
         File.Copy(package, Path.Combine(artifactsPath.FullName, Path.GetFileName(package)));
-        var unavailablePublicFeed = Directory.CreateDirectory(Path.Combine(corpus.Root.FullName, "unavailable-public-feed"));
+        var unavailablePublicFeed = Path.Combine(corpus.Root.FullName, "unavailable-public-feed");
         var config = Config(new PackageExpectation
         {
             Id = "Fixture.PublicDependency",
@@ -815,12 +892,12 @@ public sealed class ConsumerRehearsalTests
             artifactsPath.FullName,
             corpus.Root.FullName,
             TimeSpan.FromMinutes(2),
-            new ConsumerRehearsalOptions(PublicFeedPath: unavailablePublicFeed.FullName));
+            new ConsumerRehearsalOptions(PublicFeedPath: unavailablePublicFeed));
 
-        Assert.Equal("fail", report.Status);
-        Assert.Equal(1, report.ExitCode);
+        Assert.Equal("error", report.Status);
+        Assert.Equal(2, report.ExitCode);
         var failure = Assert.Single(report.Failures, failure => failure.CheckId == "consumer-rehearsal");
-        Assert.Contains("exit code 1", failure.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("infrastructure", failure.Message, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("NU1101", failure.Message, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain(corpus.Root.FullName, failure.Message, StringComparison.OrdinalIgnoreCase);
         testOutput.WriteLine($"UNAVAILABLE_SOURCE status={report.Status} exitCode={report.ExitCode} message={failure.Message}");
@@ -864,8 +941,8 @@ public sealed class ConsumerRehearsalTests
             new ConsumerRehearsalOptions(IncludeLocalFeed: false, PublicFeedPath: publicFeed.FullName));
 
         Assert.Single(outcomes);
-        Assert.Equal("fail", outcomes[0].Result.Status);
-        Assert.Contains("exit code 1", outcomes[0].Diagnostic, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal("error", outcomes[0].Result.Status);
+        Assert.Contains("infrastructure", outcomes[0].Diagnostic, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -908,7 +985,7 @@ public sealed class ConsumerRehearsalTests
             new ConsumerRehearsalOptions(
                 IncludeLocalFeed: false,
                 PublicFeedPath: Directory.CreateDirectory(Path.Combine(corpus.Root.FullName, "empty-public-feed-2")).FullName));
-        Assert.Equal("fail", missingLocalFeedOutcome.Single().Result.Status);
+        Assert.Equal("error", missingLocalFeedOutcome.Single().Result.Status);
     }
 
     [Fact]
@@ -979,7 +1056,7 @@ public sealed class ConsumerRehearsalTests
             new ConsumerRehearsalOptions(IncludeLocalFeed: false, PublicFeedPath: publicFeed.FullName));
 
         Assert.Single(outcomes);
-        Assert.Equal("fail", outcomes[0].Result.Status);
+        Assert.Equal("error", outcomes[0].Result.Status);
     }
 
     [Fact]

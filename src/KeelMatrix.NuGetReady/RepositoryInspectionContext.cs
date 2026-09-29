@@ -18,6 +18,7 @@ internal sealed class RepositoryInspectionContext : IDisposable
     private readonly ArtifactTreeHandle tree;
     private readonly string rootIdentity;
     private readonly Dictionary<string, string> expectedIdentities = new(StringComparer.Ordinal);
+    private int snapshotEntryCount;
     private bool disposed;
 
     private RepositoryInspectionContext(string rootPath, ArtifactTreeHandle tree)
@@ -27,7 +28,7 @@ internal sealed class RepositoryInspectionContext : IDisposable
         rootIdentity = tree.Root.Identity;
         try
         {
-            SnapshotDirectory(tree.Root, string.Empty);
+            SnapshotDirectory(tree.Root, string.Empty, depth: 0);
         }
         catch
         {
@@ -177,9 +178,10 @@ internal sealed class RepositoryInspectionContext : IDisposable
 
         var files = new List<string>();
         var visited = new HashSet<string>(StringComparer.Ordinal);
+        var entryCount = 0;
         try
         {
-            status = EnumerateDirectory(directory, relativeDirectory, files, visited);
+            status = EnumerateDirectory(directory, relativeDirectory, files, visited, ref entryCount, depth: 0);
             if (status == RepositoryPathStatus.Exact && expectedIdentities.Keys.Any(expectedPath =>
                     expectedPath.StartsWith(relativeDirectory + "/", StringComparison.Ordinal) &&
                     !visited.Contains(expectedPath)))
@@ -298,8 +300,15 @@ internal sealed class RepositoryInspectionContext : IDisposable
         ArtifactDirectoryHandle directory,
         string relativeDirectory,
         ICollection<string> files,
-        ISet<string> visited)
+        ISet<string> visited,
+        ref int entryCount,
+        int depth)
     {
+        if (depth > ArtifactTreeLimits.MaxTraversalDepth)
+        {
+            return RepositoryPathStatus.Unsafe;
+        }
+
         if (!IsBound() || !directory.VerifyBinding())
         {
             return RepositoryPathStatus.Unsafe;
@@ -348,6 +357,11 @@ internal sealed class RepositoryInspectionContext : IDisposable
                 }
 
                 var relativePath = $"{relativeDirectory}/{name}";
+                if (relativePath.Length > ArtifactTreeLimits.MaxPathCharacters || ++entryCount > ArtifactTreeLimits.MaxEntryCount)
+                {
+                    return RepositoryPathStatus.Unsafe;
+                }
+
                 if (!IsExpected(relativePath, child))
                 {
                     return RepositoryPathStatus.Unsafe;
@@ -357,7 +371,7 @@ internal sealed class RepositoryInspectionContext : IDisposable
 
                 if (child.IsDirectory)
                 {
-                    var status = EnumerateDirectory(child, relativePath, files, visited);
+                    var status = EnumerateDirectory(child, relativePath, files, visited, ref entryCount, depth + 1);
                     if (status != RepositoryPathStatus.Exact)
                     {
                         return status;
@@ -433,10 +447,20 @@ internal sealed class RepositoryInspectionContext : IDisposable
         return !disposed && tree.VerifyBinding();
     }
 
-    private void SnapshotDirectory(ArtifactDirectoryHandle directory, string relativeDirectory)
+    private void SnapshotDirectory(ArtifactDirectoryHandle directory, string relativeDirectory, int depth)
     {
+        if (depth > ArtifactTreeLimits.MaxTraversalDepth)
+        {
+            throw new ArtifactTreeLimitExceededException($"Repository policy tree exceeds the {ArtifactTreeLimits.MaxTraversalDepth}-level depth limit.");
+        }
+
         foreach (var name in directory.EnumerateNames().OrderBy(name => name, StringComparer.Ordinal))
         {
+            if (++snapshotEntryCount > ArtifactTreeLimits.MaxEntryCount)
+            {
+                throw new ArtifactTreeLimitExceededException($"Repository policy tree exceeds the {ArtifactTreeLimits.MaxEntryCount}-entry limit.");
+            }
+
             using var child = directory.OpenChild(name);
             if (child.IsReparsePoint)
             {
@@ -446,10 +470,15 @@ internal sealed class RepositoryInspectionContext : IDisposable
             var relativePath = string.IsNullOrEmpty(relativeDirectory)
                 ? name
                 : $"{relativeDirectory}/{name}";
+            if (relativePath.Length > ArtifactTreeLimits.MaxPathCharacters)
+            {
+                throw new ArtifactTreeLimitExceededException($"Repository policy tree contains a path longer than the {ArtifactTreeLimits.MaxPathCharacters}-character limit.");
+            }
+
             expectedIdentities[relativePath] = child.Identity;
             if (child.IsDirectory && ShouldSnapshotChildren(relativePath))
             {
-                SnapshotDirectory(child, relativePath);
+                SnapshotDirectory(child, relativePath, depth + 1);
             }
         }
     }

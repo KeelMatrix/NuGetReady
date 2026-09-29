@@ -133,14 +133,15 @@ public sealed class ReleaseWorkflowContractTests
     }
 
     [Fact]
-    public void Ci_accepts_only_the_documented_unix_launch_error()
+    public void Ci_requires_positive_tool_rehearsal_on_every_promised_host()
     {
         var root = FindRepositoryRoot();
         var workflow = File.ReadAllText(Path.Combine(root, ".github", "workflows", "ci.yml"));
 
-        Assert.Contains("$expectedPackageCheckExitCode = if ($IsWindows) { 0 } else { 2 }", workflow, StringComparison.Ordinal);
-        Assert.Contains("$expectedCorpusCheckExitCode = if ($IsWindows) { 0 } else { 2 }", workflow, StringComparison.Ordinal);
-        Assert.Contains("configured smoke command", workflow, StringComparison.Ordinal);
+        Assert.Contains("$expectedPackageCheckExitCode = 0", workflow, StringComparison.Ordinal);
+        Assert.Contains("$expectedCorpusCheckExitCode = 0", workflow, StringComparison.Ordinal);
+        Assert.DoesNotContain("Unix package inspection did not report", workflow, StringComparison.Ordinal);
+        Assert.DoesNotContain("Unix installed-tool rehearsal did not report", workflow, StringComparison.Ordinal);
         Assert.Contains("$PSNativeCommandUseErrorActionPreference = $false", workflow, StringComparison.Ordinal);
         Assert.Contains("$packageCheckExitCode -ne $expectedPackageCheckExitCode", workflow, StringComparison.Ordinal);
         Assert.Contains("$corpusCheckExitCode -ne $expectedCorpusCheckExitCode", workflow, StringComparison.Ordinal);

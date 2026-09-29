@@ -1,5 +1,6 @@
 using System.Reflection;
 using System.Globalization;
+using System.Net.Http;
 using System.Reflection.Metadata;
 using System.Reflection.PortableExecutable;
 using System.Text;
@@ -105,6 +106,7 @@ internal static class ConsumerRehearsal
         {
             var feedPath = Directory.CreateDirectory(Path.Combine(root.FullName, "feed")).FullName;
             var cliHome = Directory.CreateDirectory(Path.Combine(root.FullName, "cli-home")).FullName;
+            var isolatedMsBuildUserExtensions = Directory.CreateDirectory(Path.Combine(root.FullName, "empty-msbuild-user-extensions")).FullName;
             var localPackageIds = config.Packages!
                 .Select(package => package.Id!)
                 .ToHashSet(StringComparer.OrdinalIgnoreCase);
@@ -149,6 +151,9 @@ internal static class ConsumerRehearsal
                 ["ImportDirectoryBuildProps"] = "false",
                 ["ImportDirectoryBuildTargets"] = "false",
                 ["ImportDirectoryTargets"] = "false",
+                ["CustomBeforeMicrosoftCommonTargets"] = null,
+                ["CustomAfterMicrosoftCommonTargets"] = null,
+                ["MSBuildUserExtensionsPath"] = isolatedMsBuildUserExtensions,
                 ["DOTNET_CLI_HOME"] = cliHome,
                 ["DOTNET_NOLOGO"] = "1",
                 // Restore must extract the complete package payload, even when
@@ -157,6 +162,24 @@ internal static class ConsumerRehearsal
                 ["MSBUILDDISABLENODEREUSE"] = "1",
                 ["DOTNET_CLI_TELEMETRY_OPTOUT"] = "1"
             };
+
+            var sdkProbe = RunDotnetAsync(
+                ["--version"],
+                root.FullName,
+                baseEnvironment,
+                timeout,
+                options.ProcessRunner,
+                cancellationToken).GetAwaiter().GetResult();
+            if (!Succeeded(sdkProbe))
+            {
+                return config.Packages!
+                    .Select(package => Failure(
+                        package,
+                        "The required .NET SDK could not be verified before consumer rehearsal.",
+                        isError: true,
+                        diagnostic: "The consumer rehearsal infrastructure is unavailable because the SDK preflight did not complete successfully."))
+                    .ToArray();
+            }
 
             foreach (var package in config.Packages!)
             {
@@ -294,6 +317,14 @@ internal static class ConsumerRehearsal
                 $"Target framework '{target.Framework}' is outside the supported consumer rehearsal framework matrix for this host.");
         }
 
+        if (!HasTargetFrameworkInfrastructure(target.Framework))
+        {
+            return new TargetRehearsalOutcome(
+                false,
+                true,
+                $"Target framework '{target.Framework}' cannot be rehearsed because its required reference infrastructure is not installed on this host.");
+        }
+
         var outputType = frameworkSupport == ConsumerTargetFrameworkSupport.Runnable ? "Exe" : "Library";
         var apiTypes = string.Join(", ", target.ApiTypes.Select(type => $"typeof({type})"));
         var source = $$"""
@@ -325,6 +356,9 @@ internal static class ConsumerRehearsal
                 <ImportDirectoryBuildProps>false</ImportDirectoryBuildProps>
                 <ImportDirectoryBuildTargets>false</ImportDirectoryBuildTargets>
                 <ImportDirectoryTargets>false</ImportDirectoryTargets>
+                <CustomBeforeMicrosoftCommonTargets></CustomBeforeMicrosoftCommonTargets>
+                <CustomAfterMicrosoftCommonTargets></CustomAfterMicrosoftCommonTargets>
+                <MSBuildUserExtensionsPath>{EscapeXml(Path.Combine(Path.GetDirectoryName(projectPath)!, "empty-msbuild-user-extensions"))}</MSBuildUserExtensionsPath>
                 <RestoreNoCache>true</RestoreNoCache>
                 <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
               </PropertyGroup>
@@ -345,6 +379,15 @@ internal static class ConsumerRehearsal
         var restoreOutcome = ClassifyProcessResult(restore, ProcessPhase.Restore);
         if (!restoreOutcome.Passed)
         {
+            if (!restoreOutcome.IsError && IsConfiguredRestoreInfrastructureUnavailable(options, timeout, cancellationToken))
+            {
+                return restoreOutcome with
+                {
+                    IsError = true,
+                    Diagnostic = "The consumer rehearsal infrastructure is unavailable because a configured package source could not be reached."
+                };
+            }
+
             return restoreOutcome;
         }
 
@@ -391,6 +434,94 @@ internal static class ConsumerRehearsal
         return ClassifyProcessResult(run, ProcessPhase.Run);
     }
 
+    private static bool HasTargetFrameworkInfrastructure(string framework)
+    {
+        if (framework.StartsWith("netstandard", StringComparison.OrdinalIgnoreCase))
+        {
+            return HasReferencePack("NETStandard.Library.Ref", framework["netstandard".Length..]);
+        }
+
+        if (framework.StartsWith("net4", StringComparison.OrdinalIgnoreCase))
+        {
+            if (!OperatingSystem.IsWindows())
+            {
+                return false;
+            }
+
+            var versionDigits = framework[3..];
+            var version = versionDigits.Length switch
+            {
+                2 when versionDigits[0] == '4' => $"4.{versionDigits[1]}",
+                3 when versionDigits[0] == '4' => $"4.{versionDigits[1]}.{versionDigits[2]}",
+                _ => string.Empty
+            };
+            if (version.Length == 0)
+            {
+                return false;
+            }
+
+            return new[]
+            {
+                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
+                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles)
+            }
+            .Where(path => !string.IsNullOrWhiteSpace(path))
+            .Select(path => Path.Combine(path, "Reference Assemblies", "Microsoft", "Framework", ".NETFramework", $"v{version}"))
+            .Any(Directory.Exists);
+        }
+
+        if (!framework.StartsWith("net", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var suffix = framework[3..];
+        var separator = suffix.IndexOf('.');
+        var minorText = separator >= 0 && separator + 1 < suffix.Length
+            ? new string(suffix[(separator + 1)..].TakeWhile(char.IsDigit).ToArray())
+            : string.Empty;
+        if (separator <= 0 || minorText.Length == 0 ||
+            !int.TryParse(suffix[..separator], out var major) ||
+            !int.TryParse(minorText, out var minor))
+        {
+            return false;
+        }
+
+        var pack = suffix.Contains("-windows", StringComparison.OrdinalIgnoreCase)
+            ? "Microsoft.WindowsDesktop.App.Ref"
+            : "Microsoft.NETCore.App.Ref";
+        return HasReferencePack(pack, $"{major}.{minor}");
+    }
+
+    private static bool HasReferencePack(string packName, string versionPrefix)
+    {
+        var runtimeDirectory = new DirectoryInfo(System.Runtime.InteropServices.RuntimeEnvironment.GetRuntimeDirectory());
+        var dotnetRoot = runtimeDirectory.Parent?.Parent?.Parent?.FullName;
+        if (dotnetRoot is null)
+        {
+            return false;
+        }
+
+        var packRoot = Path.Combine(dotnetRoot, "packs", packName);
+        try
+        {
+            return Directory.EnumerateDirectories(packRoot)
+                .Any(path => string.Equals(Path.GetFileName(path), versionPrefix, StringComparison.OrdinalIgnoreCase) ||
+                             Path.GetFileName(path).StartsWith(versionPrefix + ".", StringComparison.OrdinalIgnoreCase) ||
+                             (packName.Equals("NETStandard.Library.Ref", StringComparison.Ordinal) &&
+                              versionPrefix.Equals("2.0", StringComparison.Ordinal) &&
+                              Path.GetFileName(path).StartsWith("2.", StringComparison.OrdinalIgnoreCase)));
+        }
+        catch (DirectoryNotFoundException)
+        {
+            return false;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
     private static async Task<RehearsalOutcome> RunToolAsync(
         PackageExpectation package,
         string packagePath,
@@ -412,6 +543,15 @@ internal static class ConsumerRehearsal
         var installOutcome = ClassifyProcessResult(install, ProcessPhase.ToolInstall);
         if (!installOutcome.Passed)
         {
+            if (!installOutcome.IsError && IsConfiguredRestoreInfrastructureUnavailable(options, timeout, cancellationToken))
+            {
+                installOutcome = installOutcome with
+                {
+                    IsError = true,
+                    Diagnostic = "The consumer rehearsal infrastructure is unavailable because a configured package source could not be reached."
+                };
+            }
+
             return Failure(package, "The isolated tool could not be installed from the controlled feed.", installOutcome.IsError, installOutcome.Diagnostic);
         }
 
@@ -430,8 +570,14 @@ internal static class ConsumerRehearsal
         ToolLaunchSnapshot launch;
         try
         {
+            var verifiedLaunchManifest = CaptureLaunchManifest(toolPath);
             BeforeToolLaunchSnapshotForTests?.Invoke(toolPath);
-            launch = ToolLaunchSnapshot.Create(toolPath, packageRoot, Path.GetFileName(executable), executableIdentity);
+            launch = ToolLaunchSnapshot.Create(
+                toolPath,
+                packageRoot,
+                Path.GetFileName(executable),
+                executableIdentity,
+                verifiedLaunchManifest);
         }
         catch (IOException)
         {
@@ -445,13 +591,9 @@ internal static class ConsumerRehearsal
         using (launch)
         {
             BeforeToolLaunchForTests?.Invoke(launch.ExecutablePath);
-            if (!ToolLaunchSnapshot.CanLaunchSafely)
+            if (!launch.VerifyUnchanged())
             {
-                return Failure(
-                    package,
-                    "The installed tool could not be launched safely for its configured smoke command on this host because the apphost and its path-loaded dependencies cannot be bound through process creation.",
-                    true,
-                    string.Empty);
+                return Failure(package, "The verified tool launch image changed before process creation.", true, string.Empty);
             }
 
             var smoke = package.Smoke?.ToArray() ?? Array.Empty<string>();
@@ -534,25 +676,31 @@ internal static class ConsumerRehearsal
             string root,
             string executablePath,
             ArtifactTreeHandle launchTree,
-            IReadOnlyList<ArtifactDirectoryHandle> launchEntries)
+            IReadOnlyList<ArtifactDirectoryHandle> launchEntries,
+            IReadOnlyDictionary<string, string> verifiedManifest)
         {
             Root = root;
             ExecutablePath = executablePath;
             LaunchTree = launchTree;
             LaunchEntries = launchEntries;
+            VerifiedManifest = verifiedManifest;
         }
 
         private string Root { get; }
         private ArtifactTreeHandle LaunchTree { get; }
         private IReadOnlyList<ArtifactDirectoryHandle> LaunchEntries { get; }
+        private IReadOnlyDictionary<string, string> VerifiedManifest { get; }
         public string ExecutablePath { get; }
-        public static bool CanLaunchSafely => OperatingSystem.IsWindows();
+        // Windows uses held launch handles; Unix uses a private content-bound
+        // copy whose bytes are verified before process creation.
+        public static bool CanLaunchSafely => true;
 
         public static ToolLaunchSnapshot Create(
             string toolPath,
             string packageRoot,
             string executableName,
-            string expectedExecutableIdentity)
+            string expectedExecutableIdentity,
+            IReadOnlyDictionary<string, string> verifiedManifest)
         {
             using var source = ArtifactTreeHandle.Open(toolPath);
             if (!source.VerifyBinding())
@@ -570,7 +718,23 @@ internal static class ConsumerRehearsal
                     throw new IOException("The installed tool executable changed before it could be pinned.");
                 }
 
-                CopyDirectory(source, source.Root, root, executableName, verifiedExecutable, topLevel: true);
+                var copiedFiles = new HashSet<string>(StringComparer.Ordinal);
+                var aggregateBytes = 0L;
+                CopyDirectory(
+                    source,
+                    source.Root,
+                    root,
+                    executableName,
+                    verifiedExecutable,
+                    verifiedManifest,
+                    copiedFiles,
+                    ref aggregateBytes,
+                    relativeDirectory: string.Empty,
+                    topLevel: true);
+                if (!copiedFiles.SetEquals(verifiedManifest.Keys))
+                {
+                    throw new IOException("The installed tool changed while its verified launch image was being copied.");
+                }
                 if (!source.VerifyBinding())
                 {
                     throw new IOException("The installed tool directory changed while it was being pinned.");
@@ -593,7 +757,7 @@ internal static class ConsumerRehearsal
                         throw new IOException("The pinned tool launch image changed before it could be launched.");
                     }
 
-                    return new ToolLaunchSnapshot(root, executable, launchTree, launchEntries);
+                    return new ToolLaunchSnapshot(root, executable, launchTree, launchEntries, verifiedManifest);
                 }
                 catch
                 {
@@ -619,6 +783,10 @@ internal static class ConsumerRehearsal
             string destination,
             string executableName,
             ArtifactDirectoryHandle pinnedExecutable,
+            IReadOnlyDictionary<string, string> verifiedManifest,
+            ISet<string> copiedFiles,
+            ref long aggregateBytes,
+            string relativeDirectory,
             bool topLevel)
         {
             Directory.CreateDirectory(destination);
@@ -638,16 +806,38 @@ internal static class ConsumerRehearsal
                 }
 
                 var target = Path.Combine(destination, name);
+                var relativePath = string.IsNullOrEmpty(relativeDirectory) ? name : $"{relativeDirectory}/{name}";
                 if (child.IsDirectory)
                 {
-                    CopyDirectory(tree, child, target, executableName, pinnedExecutable, topLevel: false);
+                    CopyDirectory(
+                        tree,
+                        child,
+                        target,
+                        executableName,
+                        pinnedExecutable,
+                        verifiedManifest,
+                        copiedFiles,
+                        ref aggregateBytes,
+                        relativePath,
+                        topLevel: false);
                     continue;
+                }
+
+                if (!verifiedManifest.TryGetValue(relativePath, out var expectedHash))
+                {
+                    throw new IOException("The installed tool gained an unverified launch file.");
                 }
 
                 using var file = new ArtifactFileHandle(child);
                 using var input = file.OpenRead();
                 using var output = new FileStream(target, FileMode.CreateNew, FileAccess.Write, FileShare.None);
-                input.CopyTo(output);
+                var copiedHash = ArtifactSnapshotSet.CopyAndHash(input, output, ref aggregateBytes);
+                if (!string.Equals(copiedHash, expectedHash, StringComparison.Ordinal))
+                {
+                    throw new IOException("The installed tool launch file changed after provenance verification.");
+                }
+
+                copiedFiles.Add(relativePath);
 
                 // FileStream creates a non-executable destination on Unix. The
                 // verified tool child is an apphost and must retain execute
@@ -725,6 +915,43 @@ internal static class ConsumerRehearsal
             LaunchTree.Dispose();
             DeleteDirectory(new DirectoryInfo(Root));
         }
+
+        public bool VerifyUnchanged()
+        {
+            try
+            {
+                var current = CaptureLaunchManifest(Root);
+                return current.Count == VerifiedManifest.Count &&
+                       current.All(pair => VerifiedManifest.TryGetValue(pair.Key, out var expected) &&
+                                           string.Equals(expected, pair.Value, StringComparison.Ordinal));
+            }
+            catch (IOException)
+            {
+                return false;
+            }
+            catch (UnauthorizedAccessException)
+            {
+                return false;
+            }
+        }
+    }
+
+    private static Dictionary<string, string> CaptureLaunchManifest(string toolPath)
+    {
+        using var scan = ArtifactTreeScanner.Scan(
+            ArtifactTreeHandle.Open(toolPath),
+            ownsHandle: true,
+            hashArchives: false);
+        var manifest = new Dictionary<string, string>(StringComparer.Ordinal);
+        var aggregateBytes = 0L;
+        foreach (var entry in scan.Entries.Where(entry => !entry.IsDirectory).OrderBy(entry => entry.RelativePath, StringComparer.Ordinal))
+        {
+            using var file = scan.OpenFile(entry.RelativePath);
+            using var stream = file.OpenRead();
+            manifest.Add(entry.RelativePath, ArtifactSnapshotSet.CopyAndHash(stream, Stream.Null, ref aggregateBytes));
+        }
+
+        return manifest;
     }
 
     private static async Task<ProcessResult> RunDotnetAsync(
@@ -738,6 +965,47 @@ internal static class ConsumerRehearsal
         return processRunner is null
             ? await BoundedProcess.RunAsync("dotnet", arguments, workingDirectory, environment, timeout, cancellationToken: cancellationToken).ConfigureAwait(false)
             : await processRunner("dotnet", arguments, workingDirectory, environment, timeout).ConfigureAwait(false);
+    }
+
+    private static bool IsConfiguredRestoreInfrastructureUnavailable(
+        ConsumerRehearsalOptions options,
+        TimeSpan timeout,
+        CancellationToken cancellationToken)
+    {
+        if (!options.IncludeLocalFeed)
+        {
+            return true;
+        }
+
+        var source = options.PublicFeedPath ?? "https://api.nuget.org/v3/index.json";
+        if (!Uri.TryCreate(source, UriKind.Absolute, out var uri) ||
+            uri.Scheme.Equals(Uri.UriSchemeFile, StringComparison.OrdinalIgnoreCase) ||
+            (!uri.Scheme.Equals(Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase) &&
+             !uri.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)))
+        {
+            return !Directory.Exists(source);
+        }
+
+        using var request = new HttpRequestMessage(HttpMethod.Get, uri);
+        using var client = new HttpClient
+        {
+            Timeout = timeout <= TimeSpan.Zero ? TimeSpan.FromSeconds(1) : timeout
+        };
+        using var linkedCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        linkedCancellation.CancelAfter(TimeSpan.FromSeconds(Math.Min(10, Math.Max(1, timeout.TotalSeconds))));
+        try
+        {
+            using var response = client.Send(request, HttpCompletionOption.ResponseHeadersRead, linkedCancellation.Token);
+            return !response.IsSuccessStatusCode;
+        }
+        catch (HttpRequestException)
+        {
+            return true;
+        }
+        catch (TaskCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            return true;
+        }
     }
 
     private static bool Succeeded(ProcessResult result)
@@ -984,6 +1252,10 @@ internal static class ConsumerRehearsal
     {
         var tick = metadataName.IndexOf('`');
         var name = EscapeCSharpIdentifier(tick >= 0 ? metadataName[..tick] : metadataName);
+        if (tick >= 0 && int.TryParse(metadataName[(tick + 1)..], out var genericCount) && genericCount > 0)
+        {
+            name += "<" + new string(',', genericCount - 1) + ">";
+        }
         var qualifiedNamespace = string.IsNullOrWhiteSpace(namespaceName)
             ? string.Empty
             : string.Join(".", namespaceName.Split('.').Select(EscapeCSharpIdentifier));

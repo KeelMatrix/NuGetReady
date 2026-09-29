@@ -222,25 +222,38 @@ public sealed class PackageInspectionContractTests
     }
 
     [Fact]
-    public async Task Pack_fails_closed_for_local_environment_and_telemetry_files_even_when_directory_targets_are_disabled()
+    public async Task Pack_fails_closed_for_local_generated_linked_renamed_and_wildcard_sensitive_inputs()
     {
         var project = FindRepositoryFile("src", "KeelMatrix.NuGetReady", "KeelMatrix.NuGetReady.csproj");
         var projectDirectory = Path.GetDirectoryName(project)!;
-        var sensitiveFiles = new[] { ".env.local", "keelmatrix.telemetry.json" }
+        var sensitiveFiles = new[]
+            {
+                ".env.local",
+                "keelmatrix.telemetry.json",
+                "obj/credentials.json",
+                "obj/generated-secret.json",
+                "linked-input/.env.linked"
+            }
             .Select(name => Path.Combine(projectDirectory, name))
             .ToArray();
+        var linkedDirectory = Path.Combine(projectDirectory, "linked-input");
         var originalProject = File.ReadAllText(project);
         var output = Directory.CreateTempSubdirectory("nugetready-pack-guard-");
         try
         {
             foreach (var path in sensitiveFiles)
             {
+                Directory.CreateDirectory(Path.GetDirectoryName(path)!);
                 File.WriteAllText(path, "local-only");
             }
             var packItems = string.Join(
                 Environment.NewLine,
-                new[] { ".env.local", "keelmatrix.telemetry.json" }
-                    .Select(name => $"  <ItemGroup><None Include=\"{name}\" Pack=\"true\" PackagePath=\"{name}\" /></ItemGroup>"));
+                [
+                    "  <ItemGroup><None Include=\".env.local\" Pack=\"true\" PackagePath=\".env.local\" /></ItemGroup>",
+                    "  <ItemGroup><None Include=\"keelmatrix.telemetry.json\" Pack=\"true\" PackagePath=\"keelmatrix.telemetry.json\" /></ItemGroup>",
+                    "  <ItemGroup><None Include=\"obj/*.json\" Pack=\"true\" PackagePath=\"docs/%(Filename).txt\" /></ItemGroup>",
+                    "  <ItemGroup><None Include=\"linked-input/.env.linked\" Link=\"renamed-safe.txt\" Pack=\"true\" PackagePath=\"docs/renamed-safe.txt\" /></ItemGroup>"
+                ]);
             File.WriteAllText(project, originalProject.Replace("</Project>", packItems + Environment.NewLine + "</Project>", StringComparison.Ordinal));
 
             var result = await BoundedProcess.RunAsync(
@@ -271,6 +284,11 @@ public sealed class PackageInspectionContractTests
                 {
                     File.Delete(path);
                 }
+            }
+
+            if (Directory.Exists(linkedDirectory))
+            {
+                Directory.Delete(linkedDirectory, recursive: true);
             }
 
             File.WriteAllText(project, originalProject);

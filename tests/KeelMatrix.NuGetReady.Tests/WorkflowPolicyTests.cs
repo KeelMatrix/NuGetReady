@@ -1155,6 +1155,45 @@ public sealed class WorkflowPolicyTests
     }
 
     [Fact]
+    public void Output_command_substitution_is_not_certified_as_inert()
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", """
+            name: continuous integration
+            on:
+              push:
+                branches: [main]
+            jobs:
+              build:
+                steps:
+                  - run: echo "$(dotnet nuget push artifacts/package.nupkg)"
+            """);
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        AssertLimitedUnproven(inspection);
+    }
+
+    [Fact]
+    public void Single_quoted_output_substitution_text_remains_an_inert_control()
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", """
+            name: continuous integration
+            on:
+              pull_request:
+            permissions: {}
+            jobs:
+              build:
+                steps:
+                  - run: echo '$(dotnet nuget push artifacts/package.nupkg)'
+            """);
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        Assert.False(inspection.Evaluated, string.Join(" | ", inspection.Failures.Select(failure => failure.Message)));
+        Assert.Empty(inspection.Failures);
+    }
+
+    [Fact]
     public void Indirect_script_depth_limit_is_limited_unproven()
     {
         using var repository = WorkflowRepository.Create("ci.yml", """

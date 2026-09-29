@@ -168,10 +168,9 @@ jobs:
           finally {
             $PSNativeCommandUseErrorActionPreference = $nativePreference
           }
-          $expectedPackageCheckExitCode = if ($IsWindows) { 0 } else { 2 }
+          $expectedPackageCheckExitCode = 0
           $packageCheck | Write-Output
           if ($packageCheckExitCode -ne $expectedPackageCheckExitCode) { throw "Built tool package inspection returned exit code $packageCheckExitCode; expected $expectedPackageCheckExitCode for this host." }
-          if (-not $IsWindows -and $packageCheck -notmatch 'configured smoke command') { throw "Unix package inspection did not report the configured smoke command launch diagnostic." }
           $global:LASTEXITCODE = 0
 
       - name: Install and use the built tool from an isolated feed
@@ -219,10 +218,9 @@ jobs:
           finally {
             $PSNativeCommandUseErrorActionPreference = $nativePreference
           }
-          $expectedCorpusCheckExitCode = if ($IsWindows) { 0 } else { 2 }
+          $expectedCorpusCheckExitCode = 0
           $corpusCheck | Write-Output
           if ($corpusCheckExitCode -ne $expectedCorpusCheckExitCode) { throw "The installed tool returned exit code $corpusCheckExitCode; expected $expectedCorpusCheckExitCode for this host." }
-          if (-not $IsWindows -and $corpusCheck -notmatch 'configured smoke command') { throw "Unix installed-tool rehearsal did not report the configured smoke command launch diagnostic." }
           $global:LASTEXITCODE = 0
 
           # A copy in a published-looking source must not satisfy the exact local mapping.

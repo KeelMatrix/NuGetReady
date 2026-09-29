@@ -39,10 +39,29 @@ function Test-ExtensionFamily {
 }
 
 function Test-SensitivePackagePath {
-    param([string]$Path)
+    param(
+        [string]$Path,
+        [string[]]$SiblingPaths = @()
+    )
 
     $normalized = $Path.Replace("\", "/").TrimStart("/")
     $lower = $normalized.ToLowerInvariant()
+    $name = [IO.Path]::GetFileName($lower)
+    if ($name.EndsWith(".xml", [StringComparison]::OrdinalIgnoreCase)) {
+        $directory = [IO.Path]::GetDirectoryName($lower)
+        $stem = $name.Substring(0, $name.Length - 4)
+        foreach ($siblingPath in @($SiblingPaths)) {
+            $sibling = ([string]$siblingPath).Replace("\", "/").TrimStart("/").ToLowerInvariant()
+            if ([IO.Path]::GetDirectoryName($sibling) -eq $directory) {
+                $siblingName = [IO.Path]::GetFileName($sibling)
+                if (@(".dll", ".exe", ".pdb", ".so", ".dylib") | Where-Object { $siblingName.EndsWith([string]$_, [StringComparison]::OrdinalIgnoreCase) }) {
+                    $extension = $siblingName.LastIndexOf('.')
+                    if ($extension -gt 0 -and $siblingName.Substring(0, $extension) -eq $stem) { return $false }
+                }
+            }
+        }
+    }
+
     if (@($packageSensitivePathPolicy.pathFragments) | Where-Object { $lower.Contains([string]$_, [StringComparison]::Ordinal) }) { return $true }
 
     $segments = $lower.Split('/', [StringSplitOptions]::RemoveEmptyEntries)
@@ -87,7 +106,6 @@ function Test-SensitivePackagePath {
         }
     }
 
-    $name = [IO.Path]::GetFileName($lower)
     $nameWithoutLeadingDots = $name.TrimStart('.')
     if (@($packageSensitivePathPolicy.exactFileNames) | Where-Object {
             $exact = ([string]$_).ToLowerInvariant()
@@ -116,4 +134,23 @@ function Test-SensitivePackagePath {
             return $false
         }) { return $true }
     return $false
+}
+
+function Remove-GeneratedOutputSegments {
+    param([string]$Path)
+
+    $segments = $Path.Replace("\", "/").TrimStart("/").Split('/', [StringSplitOptions]::RemoveEmptyEntries) |
+        Where-Object { $_ -notin @("bin", "obj") }
+    return ($segments -join "/")
+}
+
+function Test-SensitivePackSourcePath {
+    param(
+        [string]$Path,
+        [string[]]$SiblingPaths = @()
+    )
+
+    $normalizedPath = Remove-GeneratedOutputSegments $Path
+    $normalizedSiblings = @($SiblingPaths | ForEach-Object { Remove-GeneratedOutputSegments ([string]$_) })
+    return Test-SensitivePackagePath $normalizedPath -SiblingPaths $normalizedSiblings
 }

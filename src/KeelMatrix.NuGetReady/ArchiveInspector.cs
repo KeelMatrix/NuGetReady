@@ -35,7 +35,7 @@ internal static class ArchiveInspector
         {
             CheckSymbols(reader, archiveFiles, mainPackagePath, failures);
 
-            CheckUnexpectedFiles(files, failures);
+            CheckUnexpectedFiles(files, files, failures);
             return WithArtifactContext(failures, expectation, artifactFileName ?? Path.GetFileName(path));
         }
 
@@ -85,7 +85,7 @@ internal static class ArchiveInspector
 
         CheckDependencyGroups(nuspec, files, failures);
         CheckLayout(reader, archiveFiles, expectation, files, failures);
-        CheckUnexpectedFiles(files, failures);
+        CheckUnexpectedFiles(files, files, failures);
         return WithArtifactContext(failures, expectation, artifactFileName ?? Path.GetFileName(path));
     }
 
@@ -183,9 +183,12 @@ internal static class ArchiveInspector
         }
     }
 
-    private static void CheckUnexpectedFiles(IReadOnlyList<string> files, List<Failure> failures)
+    private static void CheckUnexpectedFiles(
+        IReadOnlyList<string> files,
+        IReadOnlyCollection<string> siblingPaths,
+        List<Failure> failures)
     {
-        foreach (var file in files.Where(IsUnexpectedFile).OrderBy(file => file, StringComparer.Ordinal))
+        foreach (var file in files.Where(file => IsUnexpectedFile(file, siblingPaths)).OrderBy(file => file, StringComparer.Ordinal))
         {
             failures.Add(new Failure("archive-security", "Archive contains an unexpected sensitive or internal file."));
         }
@@ -224,9 +227,14 @@ internal static class ArchiveInspector
                 var symbolAssemblyNames = pdbFiles
                     .Select(GetFileNameWithoutExtension)
                     .ToHashSet(StringComparer.OrdinalIgnoreCase);
+                var dependencyAssemblyNames = mainReader!.NuspecReader
+                    .GetDependencyGroups()
+                    .SelectMany(group => group.Packages)
+                    .Select(dependency => GetFileNameWithoutExtension(dependency.Id + ".dll"))
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
                 foreach (var assembly in mainFiles.Paths.Where(file =>
                              IsSymbolBearingAssembly(file) &&
-                             IsIntendedSymbolAssembly(file, mainFiles, symbolAssemblyNames)))
+                             IsIntendedSymbolAssembly(file, mainFiles, symbolAssemblyNames, dependencyAssemblyNames)))
                 {
                     var expectedPdb = assembly[..^4] + ".pdb";
                     if (!symbolSet.Contains(expectedPdb))
@@ -373,6 +381,7 @@ internal static class ArchiveInspector
     private static void ValidateSourceLink(MetadataReader metadata, List<Failure> failures)
     {
         var sourceLinkGuid = new Guid("CC110556-A091-4D38-9FEC-25AB9A351A6A");
+        var foundSourceLink = false;
         foreach (var handle in metadata.CustomDebugInformation)
         {
             var information = metadata.GetCustomDebugInformation(handle);
@@ -380,6 +389,14 @@ internal static class ArchiveInspector
             {
                 continue;
             }
+
+            if (foundSourceLink)
+            {
+                failures.Add(new Failure("archive-layout", "Portable PDB contains more than one SourceLink mapping."));
+                continue;
+            }
+
+            foundSourceLink = true;
 
             try
             {
@@ -394,26 +411,34 @@ internal static class ArchiveInspector
                 }
 
                 var mappings = documents.EnumerateObject().ToArray();
+                var valid = true;
                 foreach (var mapping in mappings)
                 {
                     if (mapping.Name.Length == 0 || mapping.Value.ValueKind != System.Text.Json.JsonValueKind.String)
                     {
                         failures.Add(new Failure("archive-layout", "Portable PDB SourceLink metadata is invalid."));
-                        break;
+                        valid = false;
+                        continue;
                     }
 
                     var value = mapping.Value.GetString();
-                    if (value is null || !value.Contains('*', StringComparison.Ordinal) ||
+                    var keyWildcards = CountOccurrences(mapping.Name, '*');
+                    var valueWildcards = value is null ? 0 : CountOccurrences(value, '*');
+                    var pairedWildcard = keyWildcards == 1 && valueWildcards == 1;
+                    var exactMapping = keyWildcards == 0 && valueWildcards == 0;
+                    if ((!pairedWildcard && !exactMapping) ||
+                        value is null ||
                         !Uri.TryCreate(value.Replace("*", "source", StringComparison.Ordinal), UriKind.Absolute, out var uri) ||
                         (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
                     {
                         failures.Add(new Failure("archive-layout", "Portable PDB SourceLink metadata is invalid."));
-                        break;
+                        valid = false;
                     }
                 }
 
-                if (!mappings.All(mapping => mapping.Value.ValueKind == System.Text.Json.JsonValueKind.String) ||
-                    !metadata.Documents.Select(handle => metadata.GetString(metadata.GetDocument(handle).Name)).All(documentName => mappings.Any(mapping => SourceLinkMatches(mapping.Name, documentName))))
+                if (valid && !metadata.Documents
+                        .Select(handle => metadata.GetString(metadata.GetDocument(handle).Name))
+                        .All(documentName => mappings.Any(mapping => SourceLinkMatches(mapping.Name, documentName))))
                 {
                     failures.Add(new Failure("archive-layout", "Portable PDB SourceLink metadata does not cover all source documents."));
                 }
@@ -423,6 +448,11 @@ internal static class ArchiveInspector
                 failures.Add(new Failure("archive-layout", "Portable PDB SourceLink metadata is invalid."));
             }
         }
+    }
+
+    private static int CountOccurrences(string value, char character)
+    {
+        return value.Count(candidate => candidate == character);
     }
 
     private static CanonicalArchiveFiles GetValidatedFiles(PackageArchiveReader reader)
@@ -448,11 +478,27 @@ internal static class ArchiveInspector
     private static bool IsIntendedSymbolAssembly(
         string assembly,
         CanonicalArchiveFiles mainFiles,
-        HashSet<string> symbolAssemblyNames)
+        HashSet<string> symbolAssemblyNames,
+        HashSet<string> dependencyAssemblyNames)
     {
         var expectedPdb = assembly[..^4] + ".pdb";
-        return mainFiles.Paths.Contains(expectedPdb, StringComparer.OrdinalIgnoreCase) ||
-               symbolAssemblyNames.Contains(GetFileNameWithoutExtension(assembly));
+        if (mainFiles.Paths.Contains(expectedPdb, StringComparer.OrdinalIgnoreCase) ||
+            symbolAssemblyNames.Contains(GetFileNameWithoutExtension(assembly)))
+        {
+            return true;
+        }
+
+        var assemblyName = GetFileNameWithoutExtension(assembly);
+        // Package-owned assemblies are covered even when their PDB is absent;
+        // otherwise a valid unrelated PDB could make omitted symbols disappear
+        // from the expected set. Bundled dependency/runtime binaries are the
+        // explicit exclusions: they are identified by declared dependency IDs
+        // or by framework-owned assembly prefixes, not by the supplied PDB set.
+        return !dependencyAssemblyNames.Contains(assemblyName) &&
+               !assemblyName.StartsWith("System.", StringComparison.OrdinalIgnoreCase) &&
+               !assemblyName.StartsWith("Microsoft.", StringComparison.OrdinalIgnoreCase) &&
+               !assemblyName.StartsWith("NuGet.", StringComparison.OrdinalIgnoreCase) &&
+               !assemblyName.StartsWith("Newtonsoft.", StringComparison.OrdinalIgnoreCase);
     }
 
     private static string GetFileNameWithoutExtension(string path)
@@ -467,14 +513,20 @@ internal static class ArchiveInspector
 
     private static bool SourceLinkMatches(string pattern, string document)
     {
-        var star = pattern.IndexOf('*');
-        if (star < 0)
+        var first = pattern.IndexOf('*');
+        if (first < 0)
         {
             return string.Equals(pattern, document, StringComparison.OrdinalIgnoreCase);
         }
 
-        return document.StartsWith(pattern[..star], StringComparison.OrdinalIgnoreCase) &&
-               document.EndsWith(pattern[(star + 1)..], StringComparison.OrdinalIgnoreCase);
+        if (CountOccurrences(pattern, '*') != 1)
+        {
+            return false;
+        }
+
+        return document.StartsWith(pattern[..first], StringComparison.OrdinalIgnoreCase) &&
+               document.EndsWith(pattern[(first + 1)..], StringComparison.OrdinalIgnoreCase) &&
+               document.Length >= pattern.Length - 1;
     }
 
     private static void CheckToolCommand(
@@ -506,7 +558,7 @@ internal static class ArchiveInspector
         {
             failures.Add(new Failure("archive-layout", "Tool settings do not declare a command."));
         }
-        else if (expectation.Command is not null && !commands.Contains(expectation.Command, StringComparer.Ordinal))
+        else if (expectation.Command is not null && !commands.Any(command => ToolCommandPolicy.NamesEquivalent(expectation.Command, command)))
         {
             failures.Add(new Failure("archive-layout", "Tool settings do not declare the configured command."));
         }
@@ -527,9 +579,9 @@ internal static class ArchiveInspector
                files.Any(candidate => string.Equals(candidate, expected, StringComparison.OrdinalIgnoreCase));
     }
 
-    private static bool IsUnexpectedFile(string file)
+    private static bool IsUnexpectedFile(string file, IReadOnlyCollection<string> siblingPaths)
     {
-        return PackageSensitiveFilePolicy.IsSensitive(file);
+        return PackageSensitiveFilePolicy.IsSensitive(file, siblingPaths);
     }
 
 }

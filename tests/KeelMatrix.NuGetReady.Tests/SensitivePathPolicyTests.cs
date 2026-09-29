@@ -5,6 +5,25 @@ namespace KeelMatrix.NuGetReady.Tests;
 public sealed class SensitivePathPolicyTests
 {
     [Fact]
+    public void Assembly_documentation_is_allowed_only_with_the_matching_assembly_role()
+    {
+        Assert.False(PackageSensitiveFilePolicy.IsSensitive(
+            "lib/net8.0/SecretParser.xml",
+            ["lib/net8.0/SecretParser.dll"]));
+        Assert.False(PackageSensitiveFilePolicy.IsSensitive(
+            "ref/net8.0/PasswordHasher.xml",
+            ["ref/net8.0/PasswordHasher.dll"]));
+        Assert.True(PackageSensitiveFilePolicy.IsSensitive("lib/net8.0/SecretParser.xml"));
+        Assert.True(PackageSensitiveFilePolicy.IsSensitive(
+            "lib/net8.0/SecretParser.xml",
+            ["lib/net8.0/OtherAssembly.dll"]));
+        Assert.True(PackageSensitiveFilePolicy.IsSensitive(
+            "lib/net8.0/SecretParser.xml",
+            ["ref/net8.0/SecretParser.dll"]));
+        Assert.False(PackageSensitiveFilePolicy.IsSensitive("lib/net8.0/SecretParser.dll"));
+    }
+
+    [Fact]
     public async Task Tool_and_power_shell_policy_accept_manifest_generated_legitimate_embedded_names()
     {
         var manifest = PackageSensitiveFilePolicy.ReadManifestForTests();

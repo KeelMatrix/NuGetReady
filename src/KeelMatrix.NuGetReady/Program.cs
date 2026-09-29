@@ -76,8 +76,11 @@ internal static class NuGetReadyApplication
         }
         catch (OperationCanceledException)
         {
-            WriteError("NuGetReady was cancelled before the bounded checks completed.", options?.Format ?? OutputFormat.Text);
-            return 130;
+            WriteError(
+                "NuGetReady was cancelled before the bounded checks completed.",
+                options?.Format ?? OutputFormat.Text,
+                cancelled: true);
+            return 2;
         }
         catch (Exception)
         {
@@ -86,22 +89,28 @@ internal static class NuGetReadyApplication
         }
     }
 
-    private static void WriteError(string message, OutputFormat format)
+    private static void WriteError(string message, OutputFormat format, bool cancelled = false)
     {
         if (format == OutputFormat.Json)
         {
-            var failure = new Failure("input", message, true);
+            var checkId = cancelled ? "consumer-rehearsal" : "input";
+            var failure = new Failure(checkId, message, true);
+            var checks = CheckContract.Order
+                .Select(id => id == checkId
+                    ? new CheckResult(id, new[] { failure }, CheckContract.Error)
+                    : new CheckResult(id, Array.Empty<Failure>(), CheckContract.NotRun))
+                .ToArray();
             ReportWriter.Write(new ReadinessReport
             {
                 Status = "error",
                 ExitCode = 2,
-                Checks = new[] { new CheckResult("input", new[] { failure }) },
+                Checks = checks,
                 Failures = new[] { failure }
             }, format);
         }
         else
         {
-            Console.Error.WriteLine($"Configuration error: {message}");
+            Console.Error.WriteLine($"{(cancelled ? "NuGetReady error" : "Configuration error")}: {message}");
         }
     }
 }

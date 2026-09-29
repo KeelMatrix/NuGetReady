@@ -329,7 +329,11 @@ internal static class BoundedProcess
         {
             if (unixProcessGroup)
             {
-                process.Kill(entireProcessTree: true);
+                if (!process.HasExited)
+                {
+                    _ = UnixProcessSupervisor.RequestTermination(process.Id);
+                }
+
                 return WaitForDirectExit(process);
             }
 
@@ -369,7 +373,10 @@ internal static class BoundedProcess
                 return true;
             }
 
-            return process.WaitForExit((int)TerminationGracePeriod.TotalMilliseconds) && process.HasExited;
+            var waitMilliseconds = !OperatingSystem.IsWindows()
+                ? (int)TimeSpan.FromSeconds(5).TotalMilliseconds
+                : (int)TerminationGracePeriod.TotalMilliseconds;
+            return process.WaitForExit(waitMilliseconds) && process.HasExited;
         }
         catch (InvalidOperationException)
         {
@@ -527,6 +534,13 @@ internal static class UnixProcessSupervisor
 
     internal sealed record SupervisorRequest(string FileName, string[] Arguments);
 
+    private static int terminationRequested;
+
+    public static bool RequestTermination(int processId)
+    {
+        return kill(processId, SigTerm) == 0 || Marshal.GetLastWin32Error() == NoSuchProcessError;
+    }
+
     public static string Encode(string fileName, IReadOnlyList<string> arguments)
     {
         return Convert.ToBase64String(JsonSerializer.SerializeToUtf8Bytes(new SupervisorRequest(fileName, arguments.ToArray())));
@@ -565,6 +579,13 @@ internal static class UnixProcessSupervisor
         var environmentVector = IntPtr.Zero;
         var spawnAttributes = IntPtr.Zero;
         var spawnAttributesInitialized = false;
+        using var terminationSignal = PosixSignalRegistration.Create(
+            PosixSignal.SIGTERM,
+            context =>
+            {
+                context.Cancel = true;
+                Volatile.Write(ref terminationRequested, 1);
+            });
         try
         {
             filePointer = Marshal.StringToCoTaskMemUTF8(request.FileName);
@@ -633,7 +654,10 @@ internal static class UnixProcessSupervisor
 
             SignalReady();
             var status = 0;
-            if (waitpid(child, out status, 0) < 0)
+            var macDescendants = OperatingSystem.IsMacOS()
+                ? new Dictionary<int, string>()
+                : null;
+            if (WaitForChild(child, out status, macDescendants) < 0)
             {
                 return 125;
             }
@@ -641,7 +665,7 @@ internal static class UnixProcessSupervisor
             // The target has its own process group. Kill and verify that group before
             // claiming cleanup; on Linux also require the subreaper to have no adopted
             // child remaining, which keeps detached/reparented descendants unproven.
-            var descendantsClean = KillAndVerifyProcessGroup(child);
+            var descendantsClean = KillAndVerifyProcessGroup(child, macDescendants);
             if (!descendantsClean)
             {
                 return 125;
@@ -730,8 +754,45 @@ internal static class UnixProcessSupervisor
         _ = write(1, signal, (nuint)signal.Length);
     }
 
+    private static int WaitForChild(
+        int child,
+        out int status,
+        Dictionary<int, string>? macDescendants)
+    {
+        status = 0;
+        while (true)
+        {
+            if (macDescendants is not null)
+            {
+                TrackMacDescendants(child, macDescendants);
+            }
+
+            if (Volatile.Read(ref terminationRequested) != 0)
+            {
+                _ = kill(-child, SigKill);
+                if (macDescendants is not null)
+                {
+                    KillTrackedMacDescendants(macDescendants);
+                }
+            }
+
+            var result = waitpid(child, out status, WaitNoHang);
+            if (result != 0)
+            {
+                return result;
+            }
+
+            Thread.Sleep(10);
+        }
+    }
+
     private static bool ReapDescendants()
     {
+        if (OperatingSystem.IsLinux())
+        {
+            return KillAndReapLinuxDescendants();
+        }
+
         var deadline = DateTime.UtcNow + (OperatingSystem.IsMacOS()
             ? TimeSpan.FromSeconds(5)
             : TimeSpan.FromMilliseconds(250));
@@ -753,14 +814,81 @@ internal static class UnixProcessSupervisor
         return waitpid(-1, out _, WaitNoHang) < 0 && Marshal.GetLastWin32Error() == NoChildrenError;
     }
 
-    private static bool KillAndVerifyProcessGroup(int processGroupId)
+    private static bool KillAndReapLinuxDescendants()
+    {
+        var deadline = DateTime.UtcNow + TimeSpan.FromMilliseconds(500);
+        var childrenPath = $"/proc/{Environment.ProcessId}/task/{Environment.ProcessId}/children";
+        while (DateTime.UtcNow < deadline)
+        {
+            var adopted = ReadLinuxAdoptedChildren(childrenPath);
+            foreach (var child in adopted)
+            {
+                _ = kill(child, SigKill);
+            }
+
+            var reapedAny = false;
+            while (waitpid(-1, out _, WaitNoHang) > 0)
+            {
+                reapedAny = true;
+            }
+
+            if (ReadLinuxAdoptedChildren(childrenPath).Length == 0)
+            {
+                var waitResult = waitpid(-1, out _, WaitNoHang);
+                return waitResult < 0 && Marshal.GetLastWin32Error() == NoChildrenError;
+            }
+
+            if (!reapedAny && adopted.Length == 0)
+            {
+                Thread.Sleep(10);
+            }
+        }
+
+        return ReadLinuxAdoptedChildren(childrenPath).Length == 0 &&
+               waitpid(-1, out _, WaitNoHang) < 0 &&
+               Marshal.GetLastWin32Error() == NoChildrenError;
+    }
+
+    private static int[] ReadLinuxAdoptedChildren(string childrenPath)
+    {
+        try
+        {
+            return File.ReadAllText(childrenPath)
+                .Split(' ', StringSplitOptions.RemoveEmptyEntries)
+                .Select(value => int.TryParse(value, out var pid) ? pid : 0)
+                .Where(pid => pid > 0)
+                .ToArray();
+        }
+        catch (IOException)
+        {
+            return Array.Empty<int>();
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return Array.Empty<int>();
+        }
+    }
+
+    private static bool KillAndVerifyProcessGroup(
+        int processGroupId,
+        IReadOnlyDictionary<int, string>? macDescendants = null)
     {
         _ = kill(-processGroupId, SigKill);
+        if (macDescendants is not null)
+        {
+            KillTrackedMacDescendants(macDescendants);
+        }
+
         var deadline = DateTime.UtcNow + (OperatingSystem.IsMacOS()
             ? TimeSpan.FromSeconds(5)
             : TimeSpan.FromMilliseconds(250));
         while (DateTime.UtcNow < deadline)
         {
+            if (macDescendants is not null)
+            {
+                KillTrackedMacDescendants(macDescendants);
+            }
+
             if (OperatingSystem.IsLinux())
             {
                 while (waitpid(-1, out _, WaitNoHang) > 0)
@@ -771,7 +899,9 @@ internal static class UnixProcessSupervisor
             if (kill(-processGroupId, 0) != 0)
             {
                 var groupError = Marshal.GetLastWin32Error();
-                if (OperatingSystem.IsMacOS() && MacProcessGroupHasNoLiveMembers(processGroupId))
+                if (OperatingSystem.IsMacOS() &&
+                    MacProcessGroupHasNoLiveMembers(processGroupId) &&
+                    MacTrackedDescendantsHaveNoLiveMembers(macDescendants))
                 {
                     return true;
                 }
@@ -780,7 +910,9 @@ internal static class UnixProcessSupervisor
                     (!OperatingSystem.IsLinux() || ReapDescendants());
             }
 
-            if (OperatingSystem.IsMacOS() && MacProcessGroupHasNoLiveMembers(processGroupId))
+            if (OperatingSystem.IsMacOS() &&
+                MacProcessGroupHasNoLiveMembers(processGroupId) &&
+                MacTrackedDescendantsHaveNoLiveMembers(macDescendants))
             {
                 return true;
             }
@@ -788,7 +920,9 @@ internal static class UnixProcessSupervisor
             Thread.Sleep(10);
         }
 
-        if (OperatingSystem.IsMacOS() && MacProcessGroupHasNoLiveMembers(processGroupId))
+        if (OperatingSystem.IsMacOS() &&
+            MacProcessGroupHasNoLiveMembers(processGroupId) &&
+            MacTrackedDescendantsHaveNoLiveMembers(macDescendants))
         {
             return true;
         }
@@ -798,7 +932,76 @@ internal static class UnixProcessSupervisor
             (!OperatingSystem.IsLinux() || ReapDescendants());
     }
 
-    private static bool MacProcessGroupHasNoLiveMembers(int processGroupId)
+    private static void TrackMacDescendants(int rootProcessId, IDictionary<int, string> tracked)
+    {
+        var processes = ReadMacProcessSnapshot();
+        if (processes is null)
+        {
+            return;
+        }
+
+        var descendants = new HashSet<int> { rootProcessId };
+        var changed = true;
+        while (changed)
+        {
+            changed = false;
+            foreach (var process in processes.Values)
+            {
+                if (!process.IsZombie && descendants.Contains(process.ParentProcessId) && descendants.Add(process.ProcessId))
+                {
+                    changed = true;
+                }
+            }
+        }
+
+        foreach (var processId in descendants)
+        {
+            if (processId != rootProcessId && processes.TryGetValue(processId, out var process) && !process.IsZombie)
+            {
+                tracked.TryAdd(processId, process.StartTime);
+            }
+        }
+    }
+
+    private static void KillTrackedMacDescendants(IReadOnlyDictionary<int, string> tracked)
+    {
+        var processes = ReadMacProcessSnapshot();
+        if (processes is null)
+        {
+            return;
+        }
+
+        foreach (var (processId, startTime) in tracked)
+        {
+            if (processes.TryGetValue(processId, out var process) &&
+                !process.IsZombie &&
+                string.Equals(process.StartTime, startTime, StringComparison.Ordinal))
+            {
+                _ = kill(processId, SigKill);
+            }
+        }
+    }
+
+    private static bool MacTrackedDescendantsHaveNoLiveMembers(IReadOnlyDictionary<int, string>? tracked)
+    {
+        if (tracked is null || tracked.Count == 0)
+        {
+            return true;
+        }
+
+        var processes = ReadMacProcessSnapshot();
+        if (processes is null)
+        {
+            return false;
+        }
+
+        return tracked.All(pair =>
+            !processes.TryGetValue(pair.Key, out var process) ||
+            process.IsZombie ||
+            !string.Equals(process.StartTime, pair.Value, StringComparison.Ordinal));
+    }
+
+    private static Dictionary<int, MacProcessInfo>? ReadMacProcessSnapshot()
     {
         try
         {
@@ -808,38 +1011,62 @@ internal static class UnixProcessSupervisor
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
-                ArgumentList = { "-axo", "pid=,pgid=,state=" }
+                ArgumentList = { "-axo", "pid=,ppid=,pgid=,state=,lstart=" }
             });
             if (process is null)
             {
-                return false;
+                return null;
             }
 
             var output = process.StandardOutput.ReadToEnd();
             if (!process.WaitForExit(1000) || process.ExitCode != 0)
             {
-                return false;
+                return null;
             }
 
+            var snapshot = new Dictionary<int, MacProcessInfo>();
             foreach (var line in output.Split('\n', StringSplitOptions.RemoveEmptyEntries))
             {
                 var fields = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-                if (fields.Length >= 3 &&
-                    int.TryParse(fields[1], out var groupId) &&
-                    groupId == processGroupId &&
-                    !fields[2].StartsWith('Z'))
+                if (fields.Length >= 9 &&
+                    int.TryParse(fields[0], out var processId) &&
+                    int.TryParse(fields[1], out var parentProcessId) &&
+                    int.TryParse(fields[2], out var groupId))
                 {
-                    return false;
+                    snapshot[processId] = new MacProcessInfo(
+                        processId,
+                        parentProcessId,
+                        groupId,
+                        fields[3].StartsWith('Z'),
+                        string.Join(' ', fields.Skip(4)));
                 }
             }
 
-            return true;
+            return snapshot;
         }
         catch (Exception exception) when (exception is InvalidOperationException or System.ComponentModel.Win32Exception)
         {
-            return false;
+            return null;
         }
     }
+
+    private static bool MacProcessGroupHasNoLiveMembers(int processGroupId)
+    {
+        var processes = ReadMacProcessSnapshot();
+        if (processes is null)
+        {
+            return false;
+        }
+
+        return processes.Values.All(process => process.ProcessGroupId != processGroupId || process.IsZombie);
+    }
+
+    private readonly record struct MacProcessInfo(
+        int ProcessId,
+        int ParentProcessId,
+        int ProcessGroupId,
+        bool IsZombie,
+        string StartTime);
 
     private static int DecodeExitStatus(int status)
     {
@@ -848,6 +1075,7 @@ internal static class UnixProcessSupervisor
 
     private const int PrSetChildSubreaper = 36;
     private const int SigKill = 9;
+    private const int SigTerm = 15;
     private const int WaitNoHang = 1;
     private const int NoChildrenError = 10;
     private const int NoSuchProcessError = 3;

@@ -9,7 +9,7 @@ The 0.1.0 release is planned and unreleased.
 ### Added
 
 - Provides deterministic exact-artifact and package-archive readiness checks for NuGet libraries and .NET tools.
-- Rehearses isolated library restore/build against a public API for every declared target framework and .NET tool installation/smoke execution on Windows using the just-built artifacts, a temporary local feed, controlled sources, and a fresh package cache; Linux and macOS fail closed before tool smoke execution with an infrastructure error identifying the configured smoke command when a handle-bound launch cannot be provided.
+- Rehearses isolated library restore/build against a public API for every declared target framework and .NET tool installation/smoke execution on Windows, Linux, and macOS using the just-built artifacts, a temporary local feed, controlled sources, and a fresh package cache. Tool smoke runs from a private content-bound launch image; a launch-image mutation or unproven process lifecycle is an infrastructure error.
 - Supports versioned repository configuration, text and JSON reports, stable exit codes, narrow release-workflow policy checks, and explicit `not-run`/`not-applicable` states when a check cannot be evaluated.
 - Validates portable PDB identity and checksum correspondence, package-sensitive paths, file-based licenses, bounded process cleanup, deterministic diagnostics, and telemetry opt-out behavior.
 - Rejects manifest-defined sensitive-name families when protected names are extended or used as directory segments, while the separate package-content contract rejects undeclared binary and XML entries even when their names are legitimate assemblies.
@@ -29,11 +29,13 @@ The 0.1.0 release is planned and unreleased.
 - Accepts customer-owned Trusted Publishing usernames in the supported workflow profile, with an optional explicit expected username for repositories that require one.
 - Snapshots counted package archives before inspection, uses one immutable snapshot for archive, dependency, feed, consumer, and provenance checks, and verifies the source files remain unchanged after the rehearsal.
 - Rejects tool smoke arguments outside `dotnetTool` expectations or containing embedded NUL characters, isolates generated consumers from ambient `Directory.Build.*` imports, escapes control characters in human-readable diagnostics, and inspects the exact release-built package bytes before release upload.
+- Defines public cancellation as `error`/exit `2`, with JSON `exitCode: 2`, downstream checks `not-run`, and telemetry ineligible.
+- Keeps generated `bin`/`obj` pack sources usable while applying the sensitive filename/family policy to their source identities and to every pack destination, including linked, renamed, and wildcard-selected inputs.
 - Inspects workflow, configuration, local script, and composite-action paths through a pinned repository identity snapshot and descriptor-relative handles; missing pinned nodes, reparse points, and root, ancestor, or leaf rebinding fail closed without reading outside content.
 
 ### Fixed
 
 - Pins the accepted artifact root and traversed ancestors for handle-relative enumeration, attribute inspection, archive opens, hashing, snapshot copies, and final verification, failing closed before outside-root bytes are read during rebinds.
-- Keeps tool-command validation bound to a direct non-reparse installed child and, on Windows, launches a private handle-held snapshot of the complete installed tool directory, closing apphost and dependency replacement windows through process creation. Linux and macOS return an infrastructure error identifying the configured smoke command when their generic process-creation APIs cannot provide the same binding.
-- Aligns CI validation with the platform contract: Windows requires a successful smoke rehearsal, while Linux and macOS accept only the documented configured-smoke-command launch error with exit code `2`.
+- Keeps tool-command validation bound to a direct non-reparse installed child and launches a private content-bound snapshot of the complete installed tool directory on every supported host, closing apphost and dependency replacement windows through pre-launch content verification; Windows additionally holds launch entries with replacement-blocking sharing through process creation.
+- Aligns CI validation with the platform contract: Windows, Linux, and macOS each require successful installed-tool smoke rehearsal and exit code `0` for the positive controls.
 - Treats deletion of any pinned workflow-policy node after repository snapshot as an unsafe input instead of allowing the workflow check to become `not-applicable`.

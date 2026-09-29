@@ -132,7 +132,7 @@ function Inspect-Archive {
             )
         }
 
-        $forbidden = @($entries | Where-Object { Test-SensitivePackagePath $_ })
+        $forbidden = @($entries | Where-Object { Test-SensitivePackagePath $_ -SiblingPaths $entries })
         Assert-Contract ($forbidden.Count -eq 0) "Forbidden archive entries found: $($forbidden -join ', ')"
 
         $unexpected = @($entries | Where-Object {

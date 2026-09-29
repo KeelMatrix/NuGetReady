@@ -63,4 +63,24 @@ internal static class ToolCommandPolicy
 
         return !ReservedDeviceNames.Contains(stem.TrimEnd('.', ' '));
     }
+
+    public static bool NamesEquivalent(string configured, string declared)
+    {
+        if (string.Equals(configured, declared, StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        if (!OperatingSystem.IsWindows())
+        {
+            return false;
+        }
+
+        return string.Equals(AddExeSuffix(configured), AddExeSuffix(declared), StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string AddExeSuffix(string command)
+    {
+        return command.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) ? command : command + ".exe";
+    }
 }

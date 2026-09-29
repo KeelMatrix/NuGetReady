@@ -211,6 +211,16 @@ internal sealed class ArtifactDirectoryHandle : IDisposable
         {
             beforeAttribute?.Invoke();
             var info = ArtifactNative.GetInfo(childHandle);
+            if (!info.IsDirectory && !info.IsRegularFile)
+            {
+                throw new IOException("Artifact tree contains an unsupported filesystem entry type.");
+            }
+
+            if (requireNonDirectory && info.IsDirectory)
+            {
+                throw new IOException("Artifact launch entry is a directory.");
+            }
+
             return new ArtifactDirectoryHandle(childHandle, this, name, info.Identity, info.Attributes);
         }
         catch
@@ -328,7 +338,8 @@ internal readonly record struct ArtifactNodeInfo(
     FileAttributes Attributes,
     long Length,
     long LastWriteUtcTicks,
-    long CreationUtcTicks)
+    long CreationUtcTicks,
+    bool IsRegularFile)
 {
     public bool IsDirectory => (Attributes & FileAttributes.Directory) != 0;
 }
@@ -366,6 +377,9 @@ internal static class ArtifactNative
     private const int UnixReadOnly = 0;
     private const int UnixNoFollowLinux = 0x20000;
     private const int UnixNoFollowMacOs = 0x100;
+    private const int UnixNonBlockLinux = 0x800;
+    private const int UnixNonBlockMacOs = 0x4;
+    private const int UnixRegularMode = 0x8000;
     private const int UnixSymlinkMode = 0xA000;
     private const int UnixFileTypeMask = 0xF000;
     private const int UnixDirectoryMode = 0x4000;
@@ -408,7 +422,8 @@ internal static class ArtifactNative
         var normalized = NormalizeUnixPath(path);
         var descriptor = UnixOpen(
             normalized == "/" ? normalized : "/",
-            UnixReadOnly | (OperatingSystem.IsMacOS() ? UnixNoFollowMacOs : UnixNoFollowLinux),
+            UnixReadOnly |
+            (OperatingSystem.IsMacOS() ? UnixNoFollowMacOs | UnixNonBlockMacOs : UnixNoFollowLinux | UnixNonBlockLinux),
             0);
         if (descriptor < 0)
         {
@@ -429,7 +444,11 @@ internal static class ArtifactNative
             return OpenWindowsRelative(parent, name, exclusiveForLaunch, requireNonDirectory);
         }
 
-        var flags = UnixReadOnly | (OperatingSystem.IsMacOS() ? UnixNoFollowMacOs : UnixNoFollowLinux);
+        // O_NONBLOCK prevents opening a FIFO from waiting for a writer. The
+        // descriptor is inspected immediately and non-regular entries are
+        // rejected before any read can occur.
+        var flags = UnixReadOnly |
+                    (OperatingSystem.IsMacOS() ? UnixNoFollowMacOs | UnixNonBlockMacOs : UnixNoFollowLinux | UnixNonBlockLinux);
         var descriptor = UnixOpenAt(parent.DangerousGetHandle().ToInt32(), name, flags, 0);
         if (descriptor < 0)
         {
@@ -492,7 +511,8 @@ internal static class ArtifactNative
                 attributes,
                 ((long)information.FileSizeHigh << 32) | information.FileSizeLow,
                 FileTimeTicks(information.LastWriteTime),
-                FileTimeTicks(information.CreationTime));
+                FileTimeTicks(information.CreationTime),
+                (attributes & FileAttributes.Directory) == 0);
         }
 
         if (OperatingSystem.IsMacOS())
@@ -503,20 +523,26 @@ internal static class ArtifactNative
             }
 
             var mode = information.Mode;
+            var fileType = mode & UnixFileTypeMask;
             var identity = new ArtifactPathIdentity(
                 $"{information.Device:x}:{information.Inode:x}",
-                (mode & UnixFileTypeMask) == UnixSymlinkMode);
-            var attributes = (mode & UnixFileTypeMask) == UnixDirectoryMode ? FileAttributes.Directory : FileAttributes.Normal;
-            return new ArtifactNodeInfo(identity, attributes, information.Size, UnixTimeTicks(information.ModifyTime), UnixTimeTicks(information.BirthTime));
+                fileType == UnixSymlinkMode);
+            var isDirectory = fileType == UnixDirectoryMode;
+            var isRegularFile = fileType == UnixRegularMode;
+            var attributes = isDirectory ? FileAttributes.Directory : FileAttributes.Normal;
+            return new ArtifactNodeInfo(identity, attributes, information.Size, UnixTimeTicks(information.ModifyTime), UnixTimeTicks(information.BirthTime), isRegularFile);
         }
 
         if (LinuxFStat(handle.DangerousGetHandle().ToInt32(), out var linux) == 0)
         {
+            var fileType = linux.Mode & UnixFileTypeMask;
             var identity = new ArtifactPathIdentity(
                 $"{linux.Device:x}:{linux.Inode:x}",
-                (linux.Mode & UnixFileTypeMask) == UnixSymlinkMode);
-            var attributes = (linux.Mode & UnixFileTypeMask) == UnixDirectoryMode ? FileAttributes.Directory : FileAttributes.Normal;
-            return new ArtifactNodeInfo(identity, attributes, linux.Size, UnixTimeTicks((linux.ModifySeconds, linux.ModifyNanoseconds)), UnixTimeTicks((linux.ChangeSeconds, linux.ChangeNanoseconds)));
+                fileType == UnixSymlinkMode);
+            var isDirectory = fileType == UnixDirectoryMode;
+            var isRegularFile = fileType == UnixRegularMode;
+            var attributes = isDirectory ? FileAttributes.Directory : FileAttributes.Normal;
+            return new ArtifactNodeInfo(identity, attributes, linux.Size, UnixTimeTicks((linux.ModifySeconds, linux.ModifyNanoseconds)), UnixTimeTicks((linux.ChangeSeconds, linux.ChangeNanoseconds)), isRegularFile);
         }
 
         throw new IOException("Artifact entry could not be inspected.", new Win32Exception(Marshal.GetLastWin32Error()));
@@ -599,7 +625,8 @@ internal static class ArtifactNative
         var enumerationDescriptor = UnixOpenAt(
             handle.DangerousGetHandle().ToInt32(),
             ".",
-            UnixReadOnly | (OperatingSystem.IsMacOS() ? UnixNoFollowMacOs : UnixNoFollowLinux),
+            UnixReadOnly |
+            (OperatingSystem.IsMacOS() ? UnixNoFollowMacOs | UnixNonBlockMacOs : UnixNoFollowLinux | UnixNonBlockLinux),
             0);
         if (enumerationDescriptor < 0)
         {
