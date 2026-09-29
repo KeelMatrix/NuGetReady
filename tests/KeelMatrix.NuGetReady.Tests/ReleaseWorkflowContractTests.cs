@@ -141,6 +141,7 @@ public sealed class ReleaseWorkflowContractTests
         Assert.Contains("$expectedPackageCheckExitCode = if ($IsWindows) { 0 } else { 2 }", workflow, StringComparison.Ordinal);
         Assert.Contains("$expectedCorpusCheckExitCode = if ($IsWindows) { 0 } else { 2 }", workflow, StringComparison.Ordinal);
         Assert.Contains("configured smoke command", workflow, StringComparison.Ordinal);
+        Assert.Contains("$PSNativeCommandUseErrorActionPreference = $false", workflow, StringComparison.Ordinal);
         Assert.Contains("$packageCheckExitCode -ne $expectedPackageCheckExitCode", workflow, StringComparison.Ordinal);
         Assert.Contains("$corpusCheckExitCode -ne $expectedCorpusCheckExitCode", workflow, StringComparison.Ordinal);
     }

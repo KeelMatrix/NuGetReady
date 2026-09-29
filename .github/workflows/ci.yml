@@ -159,8 +159,15 @@ jobs:
             -PackagePath (Join-Path $packages 'KeelMatrix.NuGetReady.0.1.0.nupkg') `
             -SymbolsPackagePath (Join-Path $packages 'KeelMatrix.NuGetReady.0.1.0.snupkg')
           if ($LASTEXITCODE -ne 0) { throw "Tool package inspection failed." }
-          $packageCheck = & dotnet run --project src/KeelMatrix.NuGetReady/KeelMatrix.NuGetReady.csproj --configuration Release --no-build --no-restore -- check --config nugetready.json --artifacts $packages --format json 2>&1 | Out-String
-          $packageCheckExitCode = $LASTEXITCODE
+          $nativePreference = $PSNativeCommandUseErrorActionPreference
+          $PSNativeCommandUseErrorActionPreference = $false
+          try {
+            $packageCheck = & dotnet run --project src/KeelMatrix.NuGetReady/KeelMatrix.NuGetReady.csproj --configuration Release --no-build --no-restore -- check --config nugetready.json --artifacts $packages --format json 2>&1 | Out-String
+            $packageCheckExitCode = $LASTEXITCODE
+          }
+          finally {
+            $PSNativeCommandUseErrorActionPreference = $nativePreference
+          }
           $expectedPackageCheckExitCode = if ($IsWindows) { 0 } else { 2 }
           $packageCheck | Write-Output
           if ($packageCheckExitCode -ne $expectedPackageCheckExitCode) { throw "Built tool package inspection returned exit code $packageCheckExitCode; expected $expectedPackageCheckExitCode for this host." }
@@ -202,8 +209,15 @@ jobs:
           if (-not (Test-Path $tool)) { throw "The isolated tool executable was not created." }
           $corpusConfig = Join-Path $corpus 'nugetready.json'
           $env:PATH = "$toolPath$([IO.Path]::PathSeparator)$env:PATH"
-          $corpusCheck = & nugetready check --config $corpusConfig --artifacts $corpus --format json 2>&1 | Out-String
-          $corpusCheckExitCode = $LASTEXITCODE
+          $nativePreference = $PSNativeCommandUseErrorActionPreference
+          $PSNativeCommandUseErrorActionPreference = $false
+          try {
+            $corpusCheck = & nugetready check --config $corpusConfig --artifacts $corpus --format json 2>&1 | Out-String
+            $corpusCheckExitCode = $LASTEXITCODE
+          }
+          finally {
+            $PSNativeCommandUseErrorActionPreference = $nativePreference
+          }
           $expectedCorpusCheckExitCode = if ($IsWindows) { 0 } else { 2 }
           $corpusCheck | Write-Output
           if ($corpusCheckExitCode -ne $expectedCorpusCheckExitCode) { throw "The installed tool returned exit code $corpusCheckExitCode; expected $expectedCorpusCheckExitCode for this host." }
