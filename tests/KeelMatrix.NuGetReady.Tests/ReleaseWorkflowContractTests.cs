@@ -132,6 +132,19 @@ public sealed class ReleaseWorkflowContractTests
         Assert.DoesNotContain("$corpusConfig = Join-Path $root 'artifacts/corpus/nugetready.json'", workflow, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void Ci_accepts_only_the_documented_unix_launch_error()
+    {
+        var root = FindRepositoryRoot();
+        var workflow = File.ReadAllText(Path.Combine(root, ".github", "workflows", "ci.yml"));
+
+        Assert.Contains("$expectedPackageCheckExitCode = if ($IsWindows) { 0 } else { 2 }", workflow, StringComparison.Ordinal);
+        Assert.Contains("$expectedCorpusCheckExitCode = if ($IsWindows) { 0 } else { 2 }", workflow, StringComparison.Ordinal);
+        Assert.Contains("configured smoke command", workflow, StringComparison.Ordinal);
+        Assert.Contains("$packageCheckExitCode -ne $expectedPackageCheckExitCode", workflow, StringComparison.Ordinal);
+        Assert.Contains("$corpusCheckExitCode -ne $expectedCorpusCheckExitCode", workflow, StringComparison.Ordinal);
+    }
+
     private static string FindRepositoryRoot()
     {
         var directory = new DirectoryInfo(AppContext.BaseDirectory);

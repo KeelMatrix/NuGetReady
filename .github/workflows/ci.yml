@@ -159,8 +159,12 @@ jobs:
             -PackagePath (Join-Path $packages 'KeelMatrix.NuGetReady.0.1.0.nupkg') `
             -SymbolsPackagePath (Join-Path $packages 'KeelMatrix.NuGetReady.0.1.0.snupkg')
           if ($LASTEXITCODE -ne 0) { throw "Tool package inspection failed." }
-          dotnet run --project src/KeelMatrix.NuGetReady/KeelMatrix.NuGetReady.csproj --configuration Release --no-build --no-restore -- check --config nugetready.json --artifacts $packages --format json
-          if ($LASTEXITCODE -ne 0) { throw "Built tool package inspection failed." }
+          $packageCheck = & dotnet run --project src/KeelMatrix.NuGetReady/KeelMatrix.NuGetReady.csproj --configuration Release --no-build --no-restore -- check --config nugetready.json --artifacts $packages --format json 2>&1 | Out-String
+          $packageCheckExitCode = $LASTEXITCODE
+          $expectedPackageCheckExitCode = if ($IsWindows) { 0 } else { 2 }
+          $packageCheck | Write-Output
+          if ($packageCheckExitCode -ne $expectedPackageCheckExitCode) { throw "Built tool package inspection returned exit code $packageCheckExitCode; expected $expectedPackageCheckExitCode for this host." }
+          if (-not $IsWindows -and $packageCheck -notmatch 'configured smoke command') { throw "Unix package inspection did not report the configured smoke command launch diagnostic." }
 
       - name: Install and use the built tool from an isolated feed
         shell: pwsh
@@ -198,8 +202,12 @@ jobs:
           if (-not (Test-Path $tool)) { throw "The isolated tool executable was not created." }
           $corpusConfig = Join-Path $corpus 'nugetready.json'
           $env:PATH = "$toolPath$([IO.Path]::PathSeparator)$env:PATH"
-          nugetready check --config $corpusConfig --artifacts $corpus --format json
-          if ($LASTEXITCODE -ne 0) { throw "The installed tool failed the end-to-end corpus rehearsal." }
+          $corpusCheck = & nugetready check --config $corpusConfig --artifacts $corpus --format json 2>&1 | Out-String
+          $corpusCheckExitCode = $LASTEXITCODE
+          $expectedCorpusCheckExitCode = if ($IsWindows) { 0 } else { 2 }
+          $corpusCheck | Write-Output
+          if ($corpusCheckExitCode -ne $expectedCorpusCheckExitCode) { throw "The installed tool returned exit code $corpusCheckExitCode; expected $expectedCorpusCheckExitCode for this host." }
+          if (-not $IsWindows -and $corpusCheck -notmatch 'configured smoke command') { throw "Unix installed-tool rehearsal did not report the configured smoke command launch diagnostic." }
 
           # A copy in a published-looking source must not satisfy the exact local mapping.
           Copy-Item (Join-Path $root 'artifacts/packages/KeelMatrix.NuGetReady.0.1.0.nupkg') $publicSubstitute
