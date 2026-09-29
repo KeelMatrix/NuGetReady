@@ -172,6 +172,7 @@ jobs:
           $packageCheck | Write-Output
           if ($packageCheckExitCode -ne $expectedPackageCheckExitCode) { throw "Built tool package inspection returned exit code $packageCheckExitCode; expected $expectedPackageCheckExitCode for this host." }
           if (-not $IsWindows -and $packageCheck -notmatch 'configured smoke command') { throw "Unix package inspection did not report the configured smoke command launch diagnostic." }
+          $global:LASTEXITCODE = 0
 
       - name: Install and use the built tool from an isolated feed
         shell: pwsh
@@ -222,6 +223,7 @@ jobs:
           $corpusCheck | Write-Output
           if ($corpusCheckExitCode -ne $expectedCorpusCheckExitCode) { throw "The installed tool returned exit code $corpusCheckExitCode; expected $expectedCorpusCheckExitCode for this host." }
           if (-not $IsWindows -and $corpusCheck -notmatch 'configured smoke command') { throw "Unix installed-tool rehearsal did not report the configured smoke command launch diagnostic." }
+          $global:LASTEXITCODE = 0
 
           # A copy in a published-looking source must not satisfy the exact local mapping.
           Copy-Item (Join-Path $root 'artifacts/packages/KeelMatrix.NuGetReady.0.1.0.nupkg') $publicSubstitute
