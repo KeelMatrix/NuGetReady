@@ -95,6 +95,8 @@ public sealed class CliContractTests
         Assert.Contains("credential-name normalization does not prove a process binding", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("preserve command position, quoting, literal argument bytes, empty arguments, and operators", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("malformed YAML, duplicate keys, invalid roots, or multiple documents are error/exit 2", CliParser.HelpText, StringComparison.Ordinal);
+        Assert.Contains("missing pinned nodes, reparse points, and root, ancestor, or leaf rebinding fail closed", CliParser.HelpText, StringComparison.Ordinal);
+        Assert.Contains("A pinned workflow-policy node that disappears between snapshot and inspection is also error/exit 2, never not-applicable", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("not-applicable requires successfully inspected non-applicability", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("capability-and-reachability boundary", CliParser.HelpText, StringComparison.Ordinal);
         Assert.Contains("dependency and artifact-producer job", CliParser.HelpText, StringComparison.Ordinal);

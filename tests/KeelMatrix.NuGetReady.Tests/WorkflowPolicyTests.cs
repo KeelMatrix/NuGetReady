@@ -369,6 +369,184 @@ public sealed class WorkflowPolicyTests
     }
 
     [Theory]
+    [InlineData("workflow-directory")]
+    [InlineData("last-release-workflow")]
+    [InlineData("nested-workflow-directory")]
+    [InlineData("recreated-release-workflow")]
+    public void Deleting_or_recreating_pinned_workflow_nodes_after_snapshot_is_blocking(string surface)
+    {
+        const string unrelatedCiWorkflow = """
+            name: continuous integration
+            on:
+              push:
+                branches: [main]
+            permissions: {}
+            jobs:
+              build:
+                steps:
+                  - uses: actions/checkout@v6
+            """;
+
+        using var repository = surface is "workflow-directory" or "nested-workflow-directory"
+            ? WorkflowRepository.Create("ci.yml", unrelatedCiWorkflow)
+            : WorkflowRepository.Create("release.yml", ReleaseWorkflow);
+        var workflowDirectory = Path.Combine(repository.Root.FullName, ".github", "workflows");
+        var releasePath = Path.Combine(workflowDirectory, "release.yml");
+        if (surface == "last-release-workflow")
+        {
+            repository.WriteWorkflow("ci.yml", unrelatedCiWorkflow);
+        }
+        else if (surface == "nested-workflow-directory")
+        {
+            repository.WriteFile(".github/workflows/nested/release.yml", ReleaseWorkflow);
+        }
+
+        var outside = Directory.CreateTempSubdirectory("nugetready-workflow-deletion-outside-");
+        var outsideSentinel = Path.Combine(outside.FullName, "OUTSIDE_SENTINEL.txt");
+        File.WriteAllText(outsideSentinel, "OUTSIDE_SENTINEL");
+        var previous = WorkflowPolicyInspector.BeforeInspectionForTests;
+        WorkflowPolicyInspector.BeforeInspectionForTests = path =>
+        {
+            if (!string.Equals(path, repository.Root.FullName, StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            switch (surface)
+            {
+                case "workflow-directory":
+                    Directory.Delete(workflowDirectory, recursive: true);
+                    break;
+                case "last-release-workflow":
+                    File.Delete(releasePath);
+                    break;
+                case "nested-workflow-directory":
+                    Directory.Delete(Path.Combine(workflowDirectory, "nested"), recursive: true);
+                    break;
+                case "recreated-release-workflow":
+                    File.Delete(releasePath);
+                    File.WriteAllText(releasePath, File.ReadAllText(outsideSentinel));
+                    break;
+            }
+        };
+
+        WorkflowInspectionResult inspection;
+        try
+        {
+            inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+        }
+        finally
+        {
+            WorkflowPolicyInspector.BeforeInspectionForTests = previous;
+            outside.Delete(recursive: true);
+        }
+
+        var diagnostics = string.Join(" | ", inspection.Failures.Select(failure => failure.Message));
+        Assert.True(inspection.Evaluated, $"Surface '{surface}' was downgraded to not-applicable.");
+        Assert.Contains(inspection.Failures, failure => failure.IsError);
+        Assert.DoesNotContain("OUTSIDE_SENTINEL", diagnostics, StringComparison.Ordinal);
+        Assert.DoesNotContain(outside.FullName, diagnostics, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("NuGet.config")]
+    [InlineData("global.json")]
+    [InlineData("nugetready.json")]
+    public void Deleting_pinned_release_control_files_after_snapshot_is_blocking(string relativePath)
+    {
+        using var repository = WorkflowRepository.Create("release.yml", ReleaseWorkflow);
+        var previous = WorkflowPolicyInspector.BeforeInspectionForTests;
+        WorkflowPolicyInspector.BeforeInspectionForTests = path =>
+        {
+            if (string.Equals(path, repository.Root.FullName, StringComparison.Ordinal))
+            {
+                File.Delete(Path.Combine(repository.Root.FullName, relativePath));
+            }
+        };
+
+        WorkflowInspectionResult inspection;
+        try
+        {
+            inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+        }
+        finally
+        {
+            WorkflowPolicyInspector.BeforeInspectionForTests = previous;
+        }
+
+        Assert.True(inspection.Evaluated, $"Deleted '{relativePath}' was downgraded to not-applicable.");
+        Assert.Contains(inspection.Failures, failure => failure.IsError);
+        var diagnostics = string.Join(" | ", inspection.Failures.Select(failure => failure.Message));
+        Assert.DoesNotContain(repository.Root.FullName, diagnostics, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("local-script")]
+    [InlineData("composite-action")]
+    public void Deleting_pinned_indirect_release_control_files_after_snapshot_is_blocking(string surface)
+    {
+        var workflow = surface == "local-script"
+            ? """
+                name: continuous integration
+                on:
+                  push:
+                    branches: [main]
+                jobs:
+                  build:
+                    steps:
+                      - run: bash scripts/publish.sh
+                """
+            : """
+                name: continuous integration
+                on:
+                  push:
+                    branches: [main]
+                jobs:
+                  build:
+                    steps:
+                      - uses: ./.github/actions/build
+                """;
+        using var repository = WorkflowRepository.Create("ci.yml", workflow);
+        var relativePath = surface == "local-script"
+            ? "scripts/publish.sh"
+            : ".github/actions/build/action.yml";
+        repository.WriteFile(relativePath, surface == "local-script"
+            ? "dotnet nuget push artifacts/package.nupkg"
+            : """
+                name: build
+                runs:
+                  using: composite
+                  steps:
+                    - shell: bash
+                      run: dotnet build --no-restore
+                """);
+
+        var previous = WorkflowPolicyInspector.BeforeInspectionForTests;
+        WorkflowPolicyInspector.BeforeInspectionForTests = path =>
+        {
+            if (string.Equals(path, repository.Root.FullName, StringComparison.Ordinal))
+            {
+                File.Delete(Path.Combine(repository.Root.FullName, relativePath.Replace('/', Path.DirectorySeparatorChar)));
+            }
+        };
+
+        WorkflowInspectionResult inspection;
+        try
+        {
+            inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+        }
+        finally
+        {
+            WorkflowPolicyInspector.BeforeInspectionForTests = previous;
+        }
+
+        Assert.True(inspection.Evaluated, $"Deleted '{relativePath}' was downgraded to not-applicable.");
+        Assert.Contains(inspection.Failures, failure => failure.IsError);
+        var diagnostics = string.Join(" | ", inspection.Failures.Select(failure => failure.Message));
+        Assert.DoesNotContain(repository.Root.FullName, diagnostics, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
     [InlineData("validated-release-artifacts", "different-artifact")]
     [InlineData("path: artifacts/release", "path: artifacts/unvalidated")]
     [InlineData("needs: validate", "needs: missing-validation")]

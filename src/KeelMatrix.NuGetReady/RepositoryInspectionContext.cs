@@ -87,7 +87,10 @@ internal sealed class RepositoryInspectionContext : IDisposable
 
                 if (matches.Length == 0)
                 {
-                    return RepositoryPathStatus.Missing;
+                    var currentRelativePath = string.Join('/', segments.Take(index + 1));
+                    return expectedIdentities.ContainsKey(currentRelativePath)
+                        ? RepositoryPathStatus.Unsafe
+                        : RepositoryPathStatus.Missing;
                 }
 
                 if (matches.Length != 1 || !string.Equals(matches[0], segment, StringComparison.Ordinal))
@@ -173,9 +176,17 @@ internal sealed class RepositoryInspectionContext : IDisposable
         }
 
         var files = new List<string>();
+        var visited = new HashSet<string>(StringComparer.Ordinal);
         try
         {
-            status = EnumerateDirectory(directory, relativeDirectory, files);
+            status = EnumerateDirectory(directory, relativeDirectory, files, visited);
+            if (status == RepositoryPathStatus.Exact && expectedIdentities.Keys.Any(expectedPath =>
+                    expectedPath.StartsWith(relativeDirectory + "/", StringComparison.Ordinal) &&
+                    !visited.Contains(expectedPath)))
+            {
+                status = RepositoryPathStatus.Unsafe;
+            }
+
             if (status == RepositoryPathStatus.Exact)
             {
                 relativeFiles = files;
@@ -286,7 +297,8 @@ internal sealed class RepositoryInspectionContext : IDisposable
     private RepositoryPathStatus EnumerateDirectory(
         ArtifactDirectoryHandle directory,
         string relativeDirectory,
-        ICollection<string> files)
+        ICollection<string> files,
+        ISet<string> visited)
     {
         if (!IsBound() || !directory.VerifyBinding())
         {
@@ -341,9 +353,11 @@ internal sealed class RepositoryInspectionContext : IDisposable
                     return RepositoryPathStatus.Unsafe;
                 }
 
+                visited.Add(relativePath);
+
                 if (child.IsDirectory)
                 {
-                    var status = EnumerateDirectory(child, relativePath, files);
+                    var status = EnumerateDirectory(child, relativePath, files, visited);
                     if (status != RepositoryPathStatus.Exact)
                     {
                         return status;

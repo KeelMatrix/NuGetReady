@@ -29,10 +29,11 @@ The 0.1.0 release is planned and unreleased.
 - Accepts customer-owned Trusted Publishing usernames in the supported workflow profile, with an optional explicit expected username for repositories that require one.
 - Snapshots counted package archives before inspection, uses one immutable snapshot for archive, dependency, feed, consumer, and provenance checks, and verifies the source files remain unchanged after the rehearsal.
 - Rejects tool smoke arguments outside `dotnetTool` expectations or containing embedded NUL characters, isolates generated consumers from ambient `Directory.Build.*` imports, escapes control characters in human-readable diagnostics, and inspects the exact release-built package bytes before release upload.
-- Inspects workflow, configuration, local script, and composite-action paths through a pinned repository identity snapshot and descriptor-relative handles; reparse points and root, ancestor, or leaf rebinding fail closed without reading outside content.
+- Inspects workflow, configuration, local script, and composite-action paths through a pinned repository identity snapshot and descriptor-relative handles; missing pinned nodes, reparse points, and root, ancestor, or leaf rebinding fail closed without reading outside content.
 
 ### Fixed
 
 - Pins the accepted artifact root and traversed ancestors for handle-relative enumeration, attribute inspection, archive opens, hashing, snapshot copies, and final verification, failing closed before outside-root bytes are read during rebinds.
 - Keeps tool-command validation bound to a direct non-reparse installed child and, on Windows, launches a private handle-held snapshot of the complete installed tool directory, closing apphost and dependency replacement windows through process creation. Linux and macOS return an infrastructure error identifying the configured smoke command when their generic process-creation APIs cannot provide the same binding.
 - Aligns CI validation with the platform contract: Windows requires a successful smoke rehearsal, while Linux and macOS accept only the documented configured-smoke-command launch error with exit code `2`.
+- Treats deletion of any pinned workflow-policy node after repository snapshot as an unsafe input instead of allowing the workflow check to become `not-applicable`.
