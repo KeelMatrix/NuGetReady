@@ -37,5 +37,8 @@ The 0.1.0 release is planned and unreleased.
 
 - Pins the accepted artifact root and traversed ancestors for handle-relative enumeration, attribute inspection, archive opens, hashing, snapshot copies, and final verification, failing closed before outside-root bytes are read during rebinds.
 - Keeps tool-command validation bound to a direct non-reparse installed child and launches a private content-bound snapshot of the complete installed tool directory on every supported host, closing apphost and dependency replacement windows through pre-launch content verification; Windows additionally holds launch entries with replacement-blocking sharing through process creation.
+- Binds the private tool launch image to the complete payload captured with the provenance verification result, so pre-existing apphost, dependency, configuration, and runtime-file replacement or recreation cannot become the executed payload.
+- Rehearses declared public library types and type-forwarded exports with preserved one- and multi-generic arity, including namespace-qualified and escaped identifiers.
+- Validates exact, wildcard, mixed, and overlapping SourceLink mappings against every package-owned document and keeps symbol coverage bound to intended package assemblies rather than unrelated dependency symbols.
 - Aligns CI validation with the platform contract: Windows, Linux, and macOS each require successful installed-tool smoke rehearsal and exit code `0` for the positive controls.
 - Treats deletion of any pinned workflow-policy node after repository snapshot as an unsafe input instead of allowing the workflow check to become `not-applicable`.

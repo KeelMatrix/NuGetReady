@@ -1,4 +1,5 @@
 using System.IO.Compression;
+using System.Text;
 using Xunit.Abstractions;
 
 namespace KeelMatrix.NuGetReady.Tests;
@@ -346,6 +347,107 @@ public sealed class ConsumerRehearsalTests
         {
             ConsumerRehearsal.BeforeToolLaunchSnapshotForTests = previousSnapshot;
         }
+    }
+
+    [Theory]
+    [InlineData("apphost", false)]
+    [InlineData("dll", false)]
+    [InlineData("deps", false)]
+    [InlineData("runtimeconfig", false)]
+    [InlineData("config", false)]
+    [InlineData("dll", true)]
+    [InlineData("runtimeconfig", true)]
+    public void Public_cli_rejects_preexisting_tool_payload_mutation_after_provenance(string payloadKind, bool deleteAndRecreate)
+    {
+        using var corpus = PackedCorpus.Create();
+        var package = corpus.Pack("Tool/Tool.csproj");
+        var config = new PackageExpectation
+        {
+            Id = "Fixture.Tool",
+            Kind = "dotnetTool",
+            Version = "1.0.0",
+            Artifacts = ArtifactsIncludingSymbols(package),
+            Command = "fixture-tool",
+            Smoke = new List<string> { "--help" }
+        };
+
+        var previous = ConsumerRehearsal.AfterToolProvenanceForTests;
+        ConsumerRehearsal.AfterToolProvenanceForTests = toolDirectory =>
+        {
+            var path = payloadKind switch
+            {
+                "apphost" => Path.Combine(toolDirectory, OperatingSystem.IsWindows() ? "fixture-tool.exe" : "fixture-tool"),
+                "dll" => FindToolPayload(toolDirectory, "Fixture.Tool.dll"),
+                "deps" => FindToolPayload(toolDirectory, "Fixture.Tool.deps.json"),
+                "runtimeconfig" => FindToolPayload(toolDirectory, "Fixture.Tool.runtimeconfig.json"),
+                "config" => FindToolPayload(toolDirectory, "Tool.config"),
+                _ => throw new ArgumentOutOfRangeException(nameof(payloadKind))
+            };
+            var replacement = Encoding.UTF8.GetBytes("mutated-tool-payload");
+            if (deleteAndRecreate)
+            {
+                File.Delete(path);
+            }
+
+            File.WriteAllBytes(path, replacement);
+        };
+
+        try
+        {
+            var exitCode = RunPublicCli(corpus, config, out var output);
+
+            Assert.True(exitCode == 2, $"exitCode={exitCode}; output={output}");
+            Assert.Contains("pinned", output, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            ConsumerRehearsal.AfterToolProvenanceForTests = previous;
+        }
+    }
+
+    [Fact]
+    public void Public_cli_accepts_an_unchanged_tool_payload_after_provenance()
+    {
+        using var corpus = PackedCorpus.Create();
+        var package = corpus.Pack("Tool/Tool.csproj");
+        var config = new PackageExpectation
+        {
+            Id = "Fixture.Tool",
+            Kind = "dotnetTool",
+            Version = "1.0.0",
+            Artifacts = ArtifactsIncludingSymbols(package),
+            Command = "fixture-tool",
+            Smoke = new List<string> { "--help" }
+        };
+
+        var exitCode = RunPublicCli(corpus, config, out var output);
+
+        Assert.Equal(0, exitCode);
+        Assert.Contains("PASS", output, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Public_cli_rehearses_generic_forwarders_and_declared_type_controls()
+    {
+        using var corpus = PackedCorpus.Create();
+        var implementation = corpus.Pack("GenericImplementation/GenericImplementation.csproj");
+        var one = corpus.Pack("GenericFacadeOne/GenericFacadeOne.csproj", corpus.OutputPath);
+        var pair = corpus.Pack("GenericFacadePair/GenericFacadePair.csproj", corpus.OutputPath);
+        var mixed = corpus.Pack("GenericMixed/GenericMixed.csproj", corpus.OutputPath);
+        var escaped = corpus.Pack("GenericEscaped/GenericEscaped.csproj");
+        var config = new List<PackageExpectation>
+        {
+            PublicLibraryExpectation("Fixture.GenericImplementation", implementation),
+            PublicLibraryExpectation("Fixture.GenericFacadeOne", one),
+            PublicLibraryExpectation("Fixture.GenericFacadePair", pair),
+            PublicLibraryExpectation("Fixture.GenericMixed", mixed),
+            PublicLibraryExpectation("Fixture.GenericEscaped", escaped)
+        };
+
+        var exitCode = RunPublicCli(corpus, config, out var output);
+
+        Assert.True(exitCode == 0, $"exitCode={exitCode}; output={output}");
+        Assert.Contains("PASS consumer rehearsal", output, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -1173,6 +1275,63 @@ public sealed class ConsumerRehearsalTests
     private static List<string> Artifacts(string package)
     {
         return new List<string> { Path.GetFileName(package) };
+    }
+
+    private static List<string> ArtifactsIncludingSymbols(string package)
+    {
+        return new List<string>
+        {
+            Path.GetFileName(package),
+            Path.GetFileNameWithoutExtension(package) + ".snupkg"
+        };
+    }
+
+    private static PackageExpectation PublicLibraryExpectation(string id, string package)
+    {
+        return new PackageExpectation
+        {
+            Id = id,
+            Kind = "library",
+            Version = "1.0.0",
+            Artifacts = ArtifactsIncludingSymbols(package)
+        };
+    }
+
+    private static string FindToolPayload(string toolDirectory, string fileName)
+    {
+        return Directory.EnumerateFiles(toolDirectory, fileName, SearchOption.AllDirectories).Single();
+    }
+
+    private static int RunPublicCli(PackedCorpus corpus, PackageExpectation package, out string output)
+    {
+        return RunPublicCli(corpus, new List<PackageExpectation> { package }, out output);
+    }
+
+    private static int RunPublicCli(PackedCorpus corpus, IReadOnlyList<PackageExpectation> packages, out string output)
+    {
+        var configPath = Path.Combine(corpus.Root.FullName, "nugetready.json");
+        File.WriteAllText(
+            configPath,
+            System.Text.Json.JsonSerializer.Serialize(new NuGetReadyConfig
+            {
+                SchemaVersion = 1,
+                Packages = packages.ToList()
+            }));
+
+        var originalOutput = Console.Out;
+        using var captured = new StringWriter();
+        Console.SetOut(captured);
+        try
+        {
+            return NuGetReadyApplication.Run(
+                ["check", "--config", configPath, "--artifacts", corpus.OutputPath, "--format", "text"],
+                new NuGetReadyTelemetry());
+        }
+        finally
+        {
+            Console.SetOut(originalOutput);
+            output = captured.ToString();
+        }
     }
 
     private static ConsumerProcessRunner AfterRestore(Action<string, string> mutateCache)

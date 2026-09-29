@@ -27,13 +27,18 @@ internal sealed record RehearsalOutcome(RehearsalResult Result, string Diagnosti
 
 internal sealed record LibraryTarget(string Framework, IReadOnlyList<string> ApiTypes);
 
-internal sealed record TargetRehearsalOutcome(bool Passed, bool IsError, string Diagnostic);
+internal sealed record TargetRehearsalOutcome(
+    bool Passed,
+    bool IsError,
+    string Diagnostic,
+    IReadOnlyDictionary<string, string>? VerifiedLaunchManifest = null);
 
 internal static class ConsumerRehearsal
 {
     private const int DiagnosticLimit = 16 * 1024;
     private static readonly string[] PublicPackagePatterns = { "*" };
     internal static Action<string>? BeforeToolLaunchForTests { get; set; }
+    internal static Action<string>? AfterToolProvenanceForTests { get; set; }
     internal static Action<string>? BeforeToolLaunchSnapshotForTests { get; set; }
 
     public static IReadOnlyList<RehearsalOutcome> RunDetailed(
@@ -570,7 +575,9 @@ internal static class ConsumerRehearsal
         ToolLaunchSnapshot launch;
         try
         {
-            var verifiedLaunchManifest = CaptureLaunchManifest(toolPath);
+            AfterToolProvenanceForTests?.Invoke(toolPath);
+            var verifiedLaunchManifest = provenance.VerifiedLaunchManifest
+                ?? throw new IOException("The installed tool provenance did not produce a launch manifest.");
             BeforeToolLaunchSnapshotForTests?.Invoke(toolPath);
             launch = ToolLaunchSnapshot.Create(
                 toolPath,
@@ -1178,8 +1185,9 @@ internal static class ConsumerRehearsal
 
         return metadata.ExportedTypes
             .Select(metadata.GetExportedType)
-            .Where(type => (type.Attributes & TypeAttributes.VisibilityMask) == TypeAttributes.Public &&
-                           type.IsForwarder)
+            // Top-level ExportedType forwarders carry the Forwarder flag but
+            // do not repeat the source type's Public visibility bits.
+            .Where(type => type.IsForwarder)
             .Select(type => (Namespace: metadata.GetString(type.Namespace), Name: metadata.GetString(type.Name)))
             .Where(item => item.Name is not "<Module>" && !item.Name.Contains('<', StringComparison.Ordinal))
             .Where(item => IsSupportedTypeName(item.Name))
@@ -1558,7 +1566,25 @@ internal static class ConsumerRehearsal
 
     private static TargetRehearsalOutcome VerifyInstalledToolPackage(PackageExpectation package, string packagePath, string toolPath)
     {
-        return VerifyRestoredPackage(package, packagePath, new Dictionary<string, string?>(), toolPath);
+        IReadOnlyDictionary<string, string> launchManifest;
+        try
+        {
+            // Capture before provenance validation returns. The manifest is
+            // carried by that result so a later mutation cannot become the
+            // accepted launch image.
+            launchManifest = CaptureLaunchManifest(toolPath);
+        }
+        catch (IOException)
+        {
+            return new TargetRehearsalOutcome(false, true, "The installed tool launch payload could not be hashed for provenance.");
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return new TargetRehearsalOutcome(false, true, "The installed tool launch payload could not be hashed for provenance.");
+        }
+
+        var outcome = VerifyRestoredPackage(package, packagePath, new Dictionary<string, string?>(), toolPath);
+        return outcome.Passed ? outcome with { VerifiedLaunchManifest = launchManifest } : outcome;
     }
 
     private static string[] ReadToolAssetRoots(PackageArchiveReader reader)
