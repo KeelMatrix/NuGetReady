@@ -48,6 +48,7 @@ public sealed class CliContractTests
             FileName = "dotnet",
             WorkingDirectory = root.FullName,
             UseShellExecute = false,
+            CreateNoWindow = true,
             RedirectStandardOutput = true,
             RedirectStandardError = true
         };

@@ -1009,6 +1009,7 @@ internal static class UnixProcessSupervisor
             {
                 FileName = "/bin/ps",
                 UseShellExecute = false,
+                CreateNoWindow = true,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 ArgumentList = { "-axo", "pid=,ppid=,pgid=,state=,lstart=" }
