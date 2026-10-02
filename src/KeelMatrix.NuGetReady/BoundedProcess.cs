@@ -1033,12 +1033,16 @@ internal static class UnixProcessSupervisor
 
         public bool Pump()
         {
-            if (!ReadEvents(wait: true, out var forkObserved))
+            // The kernel fork event registers each reported child immediately.
+            // Defer the process-wide identity/marker sweep until cleanup; doing
+            // that sweep for every fork makes long-lived tool processes scale
+            // with the host process table while adding no containment proof.
+            if (!ReadEvents(wait: true, out _))
             {
                 return false;
             }
 
-            return !forkObserved || DiscoverDescendants();
+            return true;
         }
 
         public bool DrainAndDiscover(bool forceDiscovery = false)
@@ -1362,11 +1366,11 @@ internal static class UnixProcessSupervisor
         try
         {
             var result = proc_pidfdinfo(
-                    processId,
-                    fileDescriptor,
-                    ProcPidFdVnodePathInfo,
-                    buffer,
-                    MacVnodeFdInfoSize);
+                processId,
+                ProcPidFdVnodePathInfo,
+                fileDescriptor,
+                buffer,
+                MacVnodeFdInfoSize);
             if (result < MacVnodeStatOffset + sizeof(ulong))
             {
                 return false;
@@ -1586,8 +1590,8 @@ internal static class UnixProcessSupervisor
     [DllImport("libproc.dylib", SetLastError = true)]
     private static extern int proc_pidfdinfo(
         int processId,
-        int fileDescriptor,
         int flavor,
+        int fileDescriptor,
         IntPtr buffer,
         int bufferSize);
 
