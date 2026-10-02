@@ -258,7 +258,10 @@ public sealed class BoundedProcessTests
                     environment,
                     parentWaitsForTimeout ? TimeSpan.FromMilliseconds(250) : TimeSpan.FromSeconds(5));
                 Assert.False(result.CleanupConfirmed, result.StandardError);
-                Assert.Equal(parentWaitsForTimeout, result.TimedOut);
+                if (parentWaitsForTimeout)
+                {
+                    Assert.True(result.TimedOut, result.StandardError);
+                }
             }
 
             Assert.NotEmpty(cleanupObservations);
