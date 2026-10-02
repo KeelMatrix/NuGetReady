@@ -1121,35 +1121,13 @@ internal static class UnixProcessSupervisor
 
         private bool DiscoverDescendants()
         {
-            var snapshot = ReadMacProcessIdentities();
-            if (snapshot is null)
+            var markerProcessIds = ReadMacMarkerProcessIds(marker.Path);
+            if (markerProcessIds is null)
             {
                 return false;
             }
 
-            var changed = true;
-            while (changed)
-            {
-                changed = false;
-                foreach (var process in snapshot)
-                {
-                    if (tracked.ContainsKey(process.ProcessId) ||
-                        !tracked.ContainsValue(process.ParentUniqueId) ||
-                        !MacProcessIsLive(process.ProcessId))
-                    {
-                        continue;
-                    }
-
-                    if (!Track(process.ProcessId, process.UniqueId))
-                    {
-                        return false;
-                    }
-
-                    changed = true;
-                }
-            }
-
-            foreach (var processId in ReadMacMarkerProcessIds(marker.Path))
+            foreach (var processId in markerProcessIds)
             {
                 if (processId == rootProcessId ||
                     processId == supervisorProcessId ||
@@ -1373,11 +1351,11 @@ internal static class UnixProcessSupervisor
         }
     }
 
-    private static int[] ReadMacMarkerProcessIds(string? markerPath)
+    private static int[]? ReadMacMarkerProcessIds(string? markerPath)
     {
         if (string.IsNullOrWhiteSpace(markerPath))
         {
-            return Array.Empty<int>();
+            return null;
         }
 
         var pathPointer = Marshal.StringToCoTaskMemUTF8(markerPath);
@@ -1392,7 +1370,7 @@ internal static class UnixProcessSupervisor
                 0);
             if (required <= 0)
             {
-                return Array.Empty<int>();
+                return required == 0 ? Array.Empty<int>() : null;
             }
 
             for (var attempt = 0; attempt < 8; attempt++)
@@ -1410,7 +1388,7 @@ internal static class UnixProcessSupervisor
                         bufferSize);
                     if (result < 0)
                     {
-                        return Array.Empty<int>();
+                        return null;
                     }
 
                     if (result < bufferSize)
@@ -1430,68 +1408,12 @@ internal static class UnixProcessSupervisor
                 }
             }
 
-            return Array.Empty<int>();
+            return null;
         }
         finally
         {
             Marshal.FreeCoTaskMem(pathPointer);
         }
-    }
-
-    private static MacProcessIdentity[]? ReadMacProcessIdentities()
-    {
-        var processIds = ReadMacProcessIds();
-        if (processIds is null)
-        {
-            return null;
-        }
-
-        var identities = new List<MacProcessIdentity>(processIds.Length);
-        foreach (var processId in processIds)
-        {
-            if (processId > 0 && TryGetMacProcessIdentity(processId, out var identity))
-            {
-                identities.Add(identity);
-            }
-        }
-
-        return identities.ToArray();
-    }
-
-    private static int[]? ReadMacProcessIds()
-    {
-        var capacity = 1024;
-        for (var attempt = 0; attempt < 8; attempt++)
-        {
-            var buffer = Marshal.AllocHGlobal(checked(capacity * sizeof(int)));
-            try
-            {
-                var count = proc_listallpids(buffer, checked(capacity * sizeof(int)));
-                if (count < 0)
-                {
-                    return null;
-                }
-
-                if (count < capacity)
-                {
-                    var processIds = new int[count];
-                    for (var index = 0; index < count; index++)
-                    {
-                        processIds[index] = Marshal.ReadInt32(buffer, index * sizeof(int));
-                    }
-
-                    return processIds;
-                }
-            }
-            finally
-            {
-                Marshal.FreeHGlobal(buffer);
-            }
-
-            capacity = checked(capacity * 2);
-        }
-
-        return null;
     }
 
     private static int[]? ReadMacProcessGroupMembers(int processGroupId)
@@ -1592,9 +1514,6 @@ internal static class UnixProcessSupervisor
         uint pathFlags,
         IntPtr buffer,
         int bufferSize);
-
-    [DllImport("libproc.dylib", SetLastError = true)]
-    private static extern int proc_listallpids(IntPtr buffer, int bufferSize);
 
     [DllImport("libproc.dylib", SetLastError = true)]
     private static extern int proc_listpgrppids(int processGroupId, IntPtr buffer, int bufferSize);
