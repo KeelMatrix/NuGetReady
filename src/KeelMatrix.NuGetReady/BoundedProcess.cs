@@ -1033,16 +1033,17 @@ internal static class UnixProcessSupervisor
 
         public bool Pump()
         {
-            // The kernel fork event registers each reported child immediately.
-            // Defer the process-wide identity/marker sweep until cleanup; doing
-            // that sweep for every fork makes long-lived tool processes scale
-            // with the host process table while adding no containment proof.
-            if (!ReadEvents(wait: true, out _))
+            // macOS does not copy NOTE_FORK's internal child PID into the public
+            // kevent. Use the kernel event as the discovery edge, then register
+            // all currently reachable children immediately; the inherited marker
+            // closes the ancestry-independent cleanup proof if a child reparents
+            // before this event is delivered.
+            if (!ReadEvents(wait: true, out var forkObserved))
             {
                 return false;
             }
 
-            return true;
+            return !forkObserved || DiscoverDescendants(includeMarker: false);
         }
 
         public bool DrainAndDiscover(bool forceDiscovery = false)
@@ -1117,7 +1118,7 @@ internal static class UnixProcessSupervisor
             }
         }
 
-        private bool DiscoverDescendants()
+        private bool DiscoverDescendants(bool includeMarker = true)
         {
             var snapshot = ReadMacProcessIdentities();
             if (snapshot is null)
@@ -1145,6 +1146,11 @@ internal static class UnixProcessSupervisor
 
                     changed = true;
                 }
+            }
+
+            if (!includeMarker)
+            {
+                return true;
             }
 
             foreach (var process in snapshot)
@@ -1223,25 +1229,7 @@ internal static class UnixProcessSupervisor
                     return false;
                 }
 
-                if ((events[index].Fflags & NoteFork) != 0)
-                {
-                    forkObserved = true;
-                    var childProcessId = (int)(events[index].Fflags & NoteProcessIdMask);
-                    if (childProcessId > 0)
-                    {
-                        if (TryGetMacProcessIdentity(childProcessId, out var childIdentity))
-                        {
-                            if (!Track(childProcessId, childIdentity.UniqueId))
-                            {
-                                return false;
-                            }
-                        }
-                        else if (MacProcessIsLive(childProcessId))
-                        {
-                            return false;
-                        }
-                    }
-                }
+                forkObserved |= (events[index].Fflags & NoteFork) != 0;
             }
 
             return healthy;
@@ -1367,8 +1355,8 @@ internal static class UnixProcessSupervisor
         {
             var result = proc_pidfdinfo(
                 processId,
-                ProcPidFdVnodePathInfo,
                 fileDescriptor,
+                ProcPidFdVnodePathInfo,
                 buffer,
                 MacVnodeFdInfoSize);
             if (result < MacVnodeStatOffset + sizeof(ulong))
@@ -1601,8 +1589,8 @@ internal static class UnixProcessSupervisor
     [DllImport("libproc.dylib", SetLastError = true)]
     private static extern int proc_pidfdinfo(
         int processId,
-        int flavor,
         int fileDescriptor,
+        int flavor,
         IntPtr buffer,
         int bufferSize);
 
@@ -1643,7 +1631,6 @@ internal static class UnixProcessSupervisor
     private const int MacVnodeFileType = 1;
     private const int MacVnodeFdInfoSize = 1200;
     private const int MacVnodeStatOffset = 24;
-    private const uint NoteProcessIdMask = 0x000fffff;
 
     [DllImport("libc", SetLastError = true)]
     private static extern int prctl(int option, int arg2, int arg3, int arg4, int arg5);

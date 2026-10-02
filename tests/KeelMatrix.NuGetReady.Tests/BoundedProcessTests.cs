@@ -249,7 +249,11 @@ public sealed class BoundedProcessTests
         var parentCompletion = parentWaitsForTimeout
             ? "while [ ! -s \"$1\" ]; do sleep 0.01; done; sleep 30"
             : $"while [ ! -s \"$1\" ]; do sleep 0.01; done; exit {parentExitCode}";
-        var script = "setsid sh -c 'printf \"%s\\n\" \"$$\" > \"$1\"; sleep 30' nugetready-detached \"$1\" >/dev/null 2>&1 & " + parentCompletion;
+        // macOS runners do not guarantee the standalone setsid utility. The
+        // Python child performs the same setsid(2) operation before recording
+        // its PID, then remains alive after the launching shell exits.
+        var detachedPython = "import os,sys,time; os.setsid(); open(sys.argv[1], \"w\").write(str(os.getpid()) + \"\\n\"); time.sleep(30)";
+        var script = "python3 -c '" + detachedPython + "' \"$1\" >/dev/null 2>&1 & " + parentCompletion;
         return (
             "sh",
             ["-c", script, "nugetready-test", pidFile],
