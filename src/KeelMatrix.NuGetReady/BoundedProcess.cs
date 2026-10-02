@@ -1615,7 +1615,9 @@ internal static class UnixProcessSupervisor
     private const int ProcPidBsdInfo = 3;
     private const int ProcPidUniqIdentifierInfo = 17;
     private const int MacBsdInfoSize = 136;
-    private const int MacProcessIdentitySize = 72;
+    // proc_uniqidentifierinfo is 16 bytes of UUID, two uint64 values, two
+    // uint32 values, and two trailing uint64 values in the macOS libproc ABI.
+    private const int MacProcessIdentitySize = 56;
     private const int OpenReadWrite = 0x2;
     private const int OpenCreate = 0x200;
     private const int OpenExclusive = 0x800;
