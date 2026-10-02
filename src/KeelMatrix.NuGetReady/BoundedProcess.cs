@@ -580,6 +580,8 @@ internal static class UnixProcessSupervisor
         var spawnAttributes = IntPtr.Zero;
         var spawnAttributesInitialized = false;
         MacProcessTreeTracker? macProcessTree = null;
+        string? macMarkerPath = null;
+        var macMarkerFd = -1;
         using var terminationSignal = PosixSignalRegistration.Create(
             PosixSignal.SIGTERM,
             context =>
@@ -628,6 +630,11 @@ internal static class UnixProcessSupervisor
                 return 125;
             }
 
+            if (OperatingSystem.IsMacOS() && !TryCreateMacProcessMarker(out macMarkerPath, out macMarkerFd))
+            {
+                return 125;
+            }
+
             spawnAttributes = Marshal.AllocHGlobal(PosixSpawnAttributeStorageSize);
             if (posix_spawnattr_init(spawnAttributes) != 0)
             {
@@ -657,8 +664,9 @@ internal static class UnixProcessSupervisor
 
             if (OperatingSystem.IsMacOS())
             {
-                // Keep the root suspended until its kernel fork watch is armed.
-                macProcessTree = MacProcessTreeTracker.TryCreate(child);
+                // Keep the root suspended until its kernel fork watch and inherited
+                // marker are armed; a detached child cannot outrun containment setup.
+                macProcessTree = MacProcessTreeTracker.TryCreate(child, macMarkerPath);
                 if (macProcessTree is null || kill(child, SigCont) != 0)
                 {
                     _ = kill(-child, SigKill);
@@ -724,6 +732,15 @@ internal static class UnixProcessSupervisor
             }
 
             macProcessTree?.Dispose();
+            if (macMarkerFd >= 0)
+            {
+                _ = close(macMarkerFd);
+            }
+
+            if (macMarkerPath is not null)
+            {
+                UnlinkMacPath(macMarkerPath);
+            }
         }
     }
 
@@ -961,6 +978,7 @@ internal static class UnixProcessSupervisor
         private readonly int queue;
         private readonly int rootProcessId;
         private readonly int supervisorProcessId;
+        private readonly string? markerPath;
         private readonly Dictionary<int, ulong> tracked = new();
         private bool disposed;
         private bool healthy = true;
@@ -969,15 +987,17 @@ internal static class UnixProcessSupervisor
             int queue,
             int rootProcessId,
             ulong rootUniqueId,
-            int supervisorProcessId)
+            int supervisorProcessId,
+            string? markerPath)
         {
             this.queue = queue;
             this.rootProcessId = rootProcessId;
             this.supervisorProcessId = supervisorProcessId;
+            this.markerPath = markerPath;
             tracked[rootProcessId] = rootUniqueId;
         }
 
-        public static MacProcessTreeTracker? TryCreate(int rootProcessId)
+        public static MacProcessTreeTracker? TryCreate(int rootProcessId, string? markerPath)
         {
             var queue = kqueue();
             if (queue < 0 || !TryGetMacProcessIdentity(rootProcessId, out var rootIdentity))
@@ -994,7 +1014,8 @@ internal static class UnixProcessSupervisor
                 queue,
                 rootProcessId,
                 rootIdentity.UniqueId,
-                Environment.ProcessId);
+                Environment.ProcessId,
+                markerPath);
             if (!tracker.Register(rootProcessId))
             {
                 tracker.Dispose();
@@ -1006,17 +1027,11 @@ internal static class UnixProcessSupervisor
 
         public bool Pump()
         {
-            // Keep the kernel process watch armed while the child runs. macOS
-            // does not copy NOTE_FORK's internal child PID into the public
-            // kevent, so each fork event triggers a bounded walk of only the
-            // tracked process tree through proc_listchildpids. Every discovered
-            // PID is registered before cleanup can be confirmed.
-            if (!ReadEvents(wait: true, out var forkObserved))
-            {
-                return false;
-            }
-
-            return !forkObserved || DiscoverDescendants();
+            // Keep the kernel process watch armed while the child runs. Fork
+            // events are consumed here without a process-table scan; cleanup
+            // performs marker discovery only when a fork event or the initial
+            // cleanup boundary requires it.
+            return ReadEvents(wait: true, out _);
         }
 
         public bool DrainAndDiscover(bool forceDiscovery = false)
@@ -1046,11 +1061,6 @@ internal static class UnixProcessSupervisor
 
         public bool HasNoLiveDescendants()
         {
-            if (!DiscoverDescendants())
-            {
-                return false;
-            }
-
             foreach (var pair in tracked)
             {
                 if (pair.Key == rootProcessId)
@@ -1093,36 +1103,25 @@ internal static class UnixProcessSupervisor
 
         private bool DiscoverDescendants()
         {
-            var pending = new Queue<int>(tracked.Keys);
-            var visited = new HashSet<int>();
-            while (pending.Count > 0)
+            var markerProcessIds = ReadMacMarkerProcessIds(markerPath);
+            if (markerProcessIds is null)
             {
-                var parentProcessId = pending.Dequeue();
-                if (!visited.Add(parentProcessId))
+                return false;
+            }
+
+            foreach (var processId in markerProcessIds)
+            {
+                if (processId == rootProcessId ||
+                    processId == supervisorProcessId ||
+                    tracked.ContainsKey(processId) ||
+                    !TryGetMacProcessIdentity(processId, out var identity))
                 {
                     continue;
                 }
 
-                var children = ReadMacChildProcessIds(parentProcessId);
-                if (children is null)
+                if (!Track(processId, identity.UniqueId))
                 {
                     return false;
-                }
-
-                foreach (var processId in children)
-                {
-                    if (processId == supervisorProcessId ||
-                        !TryGetMacProcessIdentity(processId, out var identity))
-                    {
-                        continue;
-                    }
-
-                    if (!Track(processId, identity.UniqueId))
-                    {
-                        return false;
-                    }
-
-                    pending.Enqueue(processId);
                 }
             }
 
@@ -1204,43 +1203,121 @@ internal static class UnixProcessSupervisor
         return result == 0 || Marshal.GetLastWin32Error() != NoSuchProcessError;
     }
 
-    private static int[]? ReadMacChildProcessIds(int parentProcessId)
+    private static int[]? ReadMacMarkerProcessIds(string? markerPath)
     {
-        var capacity = 16;
-        for (var attempt = 0; attempt < 8; attempt++)
+        if (string.IsNullOrWhiteSpace(markerPath))
         {
-            var buffer = Marshal.AllocHGlobal(checked(capacity * sizeof(int)));
-            try
-            {
-                var count = proc_listchildpids(
-                    parentProcessId,
-                    buffer,
-                    checked(capacity * sizeof(int)));
-                if (count < 0)
-                {
-                    return null;
-                }
+            return null;
+        }
 
-                if (count < capacity)
+        var pathPointer = Marshal.StringToCoTaskMemUTF8(markerPath);
+        try
+        {
+            var required = proc_listpidspath(
+                ProcAllPids,
+                0,
+                pathPointer,
+                0,
+                IntPtr.Zero,
+                0);
+            if (required < 0)
+            {
+                return null;
+            }
+
+            if (required == 0)
+            {
+                return Array.Empty<int>();
+            }
+
+            var bufferSize = Math.Max(required, sizeof(int));
+            for (var attempt = 0; attempt < 8; attempt++)
+            {
+                var buffer = Marshal.AllocHGlobal(bufferSize);
+                try
                 {
-                    var processIds = new int[count];
-                    for (var index = 0; index < count; index++)
+                    var result = proc_listpidspath(
+                        ProcAllPids,
+                        0,
+                        pathPointer,
+                        0,
+                        buffer,
+                        bufferSize);
+                    if (result < 0)
                     {
-                        processIds[index] = Marshal.ReadInt32(buffer, index * sizeof(int));
+                        return null;
                     }
 
-                    return processIds;
-                }
-            }
-            finally
-            {
-                Marshal.FreeHGlobal(buffer);
-            }
+                    if (result < bufferSize)
+                    {
+                        var processIds = new int[result / sizeof(int)];
+                        for (var index = 0; index < processIds.Length; index++)
+                        {
+                            processIds[index] = Marshal.ReadInt32(buffer, index * sizeof(int));
+                        }
 
-            capacity = checked(capacity * 2);
+                        return processIds;
+                    }
+                }
+                finally
+                {
+                    Marshal.FreeHGlobal(buffer);
+                }
+
+                bufferSize = checked(bufferSize * 2);
+            }
+        }
+        finally
+        {
+            Marshal.FreeCoTaskMem(pathPointer);
         }
 
         return null;
+    }
+
+    private static bool TryCreateMacProcessMarker(out string? path, out int fileDescriptor)
+    {
+        path = null;
+        fileDescriptor = -1;
+        for (var attempt = 0; attempt < 8; attempt++)
+        {
+            var candidate = Path.Combine(
+                Path.GetTempPath(),
+                $"nugetready-process-marker-{Guid.NewGuid():N}");
+            var candidatePointer = Marshal.StringToCoTaskMemUTF8(candidate);
+            var descriptor = open(candidatePointer, OpenCreate | OpenExclusive | OpenReadWrite, 0x180);
+            Marshal.FreeCoTaskMem(candidatePointer);
+            if (descriptor < 0)
+            {
+                continue;
+            }
+
+            if (fcntl(descriptor, FSetFileDescriptorFlags, 0) != 0)
+            {
+                _ = close(descriptor);
+                UnlinkMacPath(candidate);
+                continue;
+            }
+
+            path = candidate;
+            fileDescriptor = descriptor;
+            return true;
+        }
+
+        return false;
+    }
+
+    private static void UnlinkMacPath(string path)
+    {
+        var pathPointer = Marshal.StringToCoTaskMemUTF8(path);
+        try
+        {
+            _ = unlink(pathPointer);
+        }
+        finally
+        {
+            Marshal.FreeCoTaskMem(pathPointer);
+        }
     }
 
     private static bool TryGetMacProcessIdentity(int processId, out MacProcessIdentity identity)
@@ -1365,8 +1442,23 @@ internal static class UnixProcessSupervisor
     [DllImport("libc", SetLastError = true)]
     private static extern int close(int fileDescriptor);
 
+    [DllImport("libc", SetLastError = true)]
+    private static extern int open(IntPtr path, int flags, int mode);
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int unlink(IntPtr path);
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int fcntl(int fileDescriptor, int command, int argument);
+
     [DllImport("libproc.dylib", SetLastError = true)]
-    private static extern int proc_listchildpids(int parentProcessId, IntPtr buffer, int bufferSize);
+    private static extern int proc_listpidspath(
+        uint type,
+        uint typeInfo,
+        IntPtr path,
+        uint pathFlags,
+        IntPtr buffer,
+        int bufferSize);
 
     [DllImport("libproc.dylib", SetLastError = true)]
     private static extern int proc_listpgrppids(int processGroupId, IntPtr buffer, int bufferSize);
@@ -1401,6 +1493,11 @@ internal static class UnixProcessSupervisor
     // proc_uniqidentifierinfo is 16 bytes of UUID, two uint64 values, two
     // uint32 values, and two trailing uint64 values in the macOS libproc ABI.
     private const int MacProcessIdentitySize = 56;
+    private const uint ProcAllPids = 1;
+    private const int OpenReadWrite = 0x2;
+    private const int OpenCreate = 0x200;
+    private const int OpenExclusive = 0x800;
+    private const int FSetFileDescriptorFlags = 2;
 
     [DllImport("libc", SetLastError = true)]
     private static extern int prctl(int option, int arg2, int arg3, int arg4, int arg5);
