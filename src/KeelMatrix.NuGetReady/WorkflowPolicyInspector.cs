@@ -264,14 +264,19 @@ internal static class WorkflowPolicyInspector
 
         var hasReleaseControl = workflow.HasPublicationShapedTrigger ||
                                 workflow.HasPublicationInput;
+        var hasReleaseWorkflowName = HasReleasePublicationSignal(workflow.Name);
         foreach (var job in activeJobs)
         {
             var hasIndirectPublication = false;
             foreach (var step in job.Steps)
             {
                 var indirectPath = InspectIndirectPublicationPath(repositoryPath, step, indirectContext);
+                var unresolvedExecutable = HasUnresolvedExecutableRun(step.Run);
                 hasIndirectPublication |= indirectPath == IndirectPublicationPath.Publication ||
-                    indirectPath == IndirectPublicationPath.Unknown && !string.IsNullOrWhiteSpace(step.Run);
+                    !hasReleaseControl &&
+                    !hasReleaseWorkflowName &&
+                    indirectPath == IndirectPublicationPath.Unknown &&
+                    unresolvedExecutable;
             }
 
             if (hasReleaseControl ||
@@ -2469,6 +2474,163 @@ internal static class WorkflowPolicyInspector
             if (Regex.IsMatch(line, $@"^(?:&\s*)?(?:dotnet\s+)?{Regex.Escape(command)}(?:\s|$)", RegexOptions.IgnoreCase))
             {
                 return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool HasUnresolvedExecutableRun(string? run)
+    {
+        if (string.IsNullOrWhiteSpace(run))
+        {
+            return false;
+        }
+
+        foreach (var rawLine in SplitCommandSegments(run))
+        {
+            var line = rawLine.Trim();
+            if (line.Length == 0 || line.StartsWith('#'))
+            {
+                continue;
+            }
+
+            if (IsDynamicShellWrapper(line) ||
+                IsCommandVariable(line) ||
+                ContainsExecutableSubstitution(line) ||
+                ContainsPublicationShapedExpansion(line))
+            {
+                return true;
+            }
+
+            if (IsOutputOnlyCommand(line))
+            {
+                continue;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool IsDynamicShellWrapper(string line)
+    {
+        return Regex.IsMatch(
+            line,
+            @"^\s*(?:&\s*)?(?:(?:env)\s+)?(?:bash|sh|zsh|pwsh|powershell)(?:\.exe)?\s+(?:-c|-Command)\b|^\s*(?:&\s*)?cmd(?:\.exe)?\s+/c\b",
+            RegexOptions.IgnoreCase);
+    }
+
+    private static bool IsCommandVariable(string line)
+    {
+        var match = Regex.Match(
+            line,
+            @"^\s*(?:&\s*)?(?:\$(?<name>(?:env:)?[A-Za-z_][A-Za-z0-9_]*)|\$\{(?<name>[^}\r\n]+)\})(?!\s*(?:[+\-*/]?=|\|))(?:\s|$)",
+            RegexOptions.IgnoreCase);
+
+        return match.Success && Regex.IsMatch(match.Groups["name"].Value, @"(?i)(?:command|publish|push|nuget|release)");
+    }
+
+    private static bool ContainsExecutableSubstitution(string line)
+    {
+        var quote = '\0';
+        for (var index = 0; index < line.Length; index++)
+        {
+            var character = line[index];
+            if (quote == '\'')
+            {
+                if (character == '\'')
+                {
+                    quote = '\0';
+                }
+
+                continue;
+            }
+
+            if (quote == '"')
+            {
+                if (character == '"')
+                {
+                    quote = '\0';
+                }
+                else if (character == '$' && index + 1 < line.Length && line[index + 1] == '(' &&
+                         StartsWithExecutableSubstitution(line, index + 2))
+                {
+                    return true;
+                }
+
+                continue;
+            }
+
+            if (character is '\'' or '"')
+            {
+                quote = character;
+                continue;
+            }
+
+            if (character == '$' && index + 1 < line.Length && line[index + 1] == '(' &&
+                StartsWithExecutableSubstitution(line, index + 2))
+            {
+                return true;
+            }
+
+            if (character is '<' or '@' && index + 1 < line.Length && line[index + 1] == '(' &&
+                (character != '@' || !Regex.IsMatch(line, @"^\s*\$[A-Za-z_][A-Za-z0-9_]*\s*=")) &&
+                StartsWithExecutableSubstitution(line, index + 2))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool StartsWithExecutableSubstitution(string line, int start)
+    {
+        while (start < line.Length && char.IsWhiteSpace(line[start]))
+        {
+            start++;
+        }
+
+        return start < line.Length && line[start] is not '$' and not '[' and not '(' and not '\'' and not '"';
+    }
+
+    private static bool ContainsPublicationShapedExpansion(string line)
+    {
+        var quote = '\0';
+        for (var index = 0; index + 1 < line.Length; index++)
+        {
+            var character = line[index];
+            if (quote == '\'')
+            {
+                if (character == '\'')
+                {
+                    quote = '\0';
+                }
+
+                continue;
+            }
+
+            if (character == '"')
+            {
+                quote = quote == '"' ? '\0' : '"';
+                continue;
+            }
+
+            if (character == '\'')
+            {
+                quote = '\'';
+                continue;
+            }
+
+            if (character == '$' && line[index + 1] == '{')
+            {
+                var end = line.IndexOf('}', index + 2);
+                if (end >= 0 && Regex.IsMatch(line[(index + 2)..end], @"(?i)\b(?:dotnet\s+)?nuget\s+push\b|\b(?:dotnet\s+)?publish\b|\b(?:dotnet\s+)?pack\b"))
+                {
+                    return true;
+                }
+
+                index = end >= 0 ? end : line.Length;
             }
         }
 
