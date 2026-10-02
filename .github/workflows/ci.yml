@@ -169,7 +169,7 @@ jobs:
             $PSNativeCommandUseErrorActionPreference = $nativePreference
           }
           $expectedPackageCheckExitCode = 0
-          $packageCheck | Write-Output
+          Write-Output $packageCheck
           if ($packageCheckExitCode -ne $expectedPackageCheckExitCode) { throw "Built tool package inspection returned exit code $packageCheckExitCode; expected $expectedPackageCheckExitCode for this host." }
           $global:LASTEXITCODE = 0
 
@@ -219,7 +219,7 @@ jobs:
             $PSNativeCommandUseErrorActionPreference = $nativePreference
           }
           $expectedCorpusCheckExitCode = 0
-          $corpusCheck | Write-Output
+          Write-Output $corpusCheck
           if ($corpusCheckExitCode -ne $expectedCorpusCheckExitCode) { throw "The installed tool returned exit code $corpusCheckExitCode; expected $expectedCorpusCheckExitCode for this host." }
           $global:LASTEXITCODE = 0
 

@@ -2487,6 +2487,11 @@ internal static class WorkflowPolicyInspector
             return false;
         }
 
+        if (ContainsUnresolvedPipeline(run))
+        {
+            return true;
+        }
+
         foreach (var rawLine in SplitCommandSegments(run))
         {
             var line = rawLine.Trim();
@@ -2498,8 +2503,7 @@ internal static class WorkflowPolicyInspector
             if (IsDynamicShellWrapper(line) ||
                 IsCommandVariable(line) ||
                 ContainsExecutableSubstitution(line) ||
-                ContainsPublicationShapedExpansion(line) ||
-                AnalyzeCommandLine(line).IsUnresolved)
+                ContainsPublicationShapedExpansion(line))
             {
                 return true;
             }
@@ -2511,6 +2515,92 @@ internal static class WorkflowPolicyInspector
         }
 
         return false;
+    }
+
+    private static bool ContainsUnresolvedPipeline(string run)
+    {
+        foreach (var rawLine in run.Split('\n'))
+        {
+            var segments = SplitPipelineSegments(rawLine);
+            if (segments.Count < 2)
+            {
+                continue;
+            }
+
+            foreach (var rawSegment in segments)
+            {
+                var segment = rawSegment.Trim();
+                if (segment.Length == 0 || segment.StartsWith('#'))
+                {
+                    continue;
+                }
+
+                if (IsCommandVariable(segment) || IsDynamicShellWrapper(segment))
+                {
+                    return true;
+                }
+
+                var assignment = Regex.Match(
+                    segment,
+                    @"^\s*(?:\$[A-Za-z_][A-Za-z0-9_]*|\$\{[^}\r\n]+\})\s*=\s*(?<command>.+)$",
+                    RegexOptions.IgnoreCase);
+                var command = assignment.Success ? assignment.Groups["command"].Value : segment;
+                command = Regex.Replace(command, @"^\s*&\s*", string.Empty, RegexOptions.IgnoreCase);
+                command = Regex.Replace(command, @"\s+\d*\s*>\s*&\s*\d+", " ", RegexOptions.IgnoreCase);
+                command = Regex.Replace(command, @"\$\([^()\r\n]*\)", "variable", RegexOptions.IgnoreCase);
+                if (!IsOutputOnlyCommand(command) && AnalyzeCommandLine(command).IsUnresolved)
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private static List<string> SplitPipelineSegments(string line)
+    {
+        var segments = new List<string>();
+        var segment = new StringBuilder();
+        var quote = '\0';
+
+        void Flush()
+        {
+            segments.Add(segment.ToString());
+            segment.Clear();
+        }
+
+        for (var index = 0; index < line.Length; index++)
+        {
+            var character = line[index];
+            if (quote != '\0')
+            {
+                segment.Append(character);
+                if (character == quote)
+                {
+                    quote = '\0';
+                }
+
+                continue;
+            }
+
+            if (character is '\'' or '"')
+            {
+                quote = character;
+                segment.Append(character);
+            }
+            else if (character == '|' && (index + 1 >= line.Length || line[index + 1] != '|'))
+            {
+                Flush();
+            }
+            else
+            {
+                segment.Append(character);
+            }
+        }
+
+        Flush();
+        return segments;
     }
 
     private static bool IsDynamicShellWrapper(string line)
@@ -2591,7 +2681,7 @@ internal static class WorkflowPolicyInspector
             start++;
         }
 
-        return start < line.Length && line[start] is not '$' and not '[' and not '(' and not '\'' and not '"';
+        return start < line.Length && line[start] is not '$' and not '[' and not '(' and not ')' and not '\'' and not '"';
     }
 
     private static bool ContainsPublicationShapedExpansion(string line)
@@ -3353,6 +3443,7 @@ internal static class WorkflowPolicyInspector
                normalizedCommand.Equals("ConvertTo-Json", StringComparison.OrdinalIgnoreCase) ||
                normalizedCommand.Equals("Write-Host", StringComparison.OrdinalIgnoreCase) ||
                normalizedCommand.Equals("Write-Output", StringComparison.OrdinalIgnoreCase) ||
+               normalizedCommand.Equals("Out-String", StringComparison.OrdinalIgnoreCase) ||
                normalizedCommand.Equals("Select-String", StringComparison.OrdinalIgnoreCase) ||
                normalizedCommand.Equals("Compare-Object", StringComparison.OrdinalIgnoreCase) ||
                normalizedCommand.Equals("ForEach-Object", StringComparison.OrdinalIgnoreCase) ||
