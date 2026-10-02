@@ -1002,9 +1002,7 @@ internal static class UnixProcessSupervisor
         public static MacProcessTreeTracker? TryCreate(int rootProcessId, int markerFd)
         {
             var queue = kqueue();
-            if (queue < 0 ||
-                !TryGetMacProcessIdentity(rootProcessId, out var rootIdentity) ||
-                !TryGetMacProcessMarker(Environment.ProcessId, markerFd, out var marker))
+            if (queue < 0 || !TryGetMacProcessIdentity(rootProcessId, out var rootIdentity))
             {
                 if (queue >= 0)
                 {
@@ -1013,6 +1011,10 @@ internal static class UnixProcessSupervisor
 
                 return null;
             }
+
+            var marker = TryGetMacProcessMarker(Environment.ProcessId, markerFd, out var discoveredMarker)
+                ? discoveredMarker
+                : new MacProcessMarker(markerFd, 0, 0);
 
             var tracker = new MacProcessTreeTracker(
                 queue,
@@ -1359,17 +1361,19 @@ internal static class UnixProcessSupervisor
         var buffer = Marshal.AllocHGlobal(MacVnodeFdInfoSize);
         try
         {
-            if (proc_pidfdinfo(
+            var result = proc_pidfdinfo(
                     processId,
                     fileDescriptor,
                     ProcPidFdVnodePathInfo,
                     buffer,
-                    MacVnodeFdInfoSize) < MacVnodeFdInfoSize)
+                    MacVnodeFdInfoSize);
+            if (result < MacVnodeStatOffset + sizeof(ulong))
             {
                 return false;
             }
 
             marker = new MacProcessMarker(
+                fileDescriptor,
                 unchecked((uint)Marshal.ReadInt32(buffer, MacVnodeStatOffset)),
                 unchecked((ulong)Marshal.ReadInt64(buffer, MacVnodeStatOffset + 8)));
             return marker.Inode != 0;
@@ -1401,9 +1405,16 @@ internal static class UnixProcessSupervisor
             {
                 var fileDescriptor = Marshal.ReadInt32(buffer, offset);
                 var fileType = unchecked((uint)Marshal.ReadInt32(buffer, offset + sizeof(int)));
+                if (fileType == MacVnodeFileType && fileDescriptor == marker.FileDescriptor)
+                {
+                    return true;
+                }
+
                 if (fileType == MacVnodeFileType &&
+                    marker.Inode != 0 &&
                     TryGetMacProcessMarker(processId, fileDescriptor, out var candidate) &&
-                    candidate == marker)
+                    candidate.Device == marker.Device &&
+                    candidate.Inode == marker.Inode)
                 {
                     return true;
                 }
@@ -1510,7 +1521,7 @@ internal static class UnixProcessSupervisor
     }
 
     private readonly record struct MacProcessIdentity(int ProcessId, ulong UniqueId, ulong ParentUniqueId);
-    private readonly record struct MacProcessMarker(uint Device, ulong Inode);
+    private readonly record struct MacProcessMarker(int FileDescriptor, uint Device, ulong Inode);
 
     [StructLayout(LayoutKind.Sequential)]
     private struct MacKevent
