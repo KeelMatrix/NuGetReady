@@ -668,7 +668,7 @@ internal static class UnixProcessSupervisor
             {
                 // Keep the root suspended until its kernel fork watch and inherited
                 // marker are armed; a detached child cannot outrun containment setup.
-                macProcessTree = MacProcessTreeTracker.TryCreate(child, macMarkerFd);
+                macProcessTree = MacProcessTreeTracker.TryCreate(child, macMarkerPath, macMarkerFd);
                 if (macProcessTree is null || kill(child, SigCont) != 0)
                 {
                     _ = kill(-child, SigKill);
@@ -999,7 +999,7 @@ internal static class UnixProcessSupervisor
             tracked[rootProcessId] = rootUniqueId;
         }
 
-        public static MacProcessTreeTracker? TryCreate(int rootProcessId, int markerFd)
+        public static MacProcessTreeTracker? TryCreate(int rootProcessId, string? markerPath, int markerFd)
         {
             var queue = kqueue();
             if (queue < 0 || !TryGetMacProcessIdentity(rootProcessId, out var rootIdentity))
@@ -1013,8 +1013,8 @@ internal static class UnixProcessSupervisor
             }
 
             var marker = TryGetMacProcessMarker(Environment.ProcessId, markerFd, out var discoveredMarker)
-                ? discoveredMarker
-                : new MacProcessMarker(markerFd, 0, 0);
+                ? discoveredMarker with { Path = markerPath }
+                : new MacProcessMarker(markerFd, 0, 0, markerPath);
 
             var tracker = new MacProcessTreeTracker(
                 queue,
@@ -1149,17 +1149,17 @@ internal static class UnixProcessSupervisor
                 }
             }
 
-            foreach (var process in snapshot)
+            foreach (var processId in ReadMacMarkerProcessIds(marker.Path))
             {
-                if (process.ProcessId == rootProcessId ||
-                    process.ProcessId == supervisorProcessId ||
-                    tracked.ContainsKey(process.ProcessId) ||
-                    !MacProcessHasMarker(process.ProcessId, marker))
+                if (processId == rootProcessId ||
+                    processId == supervisorProcessId ||
+                    tracked.ContainsKey(processId) ||
+                    !TryGetMacProcessIdentity(processId, out var identity))
                 {
                     continue;
                 }
 
-                if (!Track(process.ProcessId, process.UniqueId))
+                if (!Track(processId, identity.UniqueId))
                 {
                     return false;
                 }
@@ -1363,7 +1363,8 @@ internal static class UnixProcessSupervisor
             marker = new MacProcessMarker(
                 fileDescriptor,
                 unchecked((uint)Marshal.ReadInt32(buffer, MacVnodeStatOffset)),
-                unchecked((ulong)Marshal.ReadInt64(buffer, MacVnodeStatOffset + 8)));
+                unchecked((ulong)Marshal.ReadInt64(buffer, MacVnodeStatOffset + 8)),
+                null);
             return marker.Inode != 0;
         }
         finally
@@ -1372,58 +1373,68 @@ internal static class UnixProcessSupervisor
         }
     }
 
-    private static bool MacProcessHasMarker(int processId, MacProcessMarker marker)
+    private static int[] ReadMacMarkerProcessIds(string? markerPath)
     {
-        if (marker.Inode == 0)
+        if (string.IsNullOrWhiteSpace(markerPath))
         {
-            return false;
+            return Array.Empty<int>();
         }
 
-        var size = proc_pidinfo(processId, ProcPidListFds, 0, IntPtr.Zero, 0);
-        if (size <= 0)
-        {
-            return false;
-        }
-
-        var buffer = Marshal.AllocHGlobal(size);
+        var pathPointer = Marshal.StringToCoTaskMemUTF8(markerPath);
         try
         {
-            var result = proc_pidinfo(processId, ProcPidListFds, 0, buffer, size);
-            if (result <= 0)
+            var required = proc_listpidspath(
+                ProcAllPids,
+                0,
+                pathPointer,
+                0,
+                IntPtr.Zero,
+                0);
+            if (required <= 0)
             {
-                return false;
+                return Array.Empty<int>();
             }
 
-            for (var offset = 0; offset + MacProcFdInfoSize <= result; offset += MacProcFdInfoSize)
+            for (var attempt = 0; attempt < 8; attempt++)
             {
-                var fileDescriptor = Marshal.ReadInt32(buffer, offset);
-                var fileType = unchecked((uint)Marshal.ReadInt32(buffer, offset + sizeof(int)));
-                if (fileType != MacVnodeFileType)
+                var bufferSize = checked(Math.Max(required, sizeof(int)) * (1 << attempt));
+                var buffer = Marshal.AllocHGlobal(bufferSize);
+                try
                 {
-                    continue;
-                }
+                    var result = proc_listpidspath(
+                        ProcAllPids,
+                        0,
+                        pathPointer,
+                        0,
+                        buffer,
+                        bufferSize);
+                    if (result < 0)
+                    {
+                        return Array.Empty<int>();
+                    }
 
-                if (fileDescriptor != marker.FileDescriptor)
-                {
-                    continue;
-                }
+                    if (result < bufferSize)
+                    {
+                        var processIds = new int[result / sizeof(int)];
+                        for (var index = 0; index < processIds.Length; index++)
+                        {
+                            processIds[index] = Marshal.ReadInt32(buffer, index * sizeof(int));
+                        }
 
-                // A descriptor number is process-local and is not proof that
-                // this process inherited the marker. Validate the vnode
-                // identity before accepting the fast-path descriptor.
-                if (TryGetMacProcessMarker(processId, fileDescriptor, out var exactMarker) &&
-                    exactMarker.Device == marker.Device &&
-                    exactMarker.Inode == marker.Inode)
+                        return processIds;
+                    }
+                }
+                finally
                 {
-                    return true;
+                    Marshal.FreeHGlobal(buffer);
                 }
             }
 
-            return false;
+            return Array.Empty<int>();
         }
         finally
         {
-            Marshal.FreeHGlobal(buffer);
+            Marshal.FreeCoTaskMem(pathPointer);
         }
     }
 
@@ -1520,7 +1531,7 @@ internal static class UnixProcessSupervisor
     }
 
     private readonly record struct MacProcessIdentity(int ProcessId, ulong UniqueId, ulong ParentUniqueId);
-    private readonly record struct MacProcessMarker(int FileDescriptor, uint Device, ulong Inode);
+    private readonly record struct MacProcessMarker(int FileDescriptor, uint Device, ulong Inode, string? Path);
 
     [StructLayout(LayoutKind.Sequential)]
     private struct MacKevent
@@ -1574,6 +1585,15 @@ internal static class UnixProcessSupervisor
     private static extern int fcntl(int fileDescriptor, int command, int argument);
 
     [DllImport("libproc.dylib", SetLastError = true)]
+    private static extern int proc_listpidspath(
+        uint type,
+        uint typeInfo,
+        IntPtr path,
+        uint pathFlags,
+        IntPtr buffer,
+        int bufferSize);
+
+    [DllImport("libproc.dylib", SetLastError = true)]
     private static extern int proc_listallpids(IntPtr buffer, int bufferSize);
 
     [DllImport("libproc.dylib", SetLastError = true)]
@@ -1612,6 +1632,7 @@ internal static class UnixProcessSupervisor
     private const uint NoteExit = 0x80000000;
     private const uint NoteFork = 0x40000000;
     private const int ProcPidBsdInfo = 3;
+    private const uint ProcAllPids = 1;
     private const int ProcPidUniqIdentifierInfo = 17;
     private const int MacBsdInfoSize = 136;
     // proc_uniqidentifierinfo is 16 bytes of UUID, two uint64 values, two
@@ -1621,10 +1642,7 @@ internal static class UnixProcessSupervisor
     private const int OpenCreate = 0x200;
     private const int OpenExclusive = 0x800;
     private const int FSetFileDescriptorFlags = 2;
-    private const int ProcPidListFds = 1;
     private const int ProcPidFdVnodePathInfo = 2;
-    private const int MacProcFdInfoSize = 8;
-    private const int MacVnodeFileType = 1;
     private const int MacVnodeFdInfoSize = 1200;
     private const int MacVnodeStatOffset = 24;
 
