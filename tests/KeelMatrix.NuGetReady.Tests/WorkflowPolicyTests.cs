@@ -1214,6 +1214,91 @@ public sealed class WorkflowPolicyTests
         Assert.Empty(inspection.Failures);
     }
 
+    [Theory]
+    [InlineData("permissions: {}")]
+    [InlineData("permissions:\n  contents: read")]
+    public void Public_cli_blocks_each_unresolved_read_only_command_form(string permissions)
+    {
+        using var corpus = PackageFixture.Create();
+        var package = corpus.AddPackage("Fixture.Standard.1.0.0.nupkg", "Fixture.Standard", "1.0.0");
+        var config = new NuGetReadyConfig
+        {
+            SchemaVersion = 1,
+            Packages =
+            [
+                new PackageExpectation
+                {
+                    Id = "Fixture.Standard",
+                    Kind = "library",
+                    Version = "1.0.0",
+                    Artifacts = [Path.GetFileName(package)]
+                }
+            ]
+        };
+        var forms = new[]
+        {
+            (Name: "command substitution", Shell: "bash", Run: "echo \"$(dotnet nuget push artifacts/package.nupkg)\""),
+            (Name: "process substitution", Shell: "bash", Run: "cat <(dotnet nuget push artifacts/package.nupkg)"),
+            (Name: "PowerShell array assignment", Shell: "pwsh", Run: "$x = @(dotnet nuget push artifacts/package.nupkg)"),
+            (Name: "neutral variable command head", Shell: "bash", Run: "$x"),
+            (Name: "keyword variable indirection", Shell: "pwsh", Run: "$publishCommand"),
+            (Name: "nested bash sh wrapper", Shell: "bash", Run: "bash -c \"sh -c 'dotnet nuget push artifacts/package.nupkg'\""),
+            (Name: "nested zsh pwsh wrapper", Shell: "bash", Run: "zsh -c \"pwsh -Command 'dotnet nuget push artifacts/package.nupkg'\""),
+            (Name: "nested powershell cmd wrapper", Shell: "pwsh", Run: "powershell -Command \"cmd /c 'dotnet nuget push artifacts/package.nupkg'\""),
+            (Name: "nested cmd bash wrapper", Shell: "cmd", Run: "cmd /c \"bash -c 'dotnet nuget push artifacts/package.nupkg'\""),
+            (Name: "unknown pipeline", Shell: "bash", Run: "unknown-package-command | echo complete"),
+            (Name: "variable pipeline", Shell: "pwsh", Run: "$x | Write-Output complete"),
+            (Name: "wrapper pipeline", Shell: "bash", Run: "echo complete | bash -c \"dotnet nuget push artifacts/package.nupkg\"")
+        };
+
+        foreach (var form in forms)
+        {
+            using var repository = WorkflowRepository.Create("ci.yml", "name: placeholder");
+            repository.WriteWorkflow("ci.yml", $$"""
+                name: continuous integration
+                on:
+                  pull_request:
+                {{permissions}}
+                jobs:
+                  unresolved:
+                    steps:
+                      - shell: {{form.Shell}}
+                        run: |
+                          {{form.Run}}
+                """);
+            repository.WriteFile("nugetready.json", System.Text.Json.JsonSerializer.Serialize(config));
+
+            var configPath = Path.Combine(repository.Root.FullName, "nugetready.json");
+            var originalOutput = Console.Out;
+            using var output = new StringWriter();
+            Console.SetOut(output);
+            int exitCode;
+            try
+            {
+                exitCode = Program.Main(
+                    ["check", "--config", configPath, "--artifacts", corpus.ArtifactsPath, "--format", "json", "--timeout", "1s"]);
+            }
+            finally
+            {
+                Console.SetOut(originalOutput);
+            }
+
+            using var report = System.Text.Json.JsonDocument.Parse(output.ToString());
+            var workflowPolicy = report.RootElement.GetProperty("checks")
+                .EnumerateArray()
+                .Single(check => check.GetProperty("id").GetString() == "workflow-policy");
+            Assert.True(
+                string.Equals("error", workflowPolicy.GetProperty("status").GetString(), StringComparison.Ordinal),
+                $"form={form.Name}; exit={exitCode}; output={output}");
+            Assert.Equal(
+                2,
+                exitCode);
+            Assert.Contains(
+                report.RootElement.GetProperty("failures").EnumerateArray(),
+                failure => failure.GetProperty("message").GetString()!.Contains("unproven", StringComparison.OrdinalIgnoreCase));
+        }
+    }
+
     [Fact]
     public void Indirect_script_depth_limit_is_limited_unproven()
     {

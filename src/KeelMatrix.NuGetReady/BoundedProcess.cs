@@ -18,6 +18,13 @@ internal sealed record ProcessResult(
 internal static class BoundedProcess
 {
     internal const string CleanupSignal = "\u001eNU_GETREADY_SUPERVISOR_CLEANUP_CONFIRMED\u001e";
+    private static readonly AsyncLocal<Action<bool>?> CleanupSignalObserver = new();
+
+    internal static Action<bool>? CleanupSignalObservedForTests
+    {
+        get => CleanupSignalObserver.Value;
+        set => CleanupSignalObserver.Value = value;
+    }
     private const int DefaultOutputLimit = 16 * 1024;
     private static readonly TimeSpan TerminationGracePeriod = TimeSpan.FromMilliseconds(500);
     private static readonly TimeSpan StartupReadinessTimeout = TimeSpan.FromSeconds(5);
@@ -106,6 +113,7 @@ internal static class BoundedProcess
 
         WindowsProcessJob? processJob = WindowsProcessJob.TryAttach(process);
         using var lifecycleCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var cleanupSignalObserved = false;
         try
         {
             var cleanupConfirmed = false;
@@ -166,16 +174,18 @@ internal static class BoundedProcess
                 processJob = null;
             }
 
+            cleanupSignalObserved = cleanupSignal.Task.IsCompletedSuccessfully && cleanupSignal.Task.Result;
             return new ProcessResult(
                 true,
                 timedOut || !waitForExit.IsCompletedSuccessfully ? -1 : process.ExitCode,
                 timedOut,
                 GetCompletedOutput(standardOutput),
                 GetCompletedOutput(standardError),
-                cleanupSignal.Task.IsCompletedSuccessfully && cleanupSignal.Task.Result);
+                cleanupSignalObserved);
         }
         finally
         {
+            CleanupSignalObservedForTests?.Invoke(cleanupSignalObserved);
             lifecycleCancellation.Cancel();
             processJob?.Dispose();
         }
@@ -898,7 +908,7 @@ internal static class UnixProcessSupervisor
         MacProcessTreeTracker? macProcessTree = null)
     {
         _ = kill(-processGroupId, SigKill);
-        macProcessTree?.DrainAndDiscover(forceDiscovery: true);
+        var macDiscoveryProven = macProcessTree is null || macProcessTree.DrainAndDiscover(forceDiscovery: true);
         macProcessTree?.KillTrackedDescendants();
 
         var deadline = DateTime.UtcNow + (OperatingSystem.IsMacOS()
@@ -906,9 +916,19 @@ internal static class UnixProcessSupervisor
             : TimeSpan.FromMilliseconds(250));
         while (DateTime.UtcNow < deadline)
         {
-            if (macProcessTree is not null && !macProcessTree.DrainAndDiscover())
+            if (macProcessTree is not null)
             {
-                return false;
+                // Always rescan the inherited marker. A missed NOTE_FORK event
+                // must not turn an untracked detached descendant into proof of
+                // containment, and a failed scan must not be bypassed by a
+                // later no-event drain.
+                macDiscoveryProven = macProcessTree.DrainAndDiscover(forceDiscovery: true);
+                if (!macDiscoveryProven)
+                {
+                    macProcessTree.KillTrackedDescendants();
+                    Thread.Sleep(10);
+                    continue;
+                }
             }
 
             macProcessTree?.KillTrackedDescendants();
@@ -924,6 +944,7 @@ internal static class UnixProcessSupervisor
             {
                 var groupError = Marshal.GetLastWin32Error();
                 if (OperatingSystem.IsMacOS() &&
+                    macDiscoveryProven &&
                     MacProcessGroupHasNoLiveMembers(processGroupId) &&
                     macProcessTree is not null &&
                     macProcessTree.HasNoLiveDescendants())
@@ -936,6 +957,7 @@ internal static class UnixProcessSupervisor
             }
 
             if (OperatingSystem.IsMacOS() &&
+                macDiscoveryProven &&
                 MacProcessGroupHasNoLiveMembers(processGroupId) &&
                 macProcessTree is not null &&
                 macProcessTree.HasNoLiveDescendants())
@@ -947,6 +969,7 @@ internal static class UnixProcessSupervisor
         }
 
         if (OperatingSystem.IsMacOS() &&
+            macDiscoveryProven &&
             MacProcessGroupHasNoLiveMembers(processGroupId) &&
             macProcessTree is not null &&
             macProcessTree.HasNoLiveDescendants())
@@ -954,9 +977,17 @@ internal static class UnixProcessSupervisor
             return true;
         }
 
+        if (OperatingSystem.IsMacOS())
+        {
+            return macDiscoveryProven &&
+                macProcessTree is not null &&
+                MacProcessGroupHasNoLiveMembers(processGroupId) &&
+                macProcessTree.HasNoLiveDescendants();
+        }
+
         return kill(-processGroupId, 0) != 0 &&
-            Marshal.GetLastWin32Error() == NoSuchProcessError &&
-            (!OperatingSystem.IsLinux() || ReapDescendants());
+               Marshal.GetLastWin32Error() == NoSuchProcessError &&
+               (!OperatingSystem.IsLinux() || ReapDescendants());
     }
 
     private static bool MacProcessGroupHasNoLiveMembers(int processGroupId)
@@ -1202,6 +1233,11 @@ internal static class UnixProcessSupervisor
 
     private static int[]? ReadMacMarkerProcessIds(string? markerPath)
     {
+        if (Environment.GetEnvironmentVariable("KEELMATRIX_NUGETREADY_TEST_MAC_MARKER_DISCOVERY_FAILURE") == "1")
+        {
+            return null;
+        }
+
         if (string.IsNullOrWhiteSpace(markerPath))
         {
             return null;

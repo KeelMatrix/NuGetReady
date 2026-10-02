@@ -2498,7 +2498,8 @@ internal static class WorkflowPolicyInspector
             if (IsDynamicShellWrapper(line) ||
                 IsCommandVariable(line) ||
                 ContainsExecutableSubstitution(line) ||
-                ContainsPublicationShapedExpansion(line))
+                ContainsPublicationShapedExpansion(line) ||
+                AnalyzeCommandLine(line).IsUnresolved)
             {
                 return true;
             }
@@ -2527,7 +2528,7 @@ internal static class WorkflowPolicyInspector
             @"^\s*(?:&\s*)?(?:\$(?<name>(?:env:)?[A-Za-z_][A-Za-z0-9_]*)|\$\{(?<name>[^}\r\n]+)\})(?!\s*(?:[+\-*/]?=|\|))(?:\s|$)",
             RegexOptions.IgnoreCase);
 
-        return match.Success && Regex.IsMatch(match.Groups["name"].Value, @"(?i)(?:command|publish|push|nuget|release)");
+        return match.Success;
     }
 
     private static bool ContainsExecutableSubstitution(string line)
@@ -2574,7 +2575,6 @@ internal static class WorkflowPolicyInspector
             }
 
             if (character is '<' or '@' && index + 1 < line.Length && line[index + 1] == '(' &&
-                (character != '@' || !Regex.IsMatch(line, @"^\s*\$[A-Za-z_][A-Za-z0-9_]*\s*=")) &&
                 StartsWithExecutableSubstitution(line, index + 2))
             {
                 return true;

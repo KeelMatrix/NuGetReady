@@ -208,6 +208,78 @@ public sealed class BoundedProcessTests
         }
     }
 
+    [Theory]
+    [InlineData(0, false, false)]
+    [InlineData(7, false, false)]
+    [InlineData(0, true, false)]
+    [InlineData(0, false, true)]
+    public async Task Mac_marker_discovery_failure_never_emits_cleanup_confirmation(
+        int parentExitCode,
+        bool parentWaitsForTimeout,
+        bool cancel)
+    {
+        if (!OperatingSystem.IsMacOS())
+        {
+            return;
+        }
+
+        var (fileName, arguments, pidFile) = CreateMacDetachedProcess(
+            parentExitCode,
+            parentWaitsForTimeout || cancel);
+        using var cancellation = new CancellationTokenSource();
+        var cleanupObservations = new List<bool>();
+        BoundedProcess.CleanupSignalObservedForTests = cleanupObservations.Add;
+        var environment = new Dictionary<string, string?>
+        {
+            ["KEELMATRIX_NUGETREADY_TEST_MAC_MARKER_DISCOVERY_FAILURE"] = "1"
+        };
+
+        try
+        {
+            if (cancel)
+            {
+                var run = BoundedProcess.RunAsync(
+                    fileName,
+                    arguments,
+                    Environment.CurrentDirectory,
+                    environment,
+                    TimeSpan.FromMinutes(1),
+                    cancellationToken: cancellation.Token);
+                _ = await WaitForRecordedPidAsync(pidFile);
+                cancellation.Cancel();
+                await Assert.ThrowsAnyAsync<OperationCanceledException>(() => run);
+            }
+            else
+            {
+                var result = await BoundedProcess.RunAsync(
+                    fileName,
+                    arguments,
+                    Environment.CurrentDirectory,
+                    environment,
+                    parentWaitsForTimeout ? TimeSpan.FromMilliseconds(250) : TimeSpan.FromSeconds(5));
+                Assert.False(result.CleanupConfirmed, result.StandardError);
+                Assert.Equal(parentWaitsForTimeout, result.TimedOut);
+            }
+
+            Assert.NotEmpty(cleanupObservations);
+            Assert.All(cleanupObservations, observed => Assert.False(observed));
+        }
+        finally
+        {
+            BoundedProcess.CleanupSignalObservedForTests = null;
+            if (File.Exists(pidFile))
+            {
+                var recorded = File.ReadAllText(pidFile).Trim();
+                if (int.TryParse(recorded, out var escapedPid) && IsLiveProcess(escapedPid))
+                {
+                    _ = kill(escapedPid, 9);
+                }
+
+                File.Delete(pidFile);
+            }
+        }
+    }
+
     private static (string FileName, IReadOnlyList<string> Arguments, string? PidFile) CreatePipeHoldingProcess()
     {
         if (OperatingSystem.IsWindows())
