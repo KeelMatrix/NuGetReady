@@ -1390,6 +1390,11 @@ internal static class UnixProcessSupervisor
 
     private static bool MacProcessHasMarker(int processId, MacProcessMarker marker)
     {
+        if (marker.Inode == 0)
+        {
+            return false;
+        }
+
         var size = proc_pidinfo(processId, ProcPidListFds, 0, IntPtr.Zero, 0);
         if (size <= 0)
         {
@@ -1409,16 +1414,22 @@ internal static class UnixProcessSupervisor
             {
                 var fileDescriptor = Marshal.ReadInt32(buffer, offset);
                 var fileType = unchecked((uint)Marshal.ReadInt32(buffer, offset + sizeof(int)));
-                if (fileType == MacVnodeFileType && fileDescriptor == marker.FileDescriptor)
+                if (fileType != MacVnodeFileType)
                 {
-                    return true;
+                    continue;
                 }
 
-                if (fileType == MacVnodeFileType &&
-                    marker.Inode != 0 &&
-                    TryGetMacProcessMarker(processId, fileDescriptor, out var candidate) &&
-                    candidate.Device == marker.Device &&
-                    candidate.Inode == marker.Inode)
+                if (fileDescriptor != marker.FileDescriptor)
+                {
+                    continue;
+                }
+
+                // A descriptor number is process-local and is not proof that
+                // this process inherited the marker. Validate the vnode
+                // identity before accepting the fast-path descriptor.
+                if (TryGetMacProcessMarker(processId, fileDescriptor, out var exactMarker) &&
+                    exactMarker.Device == marker.Device &&
+                    exactMarker.Inode == marker.Inode)
                 {
                     return true;
                 }
