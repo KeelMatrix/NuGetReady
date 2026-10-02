@@ -1033,17 +1033,18 @@ internal static class UnixProcessSupervisor
 
         public bool Pump()
         {
-            // macOS does not copy NOTE_FORK's internal child PID into the public
-            // kevent. Use the kernel event as the discovery edge, then register
-            // all currently reachable children immediately; the inherited marker
-            // closes the ancestry-independent cleanup proof if a child reparents
-            // before this event is delivered.
-            if (!ReadEvents(wait: true, out var forkObserved))
+            // Keep the kernel process watch armed while the child runs. macOS
+            // does not copy NOTE_FORK's internal child PID into the public
+            // kevent, and whole-host ancestry enrichment for every fork would
+            // make process-heavy commands unbounded. Cleanup performs one exact
+            // identity/ancestry discovery pass before confirmation; the
+            // inherited marker catches descendants that have already reparented.
+            if (!ReadEvents(wait: true, out _))
             {
                 return false;
             }
 
-            return !forkObserved || DiscoverDescendants(includeMarker: false);
+            return true;
         }
 
         public bool DrainAndDiscover(bool forceDiscovery = false)
@@ -1118,7 +1119,7 @@ internal static class UnixProcessSupervisor
             }
         }
 
-        private bool DiscoverDescendants(bool includeMarker = true)
+        private bool DiscoverDescendants()
         {
             var snapshot = ReadMacProcessIdentities();
             if (snapshot is null)
@@ -1146,11 +1147,6 @@ internal static class UnixProcessSupervisor
 
                     changed = true;
                 }
-            }
-
-            if (!includeMarker)
-            {
-                return true;
             }
 
             foreach (var process in snapshot)
