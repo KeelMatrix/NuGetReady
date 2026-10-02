@@ -1173,6 +1173,27 @@ public sealed class WorkflowPolicyTests
         AssertLimitedUnproven(inspection);
     }
 
+    [Theory]
+    [InlineData("permissions: {}")]
+    [InlineData("permissions:\n  contents: read")]
+    public void Output_command_substitution_in_explicit_read_only_ci_enters_publication_policy(string permissions)
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", $$"""
+            name: continuous integration
+            on:
+              push:
+            {{permissions}}
+            jobs:
+              build:
+                steps:
+                  - run: echo "$(dotnet nuget push artifacts/package.nupkg)"
+            """);
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        AssertLimitedUnproven(inspection);
+    }
+
     [Fact]
     public void Single_quoted_output_substitution_text_remains_an_inert_control()
     {
@@ -4261,6 +4282,35 @@ public sealed class WorkflowPolicyTests
 
         Assert.True(inspection.Evaluated);
         Assert.Contains(inspection.Failures, failure => failure.IsError || !failure.IsWarning);
+    }
+
+    [Theory]
+    [InlineData("echo $(dotnet nuget push artifacts/package.nupkg)")]
+    [InlineData("echo \"${COMMAND:-dotnet nuget push artifacts/package.nupkg}\"")]
+    [InlineData("printf \"$(dotnet nuget push artifacts/package.nupkg)\"")]
+    [InlineData("Write-Output $(dotnet nuget push artifacts/package.nupkg)")]
+    [InlineData("Write-Host `$(dotnet nuget push artifacts/package.nupkg)")]
+    [InlineData("echo safe | dotnet nuget push artifacts/package.nupkg")]
+    [InlineData("bash -c 'echo $(dotnet nuget push artifacts/package.nupkg)'")]
+    [InlineData("bash -c 'bash -c \"echo $(dotnet nuget push artifacts/package.nupkg)\"'")]
+    [InlineData("$PUBLISH_COMMAND")]
+    public void Bounded_unknown_execution_forms_in_explicit_read_only_ci_are_blocking(string command)
+    {
+        using var repository = WorkflowRepository.Create("ci.yml", $$"""
+            name: continuous integration
+            on:
+              pull_request:
+            permissions:
+              contents: read
+            jobs:
+              build:
+                steps:
+                  - run: {{command}}
+            """);
+
+        var inspection = WorkflowPolicyInspector.InspectDetailed(repository.Root.FullName);
+
+        AssertLimitedUnproven(inspection);
     }
 
     [Theory]

@@ -269,8 +269,9 @@ internal static class WorkflowPolicyInspector
             var hasIndirectPublication = false;
             foreach (var step in job.Steps)
             {
-                hasIndirectPublication |= InspectIndirectPublicationPath(repositoryPath, step, indirectContext) ==
-                    IndirectPublicationPath.Publication;
+                var indirectPath = InspectIndirectPublicationPath(repositoryPath, step, indirectContext);
+                hasIndirectPublication |= indirectPath == IndirectPublicationPath.Publication ||
+                    indirectPath == IndirectPublicationPath.Unknown && !string.IsNullOrWhiteSpace(step.Run);
             }
 
             if (hasReleaseControl ||

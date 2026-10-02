@@ -134,6 +134,78 @@ public sealed class BoundedProcessTests
         }
     }
 
+    [Theory]
+    [InlineData(0, false, false)]
+    [InlineData(7, false, false)]
+    [InlineData(0, true, false)]
+    [InlineData(0, false, true)]
+    public async Task Mac_detached_descendant_is_terminated_before_cleanup_confirmation(
+        int parentExitCode,
+        bool parentWaitsForTimeout,
+        bool cancel)
+    {
+        if (!OperatingSystem.IsMacOS())
+        {
+            return;
+        }
+
+        var (fileName, arguments, pidFile) = CreateMacDetachedProcess(parentExitCode, parentWaitsForTimeout);
+        using var cancellation = new CancellationTokenSource();
+        ProcessResult? result = null;
+        try
+        {
+            if (cancel)
+            {
+                var run = BoundedProcess.RunAsync(
+                    fileName,
+                    arguments,
+                    Environment.CurrentDirectory,
+                    new Dictionary<string, string?>(),
+                    TimeSpan.FromMinutes(1),
+                    cancellationToken: cancellation.Token);
+                var escapedPid = await WaitForRecordedPidAsync(pidFile);
+                cancellation.Cancel();
+                await Assert.ThrowsAnyAsync<OperationCanceledException>(() => run);
+                Assert.True(WaitForExit(escapedPid), $"Detached macOS PID {escapedPid} survived cancellation cleanup.");
+            }
+            else
+            {
+                result = await BoundedProcess.RunAsync(
+                    fileName,
+                    arguments,
+                    Environment.CurrentDirectory,
+                    new Dictionary<string, string?>(),
+                    parentWaitsForTimeout ? TimeSpan.FromMilliseconds(250) : TimeSpan.FromSeconds(5));
+                var escapedPid = await WaitForRecordedPidAsync(pidFile);
+
+                Assert.False(
+                    result.CleanupConfirmed && IsLiveProcess(escapedPid),
+                    "CleanupConfirmed/CleanupSignal must not be observable while the escaped PID is alive.");
+                Assert.True(result.CleanupConfirmed, result.StandardError);
+                Assert.Equal(parentWaitsForTimeout, result.TimedOut);
+                if (!parentWaitsForTimeout)
+                {
+                    Assert.Equal(parentExitCode, result.ExitCode);
+                }
+
+                Assert.True(WaitForExit(escapedPid), $"Detached macOS PID {escapedPid} survived cleanup.");
+            }
+        }
+        finally
+        {
+            if (File.Exists(pidFile))
+            {
+                var recorded = File.ReadAllText(pidFile).Trim();
+                if (int.TryParse(recorded, out var escapedPid) && IsLiveProcess(escapedPid))
+                {
+                    _ = kill(escapedPid, 9);
+                }
+
+                File.Delete(pidFile);
+            }
+        }
+    }
+
     private static (string FileName, IReadOnlyList<string> Arguments, string? PidFile) CreatePipeHoldingProcess()
     {
         if (OperatingSystem.IsWindows())
@@ -167,6 +239,43 @@ public sealed class BoundedProcessTests
             "sh",
             ["-c", "sleep 30 >/dev/null 2>&1 & child=$!; printf '%s %s\\n' \"$$\" \"$child\" > \"$1\"; exit 0", "nugetready-test", pidFile],
             pidFile);
+    }
+
+    private static (string FileName, IReadOnlyList<string> Arguments, string PidFile) CreateMacDetachedProcess(
+        int parentExitCode,
+        bool parentWaitsForTimeout)
+    {
+        var pidFile = Path.Combine(Path.GetTempPath(), $"nugetready-mac-detached-{Guid.NewGuid():N}.txt");
+        var parentCompletion = parentWaitsForTimeout
+            ? "while [ ! -s \"$1\" ]; do sleep 0.01; done; sleep 30"
+            : $"while [ ! -s \"$1\" ]; do sleep 0.01; done; exit {parentExitCode}";
+        var script = "setsid sh -c 'printf \"%s\\n\" \"$$\" > \"$1\"; sleep 30' nugetready-detached \"$1\" >/dev/null 2>&1 & " + parentCompletion;
+        return (
+            "sh",
+            ["-c", script, "nugetready-test", pidFile],
+            pidFile);
+    }
+
+    private static async Task<int> WaitForRecordedPidAsync(string pidFile)
+    {
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(30);
+        while (DateTime.UtcNow < deadline)
+        {
+            try
+            {
+                if (File.Exists(pidFile) && int.TryParse(File.ReadAllText(pidFile).Trim(), out var pid))
+                {
+                    return pid;
+                }
+            }
+            catch (IOException)
+            {
+            }
+
+            await Task.Delay(TimeSpan.FromMilliseconds(25));
+        }
+
+        throw new Xunit.Sdk.XunitException($"The detached macOS fixture did not record a PID in {pidFile}.");
     }
 
     private static IReadOnlyList<string> CreateWindowsProcessArguments(string pidFile, bool redirectOutput, bool keepParentAlive)

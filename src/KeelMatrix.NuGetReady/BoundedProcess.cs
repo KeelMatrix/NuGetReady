@@ -579,6 +579,9 @@ internal static class UnixProcessSupervisor
         var environmentVector = IntPtr.Zero;
         var spawnAttributes = IntPtr.Zero;
         var spawnAttributesInitialized = false;
+        MacProcessTreeTracker? macProcessTree = null;
+        string? macMarkerPath = null;
+        var macMarkerFd = -1;
         using var terminationSignal = PosixSignalRegistration.Create(
             PosixSignal.SIGTERM,
             context =>
@@ -627,6 +630,13 @@ internal static class UnixProcessSupervisor
                 return 125;
             }
 
+            // macOS has no Linux-style subreaper. A non-CLOEXEC vnode inherited at
+            // fork gives cleanup an ancestry-independent identity after reparenting.
+            if (OperatingSystem.IsMacOS() && !TryCreateMacProcessMarker(out macMarkerPath, out macMarkerFd))
+            {
+                return 125;
+            }
+
             spawnAttributes = Marshal.AllocHGlobal(PosixSpawnAttributeStorageSize);
             if (posix_spawnattr_init(spawnAttributes) != 0)
             {
@@ -634,7 +644,9 @@ internal static class UnixProcessSupervisor
             }
 
             spawnAttributesInitialized = true;
-            if (posix_spawnattr_setflags(spawnAttributes, PosixSpawnSetProcessGroup) != 0 ||
+            var spawnFlags = (short)(PosixSpawnSetProcessGroup |
+                (OperatingSystem.IsMacOS() ? PosixSpawnStartSuspended : 0));
+            if (posix_spawnattr_setflags(spawnAttributes, spawnFlags) != 0 ||
                 posix_spawnattr_setpgroup(spawnAttributes, 0) != 0)
             {
                 return 125;
@@ -652,12 +664,21 @@ internal static class UnixProcessSupervisor
                 return 125;
             }
 
+            if (OperatingSystem.IsMacOS())
+            {
+                // Keep the root suspended until its kernel fork watch and inherited
+                // marker are armed; a detached child cannot outrun containment setup.
+                macProcessTree = MacProcessTreeTracker.TryCreate(child, macMarkerFd);
+                if (macProcessTree is null || kill(child, SigCont) != 0)
+                {
+                    _ = kill(-child, SigKill);
+                    return 125;
+                }
+            }
+
             SignalReady();
             var status = 0;
-            var macDescendants = OperatingSystem.IsMacOS()
-                ? new Dictionary<int, string>()
-                : null;
-            if (WaitForChild(child, out status, macDescendants) < 0)
+            if (WaitForChild(child, out status, macProcessTree) < 0)
             {
                 return 125;
             }
@@ -665,7 +686,7 @@ internal static class UnixProcessSupervisor
             // The target has its own process group. Kill and verify that group before
             // claiming cleanup; on Linux also require the subreaper to have no adopted
             // child remaining, which keeps detached/reparented descendants unproven.
-            var descendantsClean = KillAndVerifyProcessGroup(child, macDescendants);
+            var descendantsClean = KillAndVerifyProcessGroup(child, macProcessTree);
             if (!descendantsClean)
             {
                 return 125;
@@ -712,6 +733,16 @@ internal static class UnixProcessSupervisor
                 }
             }
 
+            macProcessTree?.Dispose();
+            if (macMarkerFd >= 0)
+            {
+                _ = close(macMarkerFd);
+            }
+
+            if (macMarkerPath is not null)
+            {
+                UnlinkMacPath(macMarkerPath);
+            }
         }
     }
 
@@ -719,6 +750,7 @@ internal static class UnixProcessSupervisor
     private static extern int setsid();
 
     private const short PosixSpawnSetProcessGroup = 0x2;
+    private const short PosixSpawnStartSuspended = 0x80;
     private const int PosixSpawnAttributeStorageSize = 512;
 
     [DllImport("libc", SetLastError = true)]
@@ -757,23 +789,20 @@ internal static class UnixProcessSupervisor
     private static int WaitForChild(
         int child,
         out int status,
-        Dictionary<int, string>? macDescendants)
+        MacProcessTreeTracker? macProcessTree)
     {
         status = 0;
         while (true)
         {
-            if (macDescendants is not null)
+            if (macProcessTree is not null && !macProcessTree.Pump())
             {
-                TrackMacDescendants(child, macDescendants);
+                return -1;
             }
 
             if (Volatile.Read(ref terminationRequested) != 0)
             {
                 _ = kill(-child, SigKill);
-                if (macDescendants is not null)
-                {
-                    KillTrackedMacDescendants(macDescendants);
-                }
+                macProcessTree?.KillTrackedDescendants();
             }
 
             var result = waitpid(child, out status, WaitNoHang);
@@ -871,23 +900,23 @@ internal static class UnixProcessSupervisor
 
     private static bool KillAndVerifyProcessGroup(
         int processGroupId,
-        IReadOnlyDictionary<int, string>? macDescendants = null)
+        MacProcessTreeTracker? macProcessTree = null)
     {
         _ = kill(-processGroupId, SigKill);
-        if (macDescendants is not null)
-        {
-            KillTrackedMacDescendants(macDescendants);
-        }
+        macProcessTree?.DrainAndDiscover(forceDiscovery: true);
+        macProcessTree?.KillTrackedDescendants();
 
         var deadline = DateTime.UtcNow + (OperatingSystem.IsMacOS()
             ? TimeSpan.FromSeconds(5)
             : TimeSpan.FromMilliseconds(250));
         while (DateTime.UtcNow < deadline)
         {
-            if (macDescendants is not null)
+            if (macProcessTree is not null && !macProcessTree.DrainAndDiscover())
             {
-                KillTrackedMacDescendants(macDescendants);
+                return false;
             }
+
+            macProcessTree?.KillTrackedDescendants();
 
             if (OperatingSystem.IsLinux())
             {
@@ -901,7 +930,8 @@ internal static class UnixProcessSupervisor
                 var groupError = Marshal.GetLastWin32Error();
                 if (OperatingSystem.IsMacOS() &&
                     MacProcessGroupHasNoLiveMembers(processGroupId) &&
-                    MacTrackedDescendantsHaveNoLiveMembers(macDescendants))
+                    macProcessTree is not null &&
+                    macProcessTree.HasNoLiveDescendants())
                 {
                     return true;
                 }
@@ -912,7 +942,8 @@ internal static class UnixProcessSupervisor
 
             if (OperatingSystem.IsMacOS() &&
                 MacProcessGroupHasNoLiveMembers(processGroupId) &&
-                MacTrackedDescendantsHaveNoLiveMembers(macDescendants))
+                macProcessTree is not null &&
+                macProcessTree.HasNoLiveDescendants())
             {
                 return true;
             }
@@ -922,7 +953,8 @@ internal static class UnixProcessSupervisor
 
         if (OperatingSystem.IsMacOS() &&
             MacProcessGroupHasNoLiveMembers(processGroupId) &&
-            MacTrackedDescendantsHaveNoLiveMembers(macDescendants))
+            macProcessTree is not null &&
+            macProcessTree.HasNoLiveDescendants())
         {
             return true;
         }
@@ -932,142 +964,621 @@ internal static class UnixProcessSupervisor
             (!OperatingSystem.IsLinux() || ReapDescendants());
     }
 
-    private static void TrackMacDescendants(int rootProcessId, IDictionary<int, string> tracked)
+    private static bool MacProcessGroupHasNoLiveMembers(int processGroupId)
     {
-        var processes = ReadMacProcessSnapshot();
-        if (processes is null)
+        if (kill(-processGroupId, 0) != 0)
         {
-            return;
+            return Marshal.GetLastWin32Error() == NoSuchProcessError;
         }
 
-        var descendants = new HashSet<int> { rootProcessId };
-        var changed = true;
-        while (changed)
+        var members = ReadMacProcessGroupMembers(processGroupId);
+        return members is not null && members.All(processId => !MacProcessIsLive(processId));
+    }
+
+    private sealed class MacProcessTreeTracker : IDisposable
+    {
+        private readonly int queue;
+        private readonly int rootProcessId;
+        private readonly int supervisorProcessId;
+        private readonly MacProcessMarker marker;
+        private readonly Dictionary<int, ulong> tracked = new();
+        private bool disposed;
+        private bool healthy = true;
+
+        private MacProcessTreeTracker(
+            int queue,
+            int rootProcessId,
+            ulong rootUniqueId,
+            int supervisorProcessId,
+            MacProcessMarker marker)
         {
-            changed = false;
-            foreach (var process in processes.Values)
+            this.queue = queue;
+            this.rootProcessId = rootProcessId;
+            this.supervisorProcessId = supervisorProcessId;
+            this.marker = marker;
+            tracked[rootProcessId] = rootUniqueId;
+        }
+
+        public static MacProcessTreeTracker? TryCreate(int rootProcessId, int markerFd)
+        {
+            var queue = kqueue();
+            if (queue < 0 ||
+                !TryGetMacProcessIdentity(rootProcessId, out var rootIdentity) ||
+                !TryGetMacProcessMarker(Environment.ProcessId, markerFd, out var marker))
             {
-                if (!process.IsZombie && descendants.Contains(process.ParentProcessId) && descendants.Add(process.ProcessId))
+                if (queue >= 0)
                 {
-                    changed = true;
+                    _ = close(queue);
+                }
+
+                return null;
+            }
+
+            var tracker = new MacProcessTreeTracker(
+                queue,
+                rootProcessId,
+                rootIdentity.UniqueId,
+                Environment.ProcessId,
+                marker);
+            if (!tracker.Register(rootProcessId))
+            {
+                tracker.Dispose();
+                return null;
+            }
+
+            return tracker;
+        }
+
+        public bool Pump()
+        {
+            if (!ReadEvents(wait: true, out var forkObserved))
+            {
+                return false;
+            }
+
+            return !forkObserved || DiscoverDescendants();
+        }
+
+        public bool DrainAndDiscover(bool forceDiscovery = false)
+        {
+            if (!ReadEvents(wait: false, out var forkObserved))
+            {
+                return false;
+            }
+
+            return forkObserved || forceDiscovery ? DiscoverDescendants() : true;
+        }
+
+        public void KillTrackedDescendants()
+        {
+            foreach (var pair in tracked)
+            {
+                if (pair.Key == rootProcessId ||
+                    !TryGetMacProcessIdentity(pair.Key, out var identity) ||
+                    identity.UniqueId != pair.Value)
+                {
+                    continue;
+                }
+
+                _ = kill(pair.Key, SigKill);
+            }
+        }
+
+        public bool HasNoLiveDescendants()
+        {
+            if (!DiscoverDescendants())
+            {
+                return false;
+            }
+
+            foreach (var pair in tracked)
+            {
+                if (pair.Key == rootProcessId)
+                {
+                    continue;
+                }
+
+                if (!TryGetMacProcessIdentity(pair.Key, out var identity))
+                {
+                    if (MacProcessIsLive(pair.Key))
+                    {
+                        return false;
+                    }
+
+                    continue;
+                }
+
+                if (identity.UniqueId != pair.Value)
+                {
+                    continue;
+                }
+
+                if (MacProcessIsLive(pair.Key))
+                {
+                    return false;
                 }
             }
-        }
 
-        foreach (var processId in descendants)
-        {
-            if (processId != rootProcessId && processes.TryGetValue(processId, out var process) && !process.IsZombie)
-            {
-                tracked.TryAdd(processId, process.StartTime);
-            }
-        }
-    }
-
-    private static void KillTrackedMacDescendants(IReadOnlyDictionary<int, string> tracked)
-    {
-        var processes = ReadMacProcessSnapshot();
-        if (processes is null)
-        {
-            return;
-        }
-
-        foreach (var (processId, startTime) in tracked)
-        {
-            if (processes.TryGetValue(processId, out var process) &&
-                !process.IsZombie &&
-                string.Equals(process.StartTime, startTime, StringComparison.Ordinal))
-            {
-                _ = kill(processId, SigKill);
-            }
-        }
-    }
-
-    private static bool MacTrackedDescendantsHaveNoLiveMembers(IReadOnlyDictionary<int, string>? tracked)
-    {
-        if (tracked is null || tracked.Count == 0)
-        {
             return true;
         }
 
-        var processes = ReadMacProcessSnapshot();
-        if (processes is null)
+        public void Dispose()
         {
-            return false;
+            if (!disposed)
+            {
+                disposed = true;
+                _ = close(queue);
+            }
         }
 
-        return tracked.All(pair =>
-            !processes.TryGetValue(pair.Key, out var process) ||
-            process.IsZombie ||
-            !string.Equals(process.StartTime, pair.Value, StringComparison.Ordinal));
-    }
-
-    private static Dictionary<int, MacProcessInfo>? ReadMacProcessSnapshot()
-    {
-        try
+        private bool DiscoverDescendants()
         {
-            using var process = Process.Start(new ProcessStartInfo
+            var snapshot = ReadMacProcessIdentities();
+            if (snapshot is null)
             {
-                FileName = "/bin/ps",
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                ArgumentList = { "-axo", "pid=,ppid=,pgid=,state=,lstart=" }
-            });
-            if (process is null)
-            {
-                return null;
+                return false;
             }
 
-            var output = process.StandardOutput.ReadToEnd();
-            if (!process.WaitForExit(1000) || process.ExitCode != 0)
+            var changed = true;
+            while (changed)
             {
-                return null;
-            }
-
-            var snapshot = new Dictionary<int, MacProcessInfo>();
-            foreach (var line in output.Split('\n', StringSplitOptions.RemoveEmptyEntries))
-            {
-                var fields = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-                if (fields.Length >= 9 &&
-                    int.TryParse(fields[0], out var processId) &&
-                    int.TryParse(fields[1], out var parentProcessId) &&
-                    int.TryParse(fields[2], out var groupId))
+                changed = false;
+                foreach (var process in snapshot)
                 {
-                    snapshot[processId] = new MacProcessInfo(
-                        processId,
-                        parentProcessId,
-                        groupId,
-                        fields[3].StartsWith('Z'),
-                        string.Join(' ', fields.Skip(4)));
+                    if (tracked.ContainsKey(process.ProcessId) ||
+                        !tracked.ContainsValue(process.ParentUniqueId) ||
+                        !MacProcessIsLive(process.ProcessId))
+                    {
+                        continue;
+                    }
+
+                    if (!Track(process.ProcessId, process.UniqueId))
+                    {
+                        return false;
+                    }
+
+                    changed = true;
                 }
             }
 
-            return snapshot;
+            foreach (var process in snapshot)
+            {
+                if (process.ProcessId == rootProcessId ||
+                    process.ProcessId == supervisorProcessId ||
+                    tracked.ContainsKey(process.ProcessId) ||
+                    !MacProcessHasMarker(process.ProcessId, marker))
+                {
+                    continue;
+                }
+
+                if (!Track(process.ProcessId, process.UniqueId))
+                {
+                    return false;
+                }
+            }
+
+            return true;
         }
-        catch (Exception exception) when (exception is InvalidOperationException or System.ComponentModel.Win32Exception)
+
+        private bool Track(int processId, ulong uniqueId)
         {
-            return null;
+            if (tracked.ContainsKey(processId) || processId == supervisorProcessId)
+            {
+                return true;
+            }
+
+            if (!Register(processId))
+            {
+                return false;
+            }
+
+            tracked[processId] = uniqueId;
+            return true;
+        }
+
+        private bool Register(int processId)
+        {
+            var change = new MacKevent
+            {
+                Ident = (nuint)processId,
+                Filter = EvfiltProc,
+                Flags = EvAdd | EvEnable | EvClear,
+                Fflags = NoteFork | NoteExit
+            };
+            var result = kevent(queue, ref change, 1, IntPtr.Zero, 0, IntPtr.Zero);
+            if (result == 0)
+            {
+                return true;
+            }
+
+            return Marshal.GetLastWin32Error() == NoSuchProcessError && !MacProcessIsLive(processId);
+        }
+
+        private bool ReadEvents(bool wait, out bool forkObserved)
+        {
+            forkObserved = false;
+            var timeout = new MacTimespec
+            {
+                Seconds = 0,
+                Nanoseconds = wait ? 100_000_000 : 0
+            };
+            var events = new MacKevent[64];
+            var result = kevent(queue, IntPtr.Zero, 0, events, events.Length, ref timeout);
+            if (result < 0)
+            {
+                return Marshal.GetLastWin32Error() == InterruptedSystemCallError;
+            }
+
+            for (var index = 0; index < result; index++)
+            {
+                if ((events[index].Flags & EvError) != 0)
+                {
+                    healthy = false;
+                    return false;
+                }
+
+                if ((events[index].Fflags & NoteFork) != 0)
+                {
+                    forkObserved = true;
+                    var childProcessId = (int)(events[index].Fflags & NoteProcessIdMask);
+                    if (childProcessId > 0)
+                    {
+                        if (TryGetMacProcessIdentity(childProcessId, out var childIdentity))
+                        {
+                            if (!Track(childProcessId, childIdentity.UniqueId))
+                            {
+                                return false;
+                            }
+                        }
+                        else if (MacProcessIsLive(childProcessId))
+                        {
+                            return false;
+                        }
+                    }
+                }
+            }
+
+            return healthy;
         }
     }
 
-    private static bool MacProcessGroupHasNoLiveMembers(int processGroupId)
+    private static bool MacProcessIsLive(int processId)
     {
-        var processes = ReadMacProcessSnapshot();
-        if (processes is null)
+        if (TryGetMacProcessStatus(processId, out var status))
+        {
+            return status != MacZombieStatus;
+        }
+
+        var result = kill(processId, 0);
+        return result == 0 || Marshal.GetLastWin32Error() != NoSuchProcessError;
+    }
+
+    private static bool TryCreateMacProcessMarker(out string? path, out int fileDescriptor)
+    {
+        path = null;
+        fileDescriptor = -1;
+        try
+        {
+            for (var attempt = 0; attempt < 8; attempt++)
+            {
+                var candidate = Path.Combine(
+                    Path.GetTempPath(),
+                    $"nugetready-process-marker-{Guid.NewGuid():N}");
+                var candidatePointer = Marshal.StringToCoTaskMemUTF8(candidate);
+                var descriptor = open(candidatePointer, OpenCreate | OpenExclusive | OpenReadWrite, 0x180);
+                Marshal.FreeCoTaskMem(candidatePointer);
+                if (descriptor < 0)
+                {
+                    continue;
+                }
+
+                if (fcntl(descriptor, FSetFileDescriptorFlags, 0) != 0)
+                {
+                    _ = close(descriptor);
+                    UnlinkMacPath(candidate);
+                    continue;
+                }
+
+                path = candidate;
+                fileDescriptor = descriptor;
+                return true;
+            }
+        }
+        catch (IOException)
+        {
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
+
+        return false;
+    }
+
+    private static void UnlinkMacPath(string path)
+    {
+        var pathPointer = Marshal.StringToCoTaskMemUTF8(path);
+        try
+        {
+            _ = unlink(pathPointer);
+        }
+        finally
+        {
+            Marshal.FreeCoTaskMem(pathPointer);
+        }
+    }
+
+    private static bool TryGetMacProcessIdentity(int processId, out MacProcessIdentity identity)
+    {
+        identity = default;
+        var buffer = Marshal.AllocHGlobal(MacProcessIdentitySize);
+        try
+        {
+            if (proc_pidinfo(processId, ProcPidUniqIdentifierInfo, 0, buffer, MacProcessIdentitySize) < MacProcessIdentitySize)
+            {
+                return false;
+            }
+
+            identity = new MacProcessIdentity(
+                processId,
+                unchecked((ulong)Marshal.ReadInt64(buffer, 16)),
+                unchecked((ulong)Marshal.ReadInt64(buffer, 24)));
+            return identity.UniqueId != 0;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
+        }
+    }
+
+    private static bool TryGetMacProcessStatus(int processId, out int status)
+    {
+        status = 0;
+        var buffer = Marshal.AllocHGlobal(MacBsdInfoSize);
+        try
+        {
+            if (proc_pidinfo(processId, ProcPidBsdInfo, 0, buffer, MacBsdInfoSize) < MacBsdInfoSize)
+            {
+                return false;
+            }
+
+            status = Marshal.ReadInt32(buffer, 4);
+            return true;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
+        }
+    }
+
+    private static bool TryGetMacProcessMarker(
+        int processId,
+        int fileDescriptor,
+        out MacProcessMarker marker)
+    {
+        marker = default;
+        var buffer = Marshal.AllocHGlobal(MacVnodeFdInfoSize);
+        try
+        {
+            if (proc_pidfdinfo(
+                    processId,
+                    fileDescriptor,
+                    ProcPidFdVnodePathInfo,
+                    buffer,
+                    MacVnodeFdInfoSize) < MacVnodeFdInfoSize)
+            {
+                return false;
+            }
+
+            marker = new MacProcessMarker(
+                unchecked((uint)Marshal.ReadInt32(buffer, MacVnodeStatOffset)),
+                unchecked((ulong)Marshal.ReadInt64(buffer, MacVnodeStatOffset + 8)));
+            return marker.Inode != 0;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
+        }
+    }
+
+    private static bool MacProcessHasMarker(int processId, MacProcessMarker marker)
+    {
+        var size = proc_pidinfo(processId, ProcPidListFds, 0, IntPtr.Zero, 0);
+        if (size <= 0)
         {
             return false;
         }
 
-        return processes.Values.All(process => process.ProcessGroupId != processGroupId || process.IsZombie);
+        var buffer = Marshal.AllocHGlobal(size);
+        try
+        {
+            var result = proc_pidinfo(processId, ProcPidListFds, 0, buffer, size);
+            if (result <= 0)
+            {
+                return false;
+            }
+
+            for (var offset = 0; offset + MacProcFdInfoSize <= result; offset += MacProcFdInfoSize)
+            {
+                var fileDescriptor = Marshal.ReadInt32(buffer, offset);
+                var fileType = unchecked((uint)Marshal.ReadInt32(buffer, offset + sizeof(int)));
+                if (fileType == MacVnodeFileType &&
+                    TryGetMacProcessMarker(processId, fileDescriptor, out var candidate) &&
+                    candidate == marker)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
+        }
     }
 
-    private readonly record struct MacProcessInfo(
-        int ProcessId,
-        int ParentProcessId,
-        int ProcessGroupId,
-        bool IsZombie,
-        string StartTime);
+    private static MacProcessIdentity[]? ReadMacProcessIdentities()
+    {
+        var processIds = ReadMacProcessIds();
+        if (processIds is null)
+        {
+            return null;
+        }
+
+        var identities = new List<MacProcessIdentity>(processIds.Length);
+        foreach (var processId in processIds)
+        {
+            if (processId > 0 && TryGetMacProcessIdentity(processId, out var identity))
+            {
+                identities.Add(identity);
+            }
+        }
+
+        return identities.ToArray();
+    }
+
+    private static int[]? ReadMacProcessIds()
+    {
+        var capacity = 1024;
+        for (var attempt = 0; attempt < 8; attempt++)
+        {
+            var buffer = Marshal.AllocHGlobal(checked(capacity * sizeof(int)));
+            try
+            {
+                var count = proc_listallpids(buffer, checked(capacity * sizeof(int)));
+                if (count < 0)
+                {
+                    return null;
+                }
+
+                if (count < capacity)
+                {
+                    var processIds = new int[count];
+                    for (var index = 0; index < count; index++)
+                    {
+                        processIds[index] = Marshal.ReadInt32(buffer, index * sizeof(int));
+                    }
+
+                    return processIds;
+                }
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buffer);
+            }
+
+            capacity = checked(capacity * 2);
+        }
+
+        return null;
+    }
+
+    private static int[]? ReadMacProcessGroupMembers(int processGroupId)
+    {
+        var capacity = 64;
+        for (var attempt = 0; attempt < 8; attempt++)
+        {
+            var buffer = Marshal.AllocHGlobal(checked(capacity * sizeof(int)));
+            try
+            {
+                var count = proc_listpgrppids(processGroupId, buffer, checked(capacity * sizeof(int)));
+                if (count < 0)
+                {
+                    return null;
+                }
+
+                if (count < capacity)
+                {
+                    var processIds = new int[count];
+                    for (var index = 0; index < count; index++)
+                    {
+                        processIds[index] = Marshal.ReadInt32(buffer, index * sizeof(int));
+                    }
+
+                    return processIds;
+                }
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buffer);
+            }
+
+            capacity = checked(capacity * 2);
+        }
+
+        return null;
+    }
+
+    private readonly record struct MacProcessIdentity(int ProcessId, ulong UniqueId, ulong ParentUniqueId);
+    private readonly record struct MacProcessMarker(uint Device, ulong Inode);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MacKevent
+    {
+        public nuint Ident;
+        public short Filter;
+        public ushort Flags;
+        public uint Fflags;
+        public nint Data;
+        public nint Udata;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MacTimespec
+    {
+        public long Seconds;
+        public long Nanoseconds;
+    }
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int kqueue();
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int kevent(
+        int queue,
+        ref MacKevent change,
+        int changeCount,
+        IntPtr events,
+        int eventCount,
+        IntPtr timeout);
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int kevent(
+        int queue,
+        IntPtr changes,
+        int changeCount,
+        [Out] MacKevent[] events,
+        int eventCount,
+        ref MacTimespec timeout);
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int close(int fileDescriptor);
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int open(IntPtr path, int flags, int mode);
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int unlink(IntPtr path);
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int fcntl(int fileDescriptor, int command, int argument);
+
+    [DllImport("libproc.dylib", SetLastError = true)]
+    private static extern int proc_listallpids(IntPtr buffer, int bufferSize);
+
+    [DllImport("libproc.dylib", SetLastError = true)]
+    private static extern int proc_listpgrppids(int processGroupId, IntPtr buffer, int bufferSize);
+
+    [DllImport("libproc.dylib", SetLastError = true)]
+    private static extern int proc_pidinfo(int processId, int flavor, ulong argument, IntPtr buffer, int bufferSize);
+
+    [DllImport("libproc.dylib", SetLastError = true)]
+    private static extern int proc_pidfdinfo(
+        int processId,
+        int fileDescriptor,
+        int flavor,
+        IntPtr buffer,
+        int bufferSize);
 
     private static int DecodeExitStatus(int status)
     {
@@ -1077,9 +1588,34 @@ internal static class UnixProcessSupervisor
     private const int PrSetChildSubreaper = 36;
     private const int SigKill = 9;
     private const int SigTerm = 15;
+    private const int SigCont = 18;
     private const int WaitNoHang = 1;
     private const int NoChildrenError = 10;
     private const int NoSuchProcessError = 3;
+    private const int InterruptedSystemCallError = 4;
+    private const int MacZombieStatus = 5;
+    private const int EvfiltProc = -5;
+    private const ushort EvAdd = 0x0001;
+    private const ushort EvEnable = 0x0004;
+    private const ushort EvClear = 0x0020;
+    private const ushort EvError = 0x4000;
+    private const uint NoteExit = 0x80000000;
+    private const uint NoteFork = 0x40000000;
+    private const int ProcPidBsdInfo = 3;
+    private const int ProcPidUniqIdentifierInfo = 17;
+    private const int MacBsdInfoSize = 136;
+    private const int MacProcessIdentitySize = 72;
+    private const int OpenReadWrite = 0x2;
+    private const int OpenCreate = 0x200;
+    private const int OpenExclusive = 0x800;
+    private const int FSetFileDescriptorFlags = 2;
+    private const int ProcPidListFds = 1;
+    private const int ProcPidFdVnodePathInfo = 2;
+    private const int MacProcFdInfoSize = 8;
+    private const int MacVnodeFileType = 1;
+    private const int MacVnodeFdInfoSize = 1200;
+    private const int MacVnodeStatOffset = 24;
+    private const uint NoteProcessIdMask = 0x000fffff;
 
     [DllImport("libc", SetLastError = true)]
     private static extern int prctl(int option, int arg2, int arg3, int arg4, int arg5);
