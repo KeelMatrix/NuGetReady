@@ -149,7 +149,9 @@ public sealed class BoundedProcessTests
             return;
         }
 
-        var (fileName, arguments, pidFile) = CreateMacDetachedProcess(parentExitCode, parentWaitsForTimeout);
+        var (fileName, arguments, pidFile) = CreateMacDetachedProcess(
+            parentExitCode,
+            parentWaitsForTimeout || cancel);
         using var cancellation = new CancellationTokenSource();
         ProcessResult? result = null;
         try
