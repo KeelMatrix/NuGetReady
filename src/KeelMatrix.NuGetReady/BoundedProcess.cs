@@ -642,9 +642,7 @@ internal static class UnixProcessSupervisor
             }
 
             spawnAttributesInitialized = true;
-            var spawnFlags = (short)(PosixSpawnSetProcessGroup |
-                (OperatingSystem.IsMacOS() ? PosixSpawnStartSuspended : 0));
-            if (posix_spawnattr_setflags(spawnAttributes, spawnFlags) != 0 ||
+            if (posix_spawnattr_setflags(spawnAttributes, PosixSpawnSetProcessGroup) != 0 ||
                 posix_spawnattr_setpgroup(spawnAttributes, 0) != 0)
             {
                 return 125;
@@ -664,10 +662,10 @@ internal static class UnixProcessSupervisor
 
             if (OperatingSystem.IsMacOS())
             {
-                // Keep the root suspended until its kernel fork watch and inherited
-                // marker are armed; a detached child cannot outrun containment setup.
+                // The marker was created before spawn, so every forked descendant
+                // inherits its kernel-tracked identity before it can detach.
                 macProcessTree = MacProcessTreeTracker.TryCreate(child, macMarkerPath);
-                if (macProcessTree is null || kill(child, SigCont) != 0)
+                if (macProcessTree is null)
                 {
                     _ = kill(-child, SigKill);
                     return 125;
@@ -748,7 +746,6 @@ internal static class UnixProcessSupervisor
     private static extern int setsid();
 
     private const short PosixSpawnSetProcessGroup = 0x2;
-    private const short PosixSpawnStartSuspended = 0x80;
     private const int PosixSpawnAttributeStorageSize = 512;
 
     [DllImport("libc", SetLastError = true)]
@@ -1474,7 +1471,6 @@ internal static class UnixProcessSupervisor
     private const int PrSetChildSubreaper = 36;
     private const int SigKill = 9;
     private const int SigTerm = 15;
-    private const int SigCont = 18;
     private const int WaitNoHang = 1;
     private const int NoChildrenError = 10;
     private const int NoSuchProcessError = 3;
