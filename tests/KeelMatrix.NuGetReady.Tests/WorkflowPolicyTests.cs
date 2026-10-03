@@ -1299,6 +1299,71 @@ public sealed class WorkflowPolicyTests
         }
     }
 
+    [Theory]
+    [InlineData("release", "ci.yml", "permissions: {}")]
+    [InlineData("release", "ci.yml", "permissions:\n  contents: read")]
+    [InlineData("continuous integration", "release.yml", "permissions: {}")]
+    [InlineData("continuous integration", "release.yml", "permissions:\n  contents: read")]
+    public void Public_cli_blocks_unresolved_read_only_publication_syntax_when_workflow_name_or_filename_is_release_shaped(
+        string workflowName,
+        string workflowFileName,
+        string permissions)
+    {
+        using var corpus = PackageFixture.Create();
+        var package = corpus.AddPackage("Fixture.Standard.1.0.0.nupkg", "Fixture.Standard", "1.0.0");
+        var config = new NuGetReadyConfig
+        {
+            SchemaVersion = 1,
+            Packages =
+            [
+                new PackageExpectation
+                {
+                    Id = "Fixture.Standard",
+                    Kind = "library",
+                    Version = "1.0.0",
+                    Artifacts = [Path.GetFileName(package)]
+                }
+            ]
+        };
+        using var repository = WorkflowRepository.Create(workflowFileName, "name: placeholder");
+        repository.WriteWorkflow(workflowFileName, $$"""
+            name: {{workflowName}}
+            on:
+              pull_request:
+            {{permissions}}
+            jobs:
+              build:
+                steps:
+                  - run: echo "$(dotnet nuget push artifacts/package.nupkg)"
+            """);
+        repository.WriteFile("nugetready.json", System.Text.Json.JsonSerializer.Serialize(config));
+
+        var configPath = Path.Combine(repository.Root.FullName, "nugetready.json");
+        var originalOutput = Console.Out;
+        using var output = new StringWriter();
+        Console.SetOut(output);
+        int exitCode;
+        try
+        {
+            exitCode = Program.Main(
+                ["check", "--config", configPath, "--artifacts", corpus.ArtifactsPath, "--format", "json", "--timeout", "1s"]);
+        }
+        finally
+        {
+            Console.SetOut(originalOutput);
+        }
+
+        using var report = System.Text.Json.JsonDocument.Parse(output.ToString());
+        var workflowPolicy = report.RootElement.GetProperty("checks")
+            .EnumerateArray()
+            .Single(check => check.GetProperty("id").GetString() == "workflow-policy");
+        Assert.Equal("error", workflowPolicy.GetProperty("status").GetString());
+        Assert.Equal(2, exitCode);
+        Assert.Contains(
+            report.RootElement.GetProperty("failures").EnumerateArray(),
+            failure => failure.GetProperty("message").GetString()!.Contains("unproven", StringComparison.OrdinalIgnoreCase));
+    }
+
     [Fact]
     public void Indirect_script_depth_limit_is_limited_unproven()
     {

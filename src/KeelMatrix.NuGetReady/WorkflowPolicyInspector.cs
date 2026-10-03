@@ -264,7 +264,6 @@ internal static class WorkflowPolicyInspector
 
         var hasReleaseControl = workflow.HasPublicationShapedTrigger ||
                                 workflow.HasPublicationInput;
-        var hasReleaseWorkflowName = HasReleasePublicationSignal(workflow.Name);
         foreach (var job in activeJobs)
         {
             var hasIndirectPublication = false;
@@ -274,7 +273,6 @@ internal static class WorkflowPolicyInspector
                 var unresolvedExecutable = HasUnresolvedExecutableRun(step.Run);
                 hasIndirectPublication |= indirectPath == IndirectPublicationPath.Publication ||
                     !hasReleaseControl &&
-                    !hasReleaseWorkflowName &&
                     indirectPath == IndirectPublicationPath.Unknown &&
                     unresolvedExecutable;
             }
