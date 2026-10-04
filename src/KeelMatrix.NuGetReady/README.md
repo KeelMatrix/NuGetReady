@@ -48,6 +48,6 @@ Consumer rehearsal is not a sandbox. Package code, build assets, and tool smoke 
 
 ## Privacy
 
-NuGetReady uses `KeelMatrix.Telemetry` for shared activation and at-most-weekly heartbeat signals after a trustworthy completed rehearsal. It does not send package IDs, dependency names, repository identity, package contents, source paths, workflow content, failure logs, or configuration content. Set `KEELMATRIX_NO_TELEMETRY=1` to opt out.
+NuGetReady requests shared activation and heartbeat signals only after a trustworthy completed rehearsal. Its call adds no rehearsal-specific event fields and supplies no package IDs, dependency names, raw repository URLs, package contents, source paths, workflow content, failure logs, or configuration content. Customer CI may count when process and repository opt-outs are unset. `KeelMatrix.Telemetry` owns opt-out resolution, identity, heartbeat cadence, and delivery; see [PRIVACY.md](https://github.com/KeelMatrix/NuGetReady/blob/main/PRIVACY.md) for the product boundary and the [shared privacy policy](https://github.com/KeelMatrix/Telemetry/blob/main/PRIVACY.md) for the shared contract.
 
 For configuration, check contracts, and troubleshooting, see the [repository README](https://github.com/KeelMatrix/NuGetReady/blob/main/README.md). See [PRIVACY.md](https://github.com/KeelMatrix/NuGetReady/blob/main/PRIVACY.md) for the data boundary and [SECURITY.md](https://github.com/KeelMatrix/NuGetReady/blob/main/SECURITY.md) for security reporting and the execution boundary.

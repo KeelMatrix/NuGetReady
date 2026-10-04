@@ -130,7 +130,7 @@ The version-1 report contract uses the check IDs in this order: `artifact-set`, 
 
 ## Privacy and telemetry
 
-NuGetReady uses `KeelMatrix.Telemetry` 0.1.1 for shared activation and at-most-weekly heartbeat signals after a trustworthy completed rehearsal. NuGetReady passes no package IDs, dependency names, repository identity, package contents, source paths, workflow content, failure logs, or configuration content to the shared client. Set `KEELMATRIX_NO_TELEMETRY=1` to opt out for the current process; the shared package's other documented opt-out controls are also honored. This repository disables telemetry for development and CI. See [PRIVACY.md](PRIVACY.md) for the product-specific boundary and the shared package's [privacy policy](https://github.com/KeelMatrix/Telemetry/blob/main/PRIVACY.md) for the shared contract.
+NuGetReady requests shared activation and heartbeat signals only after a trustworthy completed rehearsal. Its call adds no rehearsal-specific event fields and supplies no package IDs, dependency names, raw repository URLs, package contents, source paths, workflow content, failure logs, or configuration content. KeelMatrix development and CI set `KEELMATRIX_NO_TELEMETRY=1`; customer CI may count when process and repository opt-outs are unset. The shared client owns opt-out resolution, identity, cadence, delivery, and failure handling. See [PRIVACY.md](PRIVACY.md) for the product-specific boundary and the shared package's [privacy policy](https://github.com/KeelMatrix/Telemetry/blob/main/PRIVACY.md) for its contract.
 
 ## Troubleshooting
 

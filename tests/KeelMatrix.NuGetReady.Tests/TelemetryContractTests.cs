@@ -1,93 +1,39 @@
-using KeelMatrix.Telemetry;
-
 namespace KeelMatrix.NuGetReady.Tests;
 
 public sealed class TelemetryContractTests
 {
-    [Fact]
-    public void Telemetry_is_requested_only_after_a_trustworthy_completed_rehearsal()
+    [Theory]
+    [InlineData("pass", 0, 1)]
+    [InlineData("pass", 1, 0)]
+    [InlineData("pass", 2, 0)]
+    [InlineData("warn", 0, 1)]
+    [InlineData("warn", 1, 0)]
+    [InlineData("warn", 2, 0)]
+    [InlineData("fail", 0, 0)]
+    [InlineData("fail", 1, 1)]
+    [InlineData("fail", 2, 0)]
+    [InlineData("error", 0, 0)]
+    [InlineData("error", 1, 0)]
+    [InlineData("error", 2, 0)]
+    [InlineData("unknown", 0, 0)]
+    [InlineData("unknown", 1, 0)]
+    [InlineData("unknown", 2, 0)]
+    public void Telemetry_is_requested_only_after_a_trustworthy_completed_rehearsal(
+        string status,
+        int exitCode,
+        int expectedCompletedRehearsals)
     {
         var telemetry = new RecordingTelemetry();
 
-        TelemetryCoordinator.RecordIfTrustworthy(Report("pass", 0), telemetry);
-        TelemetryCoordinator.RecordIfTrustworthy(Report("fail", 1), telemetry);
-        TelemetryCoordinator.RecordIfTrustworthy(Report("error", 2), telemetry);
+        TelemetryCoordinator.RecordIfTrustworthy(Report(status, exitCode), telemetry);
 
-        Assert.Equal(2, telemetry.CompletedRehearsals);
+        Assert.Equal(expectedCompletedRehearsals, telemetry.CompletedRehearsals);
     }
 
     [Fact]
-    public void NuGetReady_does_not_pass_product_context_to_the_shared_client()
+    public void Usage_telemetry_seam_does_not_accept_rehearsal_context()
     {
         Assert.Empty(typeof(IUsageTelemetry).GetMethod(nameof(IUsageTelemetry.RecordCompletedRehearsal))!.GetParameters());
-        Assert.All(typeof(IKeelMatrixTelemetryClient).GetMethods(), method => Assert.Empty(method.GetParameters()));
-    }
-
-    [Fact]
-    public void Process_opt_out_suppresses_client_creation_and_emission()
-    {
-        using var environment = new EnvironmentScope(("KEELMATRIX_NO_TELEMETRY", "1"), ("DOTNET_CLI_TELEMETRY_OPTOUT", null), ("DO_NOT_TRACK", null));
-        var created = 0;
-        var reporter = new NuGetReadyTelemetry(() =>
-        {
-            created++;
-            return new RecordingClient();
-        });
-
-        reporter.RecordCompletedRehearsal();
-
-        Assert.Equal(0, created);
-    }
-
-    [Fact]
-    public void KeelMatrix_ci_uses_the_repository_opt_out_to_suppress_emission()
-    {
-        using var environment = new EnvironmentScope(("CI", "true"), ("KEELMATRIX_NO_TELEMETRY", "1"), ("DOTNET_CLI_TELEMETRY_OPTOUT", null), ("DO_NOT_TRACK", null));
-        var created = 0;
-        var reporter = new NuGetReadyTelemetry(() =>
-        {
-            created++;
-            return new RecordingClient();
-        });
-
-        reporter.RecordCompletedRehearsal();
-
-        Assert.Equal(0, created);
-    }
-
-    [Fact]
-    public void Telemetry_failure_cannot_change_the_completed_result()
-    {
-        var report = Report("fail", 1);
-        var telemetry = new ThrowingTelemetry();
-
-        var exception = Record.Exception(() => TelemetryCoordinator.RecordIfTrustworthy(report, telemetry));
-
-        Assert.Null(exception);
-        Assert.Equal(1, report.ExitCode);
-        Assert.Equal("fail", report.Status);
-    }
-
-    [Fact]
-    public void Established_client_receives_activation_and_heartbeat_requests()
-    {
-        using var environment = new EnvironmentScope(("KEELMATRIX_NO_TELEMETRY", null), ("DOTNET_CLI_TELEMETRY_OPTOUT", null), ("DO_NOT_TRACK", null), ("CI", null));
-        var client = new RecordingClient();
-        var reporter = new NuGetReadyTelemetry(() => client);
-
-        reporter.RecordCompletedRehearsal();
-
-        Assert.Equal(1, client.ActivationRequests);
-        Assert.Equal(1, client.HeartbeatRequests);
-    }
-
-    [Fact]
-    public void Shared_client_contract_exposes_only_parameterless_tracking_requests()
-    {
-        var methods = typeof(Client).GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
-
-        Assert.Contains(methods, method => method.Name == nameof(Client.TrackActivation) && method.GetParameters().Length == 0);
-        Assert.Contains(methods, method => method.Name == nameof(Client.TrackHeartbeat) && method.GetParameters().Length == 0);
     }
 
     private static ReadinessReport Report(string status, int exitCode, string? message = null)
@@ -108,43 +54,5 @@ public sealed class TelemetryContractTests
         internal int CompletedRehearsals { get; private set; }
 
         public void RecordCompletedRehearsal() => CompletedRehearsals++;
-    }
-
-    private sealed class ThrowingTelemetry : IUsageTelemetry
-    {
-        public void RecordCompletedRehearsal() => throw new InvalidOperationException("synthetic telemetry outage");
-    }
-
-    private sealed class RecordingClient : IKeelMatrixTelemetryClient
-    {
-        internal int ActivationRequests { get; private set; }
-
-        internal int HeartbeatRequests { get; private set; }
-
-        public void TrackActivation() => ActivationRequests++;
-
-        public void TrackHeartbeat() => HeartbeatRequests++;
-    }
-
-    private sealed class EnvironmentScope : IDisposable
-    {
-        private readonly Dictionary<string, string?> previous = new(StringComparer.Ordinal);
-
-        internal EnvironmentScope(params (string Name, string? Value)[] values)
-        {
-            foreach (var (name, value) in values)
-            {
-                previous[name] = Environment.GetEnvironmentVariable(name);
-                Environment.SetEnvironmentVariable(name, value);
-            }
-        }
-
-        public void Dispose()
-        {
-            foreach (var pair in previous)
-            {
-                Environment.SetEnvironmentVariable(pair.Key, pair.Value);
-            }
-        }
     }
 }

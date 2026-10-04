@@ -4,11 +4,11 @@ NuGetReady performs archive inspection and a local consumer rehearsal. It may co
 
 ## Telemetry
 
-NuGetReady depends on `KeelMatrix.Telemetry` `[0.1.1]` and requests shared activation and heartbeat events only after a complete rehearsal returns a trustworthy pass, warning, or readiness failure. Installation, assembly loading, process start, malformed input, and infrastructure failures do not activate telemetry. The shared client is fire-and-forget, best-effort, and emits at most one heartbeat per consuming project per ISO week.
+NuGetReady depends on `KeelMatrix.Telemetry` `[0.1.1]` and requests shared activation and heartbeat events only after a complete rehearsal returns a trustworthy pass, warning, or readiness failure. Installation, assembly loading, process start, malformed input, and infrastructure failures do not activate telemetry.
 
-`KeelMatrix.Telemetry` 0.1.1 is the canonical source for the event fields, opt-out precedence, endpoint, local storage, and retention. Its shared envelope contains the event type, tool name, tool version, telemetry version, schema version, a stable pseudonymous consuming-codebase hash, and a stable pseudonymous installation hash. Activation adds runtime, operating-system, CI, and UTC timestamp fields; a heartbeat adds its ISO week. These pseudonymous identifiers are not described here as anonymous or unlinkable.
+`KeelMatrix.Telemetry` 0.1.1 is the canonical source for the event fields, opt-out resolution, identity derivation, local state, delivery, heartbeat cadence, and retention. Its shared privacy policy documents the fields and identifiers it may emit; see the [shared README](https://github.com/KeelMatrix/Telemetry#readme) and [shared privacy policy](https://github.com/KeelMatrix/Telemetry/blob/main/PRIVACY.md).
 
-NuGetReady passes no package IDs, dependency names, repository URLs or raw repository identity, owners, specific file names, package contents, workflow text, source paths, failure logs, configuration content, or other rehearsal data to the shared client. It does not add product-specific telemetry fields. The shared dependency may derive its pseudonymous identifiers from its documented inputs and may write its own local queue and marker state; see the [shared README](https://github.com/KeelMatrix/Telemetry#readme) and [shared privacy policy](https://github.com/KeelMatrix/Telemetry/blob/main/PRIVACY.md) for those implementation details.
+NuGetReady calls the shared API with the fixed tool name `nugetready` and the `Program` entry assembly. It adds no rehearsal-specific event fields and supplies no package IDs, dependency names, raw repository URLs, owner names, specific file names, package contents, workflow text, source paths, failure logs, or configuration content. The shared client owns its documented pseudonymous project and installation identifiers; see the shared policy for their derivation and handling.
 
 Consumers can opt out for the current process using the established environment mechanism:
 
@@ -16,4 +16,4 @@ Consumers can opt out for the current process using the established environment 
 $env:KEELMATRIX_NO_TELEMETRY="1"
 ```
 
-`KeelMatrix.Telemetry` also honors `DOTNET_CLI_TELEMETRY_OPTOUT=1`, `DO_NOT_TRACK=1`, and its documented repository-local opt-out files. This repository sets the opt-out for development tests, fixture runs, package smoke, and CI so synthetic validation is not treated as product demand. Telemetry failures never change the report, exit code, offline behavior, or bounded rehearsal behavior.
+The shared client owns other process and repository-local opt-outs and telemetry failure handling. This repository sets `KEELMATRIX_NO_TELEMETRY=1` for development tests, fixture runs, package smoke, and CI so synthetic validation is not treated as product demand. Customer CI may count when process and repository opt-outs are unset.
