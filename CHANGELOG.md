@@ -4,41 +4,11 @@ This changelog records user-visible changes to KeelMatrix.NuGetReady.
 
 ## [Unreleased]
 
-The 0.1.0 release is planned and unreleased.
+## [0.1.0] - 2026-10-05
 
 ### Added
 
-- Provides deterministic exact-artifact and package-archive readiness checks for NuGet libraries and .NET tools.
-- Rehearses isolated library restore/build against a public API for every declared target framework and .NET tool installation/smoke execution on Windows, Linux, and macOS using the just-built artifacts, a temporary local feed, controlled sources, and a fresh package cache. Tool smoke runs from a private content-bound launch image; a launch-image mutation or unproven process lifecycle is an infrastructure error.
-- Supports versioned repository configuration, text and JSON reports, stable exit codes, narrow release-workflow policy checks, and explicit `not-run`/`not-applicable` states when a check cannot be evaluated.
-- Validates portable PDB identity and checksum correspondence, package-sensitive paths, file-based licenses, bounded process cleanup, deterministic diagnostics, and repository-owned release-workflow telemetry suppression checks.
-- Rejects manifest-defined sensitive-name families when protected names are extended or used as directory segments, while the separate package-content contract rejects undeclared binary and XML entries even when their names are legitimate assemblies.
-- Requires exactly one primary archive per package expectation, rejects duplicate package identities, and keeps optional symbol association unambiguous.
-- Verifies library package-cache and installed-tool-store identity/provenance and compares the full expanded payload, including XML documentation; unsupported tool layouts are reported as unproven rather than passing.
-- Requires the package-specific provenance sidecar and blocks unsupported reusable/composite publication paths as unproven rather than treating them as release proof.
-- Defines a closed-world release-workflow profile that binds one exact version tag to the configured package version, versioned artifact filenames, inspected nuspec identity, immutable validation artifact, and exact primary package selected for publication.
-- Limits workflow-policy evaluation to nodes with publication capability or operations and to dependency or artifact paths that can influence publication; static tag filters and unknown actions in unrelated read-only CI without a recognized credential binding remain outside release policy, while unresolved executable steps enter the boundary and block as unsupported/unproven and a reachable publishing workflow still requires the exact configured-version tag.
-- Blocks unknown or unclassified YAML, expression, action, shell, command, MSBuild, credential, permission, dependency, or artifact semantics inside the reachable publication boundary as unsupported/unproven; malformed/incomplete expression framing blocks across the bounded GitHub-evaluated workflow, reusable-workflow, job, service/container, step, and composite-action grammar, while non-evaluated literal data remains outside that classification and deterministic violations of the understood profile remain readiness failures.
-- Proves effective permission and per-active-step environment overrides with case-sensitive Ubuntu runtime environment identity; treats root `secrets` context references, reusable-workflow secret bindings, bounded credential names after removing every non-alphanumeric character and case-folding, and matching static `vars`, `inputs`, or `env` members as credential-bearing without substring matching or classifying literal `secrets` prose or paths. Credential-name heuristics remain separate from runtime binding proof; unresolvable member selectors, malformed workflow input, and duplicate/invalid YAML structures block as input errors, while exact PowerShell command templates preserve quoting, argument bytes, empty arguments, and operators and reject unmodeled forms. The release path verifies root configuration identity, authentication order, temporary credential scope, and exact artifact continuity while blocking unmodeled execution mechanisms.
-- Establishes Unix process groups before target execution and confirms bounded descendant cleanup after successful completion, timeout, or cancellation; Windows retains job-object cleanup.
-- Applies an explicit consumer-framework and SDK/tooling matrix, reporting unsupported or unavailable rehearsal infrastructure as error/exit 2 and identifying build-only validation as non-execution evidence.
-- Bounds archive inspection to a fixed entry count and expanded-size budget, verifies package provenance with bounded streaming operations, and reports unproven process cleanup as error/exit 2.
-- Bounds artifact-tree discovery before archive work, rejects reparse-point and containment escapes, and requires a non-overlapping candidate source mapping for the release validator.
-- Revalidates the entire bounded artifact tree and archive hashes after enumeration, failing closed on post-scan additions, replacements, deletions, limit bypasses, or parent reparse-point rebinding.
-- Rejects duplicate, aliased, rooted, traversal, case-colliding, and Unicode-normalization-colliding archive entry paths before package metadata or layout inspection.
-- Accepts customer-owned Trusted Publishing usernames in the supported workflow profile, with an optional explicit expected username for repositories that require one.
-- Snapshots counted package archives before inspection, uses one immutable snapshot for archive, dependency, feed, consumer, and provenance checks, and verifies the source files remain unchanged after the rehearsal.
-- Rejects tool smoke arguments outside `dotnetTool` expectations or containing embedded NUL characters, isolates generated consumers from ambient `Directory.Build.*` imports, escapes control characters in human-readable diagnostics, and inspects the exact release-built package bytes before release upload.
-- Defines public cancellation as `error`/exit `2`, with JSON `exitCode: 2`, downstream checks `not-run`, and telemetry ineligible.
-- Keeps generated `bin`/`obj` pack sources usable while applying the sensitive filename/family policy to their source identities and to every pack destination, including linked, renamed, and wildcard-selected inputs.
-- Inspects workflow, configuration, local script, and composite-action paths through a pinned repository identity snapshot and descriptor-relative handles; missing pinned nodes, reparse points, and root, ancestor, or leaf rebinding fail closed without reading outside content.
-
-### Fixed
-
-- Pins the accepted artifact root and traversed ancestors for handle-relative enumeration, attribute inspection, archive opens, hashing, snapshot copies, and final verification, failing closed before outside-root bytes are read during rebinds.
-- Keeps tool-command validation bound to a direct non-reparse installed child and launches a private content-bound snapshot of the complete installed tool directory on every supported host, closing apphost and dependency replacement windows through pre-launch content verification; Windows additionally holds launch entries with replacement-blocking sharing through process creation.
-- Binds the private tool launch image to the complete payload captured with the provenance verification result, so pre-existing apphost, dependency, configuration, and runtime-file replacement or recreation cannot become the executed payload.
-- Rehearses declared public library types and type-forwarded exports with preserved one- and multi-generic arity, including namespace-qualified and escaped identifiers.
-- Validates exact, wildcard, mixed, and overlapping SourceLink mappings against every package-owned document and keeps symbol coverage bound to intended package assemblies rather than unrelated dependency symbols.
-- Aligns CI validation with the platform contract: Windows, Linux, and macOS each require successful installed-tool smoke rehearsal and exit code `0` for the positive controls.
-- Treats deletion of any pinned workflow-policy node after repository snapshot as an unsafe input instead of allowing the workflow check to become `not-applicable`.
+- Validates explicitly declared NuGet package and symbol archives for package identity, version, metadata, dependencies, target-framework groups, symbols, and unexpected or sensitive content.
+- Rehearses library consumption and .NET tool installation from the exact built artifacts with controlled package sources and isolated caches, including supported consumer restore, build, and configured smoke execution.
+- Evaluates a documented, narrow release-workflow profile for tag, version, artifact, and publishing identity; unsupported workflow behavior is reported as unproven rather than passed.
+- Produces deterministic text or versioned JSON reports with stable exit codes and bounded diagnostics.

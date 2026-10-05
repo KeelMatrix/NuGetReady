@@ -13,7 +13,7 @@
     <Copyright>KeelMatrix</Copyright>
     <Description>Rehearse a NuGet release from the exact built artifacts and prove clean isolated consumer installation before publishing.</Description>
     <PackageTags>nuget;packaging;release;ci;dotnet-tool;source-link;oidc;trusted-publishing</PackageTags>
-    <PackageReleaseNotes>Initial release of exact artifact and package archive readiness checks.</PackageReleaseNotes>
+    <PackageReleaseNotes>Initial release of exact artifact validation and isolated consumer rehearsal.</PackageReleaseNotes>
     <RepositoryUrl>https://github.com/KeelMatrix/NuGetReady</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <PackageProjectUrl>https://github.com/KeelMatrix/NuGetReady#readme</PackageProjectUrl>
