@@ -75,7 +75,7 @@ function Test-SensitivePackagePath {
 
         $values = @(Get-FamilyValues ([string]$familyRule.source) | ForEach-Object { ([string]$_).ToLowerInvariant() })
         foreach ($segment in $directorySegments) {
-            if (@($packageSensitivePathPolicy.familyExceptions) | Where-Object { $segment -eq ([string]$_).ToLowerInvariant() }) { continue }
+
             $exemptExtensions = @()
             if ($null -ne $familyRule.PSObject.Properties["exemptExtensions"]) {
                 $exemptExtensions = @($familyRule.exemptExtensions) | ForEach-Object { ([string]$_).ToLowerInvariant() }
@@ -106,6 +106,7 @@ function Test-SensitivePackagePath {
         }
     }
 
+    if (@($packageSensitivePathPolicy.familyExceptions) | Where-Object { $name -eq ([string]$_).ToLowerInvariant() }) { return $false }
     $nameWithoutLeadingDots = $name.TrimStart('.')
     if (@($packageSensitivePathPolicy.exactFileNames) | Where-Object {
             $exact = ([string]$_).ToLowerInvariant()

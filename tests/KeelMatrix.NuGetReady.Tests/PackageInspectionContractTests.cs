@@ -306,6 +306,9 @@ public sealed class PackageInspectionContractTests
     [InlineData("xAGENTS.md.bak")]
     [InlineData(".apikeyx")]
     [InlineData("xcredentials.json.bak")]
+    [InlineData("NuGet.Configuration.dll.bak")]
+    [InlineData("NuGet.Configuration.dllx")]
+    [InlineData("NuGet.Configuration.dll/child.bin")]
     public async Task Pack_fails_closed_for_extended_sensitive_name_families_and_writes_no_archives(string sensitiveFile)
     {
         var project = FindRepositoryFile("src", "KeelMatrix.NuGetReady", "KeelMatrix.NuGetReady.csproj");
@@ -313,8 +316,21 @@ public sealed class PackageInspectionContractTests
         var sensitivePath = Path.Combine(projectDirectory, sensitiveFile);
         var originalProject = File.ReadAllText(project);
         var output = Directory.CreateTempSubdirectory("nugetready-pack-family-guard-");
+        var sensitiveDirectory = Path.GetDirectoryName(sensitivePath)!;
+        var createdSensitiveDirectory = false;
         try
         {
+            if (File.Exists(sensitivePath))
+            {
+                throw new InvalidOperationException($"Sensitive pack test input already exists: {sensitiveFile}");
+            }
+
+            if (!Directory.Exists(sensitiveDirectory))
+            {
+                Directory.CreateDirectory(sensitiveDirectory);
+                createdSensitiveDirectory = true;
+            }
+
             File.WriteAllText(sensitivePath, "local-only");
             var packItem = $"  <ItemGroup><None Include=\"{sensitiveFile}\" Pack=\"true\" PackagePath=\"{sensitiveFile}\" /></ItemGroup>\n";
             File.WriteAllText(project, originalProject.Replace("</Project>", packItem + "</Project>", StringComparison.Ordinal));
@@ -351,6 +367,10 @@ public sealed class PackageInspectionContractTests
             }
 
             File.WriteAllText(project, originalProject);
+            if (createdSensitiveDirectory && Directory.Exists(sensitiveDirectory))
+            {
+                Directory.Delete(sensitiveDirectory);
+            }
 
             output.Delete(recursive: true);
         }

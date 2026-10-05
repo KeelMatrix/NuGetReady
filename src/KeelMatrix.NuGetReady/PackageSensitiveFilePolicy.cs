@@ -80,11 +80,6 @@ internal static class PackageSensitiveFilePolicy
             var values = GetFamilyValues(rule.Source);
             foreach (var segment in directorySegments)
             {
-                if (Manifest.FamilyExceptions.Contains(segment, StringComparer.OrdinalIgnoreCase))
-                {
-                    continue;
-                }
-
                 if (rule.ExemptExtensions.Any(extension => segment.EndsWith(extension, StringComparison.OrdinalIgnoreCase)))
                 {
                     continue;
@@ -111,6 +106,11 @@ internal static class PackageSensitiveFilePolicy
         }
 
         var name = lower[(lower.LastIndexOf('/') + 1)..];
+        if (Manifest.FamilyExceptions.Contains(name, StringComparer.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
         if (IsAssemblyDocumentationRole(normalized, name, siblingPaths))
         {
             return false;

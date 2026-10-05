@@ -169,6 +169,24 @@ public sealed class SensitivePathPolicyTests
     }
 
     [Fact]
+    public void Family_exceptions_apply_to_exact_file_names_but_not_directory_segments()
+    {
+        Assert.False(PackageSensitiveFilePolicy.IsSensitive("NuGet.Configuration.dll"));
+        Assert.False(PackageSensitiveFilePolicy.IsSensitive("tools/net8.0/any/NuGet.Configuration.dll"));
+
+        var rejected = new[]
+        {
+            "NuGet.Configuration.dll.bak",
+            "NuGet.Configuration.dllx",
+            "NuGet.Configuration.dll/child.bin",
+            "deep/NuGet.Configuration.dll/child.bin",
+            "deep/NUGET.CONFIGURATION.DLL/child.bin"
+        };
+
+        Assert.All(rejected, path => Assert.True(PackageSensitiveFilePolicy.IsSensitive(path), $"Family exception escaped its file entry: {path}"));
+    }
+
+    [Fact]
     public void Tool_policy_rejects_every_canonical_pack_guard_shape_at_root_and_nested_depth()
     {
         var manifest = PackageSensitiveFilePolicy.ReadManifestForTests();

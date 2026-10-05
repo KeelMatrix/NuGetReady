@@ -71,7 +71,12 @@ internal static class SensitivePathCorpus
                 "zero-byte/local-telemetry.json",
                 "local-telemetry.json.bak",
                 "local-telemetry.jsonx",
-                "local-telemetry.json/child.bin"
+                "local-telemetry.json/child.bin",
+                "NuGet.Configuration.dll.bak",
+                "NuGet.Configuration.dllx",
+                "NuGet.Configuration.dll/child.bin",
+                "nested/NuGet.Configuration.dll/child.bin",
+                "deep/nested/NUGET.CONFIGURATION.DLL/child.bin"
             });
 
         return corpus.ToHashSet(StringComparer.Ordinal);
