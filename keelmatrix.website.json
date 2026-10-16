@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "packages": {
+    "KeelMatrix.NuGetReady": {
+      "visibility": "public-product",
+      "role": "primary"
+    }
+  }
+}

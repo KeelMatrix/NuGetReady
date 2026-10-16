@@ -4,6 +4,10 @@ This changelog records user-visible changes to KeelMatrix.NuGetReady.
 
 ## [Unreleased]
 
+### Added
+
+- Add machine-readable website package classification and release-contract validation.
+
 ## [0.1.0] - 2026-10-05
 
 ### Added

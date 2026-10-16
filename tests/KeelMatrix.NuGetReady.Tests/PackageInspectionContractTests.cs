@@ -141,6 +141,45 @@ public sealed class PackageInspectionContractTests
     }
 
     [Theory]
+    [InlineData("tags", "nuget;keelmatrix-internal-package;keelmatrix-primary")]
+    [InlineData("tags", "nuget dotnet-tool keelmatrix-internal-package keelmatrix-primary")]
+    [InlineData("tags", "nuget;KeelMatrix-public-product;keelmatrix-primary")]
+    [InlineData("description", "A different package description.")]
+    [InlineData("projectUrl", "https://github.com/KeelMatrix/NuGetReady#readme")]
+    [InlineData("repositoryUrl", "https://github.com/KeelMatrix/Other")]
+    [InlineData("readme", "Other.md")]
+    [InlineData("packageType", "Library")]
+    public async Task Package_inspection_rejects_website_metadata_drift(string field, string value)
+    {
+        using var fixture = PackageFixture.Create();
+        var package = CreateArchive(
+            Path.Combine(fixture.ArtifactsPath, "KeelMatrix.NuGetReady.0.1.0.nupkg"),
+            symbols: false,
+            extraEntry: null,
+            tagsOverride: field == "tags" ? value : null,
+            descriptionOverride: field == "description" ? value : null,
+            projectUrlOverride: field == "projectUrl" ? value : null,
+            repositoryUrlOverride: field == "repositoryUrl" ? value : null,
+            readmeOverride: field == "readme" ? value : null,
+            packageTypeOverride: field == "packageType" ? value : null);
+        var symbols = CreateArchive(
+            Path.Combine(fixture.ArtifactsPath, "KeelMatrix.NuGetReady.0.1.0.snupkg"),
+            symbols: true,
+            extraEntry: null);
+        var script = FindRepositoryFile("scripts", "inspect-package.ps1");
+
+        var result = await BoundedProcess.RunAsync(
+            "pwsh",
+            ["-NoProfile", "-File", script, "-PackagePath", package, "-SymbolsPackagePath", symbols],
+            fixture.Root.FullName,
+            new Dictionary<string, string?> { ["DOTNET_CLI_TELEMETRY_OPTOUT"] = "1" },
+            TimeSpan.FromSeconds(30));
+
+        Assert.True(result.Started, result.StandardError);
+        Assert.NotEqual(0, result.ExitCode);
+    }
+
+    [Theory]
     [InlineData(false, "tools/net8.0/any/Unexpected.dll")]
     [InlineData(false, "tools/net8.0/any/Unexpected.xml")]
     [InlineData(true, "tools/net8.0/any/Unexpected.dll")]
@@ -376,16 +415,43 @@ public sealed class PackageInspectionContractTests
         }
     }
 
-    private static string CreateArchive(string path, bool symbols, string? extraEntry)
+    private static string CreateArchive(
+        string path,
+        bool symbols,
+        string? extraEntry,
+        string? tagsOverride = null,
+        string? descriptionOverride = null,
+        string? projectUrlOverride = null,
+        string? repositoryUrlOverride = null,
+        string? readmeOverride = null,
+        string? packageTypeOverride = null)
     {
-        return CreateArchive(path, symbols, extraEntry is null ? Array.Empty<string>() : new[] { extraEntry });
+        return CreateArchive(
+            path,
+            symbols,
+            extraEntry is null ? Array.Empty<string>() : new[] { extraEntry },
+            tagsOverride,
+            descriptionOverride,
+            projectUrlOverride,
+            repositoryUrlOverride,
+            readmeOverride,
+            packageTypeOverride);
     }
 
-    private static string CreateArchive(string path, bool symbols, IEnumerable<string> extraEntries)
+    private static string CreateArchive(
+        string path,
+        bool symbols,
+        IEnumerable<string> extraEntries,
+        string? tagsOverride = null,
+        string? descriptionOverride = null,
+        string? projectUrlOverride = null,
+        string? repositoryUrlOverride = null,
+        string? readmeOverride = null,
+        string? packageTypeOverride = null)
     {
         using var stream = File.Create(path);
         using var archive = new ZipArchive(stream, ZipArchiveMode.Create);
-        AddText(archive, "KeelMatrix.NuGetReady.nuspec", Nuspec(symbols));
+        AddText(archive, "KeelMatrix.NuGetReady.nuspec", Nuspec(symbols, tagsOverride, descriptionOverride, projectUrlOverride, repositoryUrlOverride, readmeOverride, packageTypeOverride));
         if (!symbols)
         {
             AddText(archive, "README.md", "readme");
@@ -408,12 +474,29 @@ public sealed class PackageInspectionContractTests
         return path;
     }
 
-    private static string Nuspec(bool symbols)
+    private static string Nuspec(
+        bool symbols,
+        string? tagsOverride = null,
+        string? descriptionOverride = null,
+        string? projectUrlOverride = null,
+        string? repositoryUrlOverride = null,
+        string? readmeOverride = null,
+        string? packageTypeOverride = null)
     {
-        var packageType = symbols ? "<packageTypes><packageType name=\"SymbolsPackage\" /></packageTypes>" : "<packageTypes><packageType name=\"DotnetTool\" /></packageTypes>";
+        var packageType = symbols
+            ? "<packageTypes><packageType name=\"SymbolsPackage\" /></packageTypes>"
+            : $"<packageTypes><packageType name=\"{packageTypeOverride ?? "DotnetTool"}\" /></packageTypes>";
         var metadata = symbols
             ? string.Empty
-            : "<readme>README.md</readme><icon>icon.png</icon>";
+            : $"""
+                <authors>KeelMatrix</authors>
+                <description>{descriptionOverride ?? "Rehearse a NuGet release from the exact built artifacts and prove clean isolated consumer installation before publishing."}</description>
+                <tags>{tagsOverride ?? "nuget packaging release ci dotnet-tool source-link oidc trusted-publishing keelmatrix-public-product keelmatrix-primary"}</tags>
+                <projectUrl>{projectUrlOverride ?? "https://github.com/KeelMatrix/NuGetReady"}</projectUrl>
+                <repository type="git" url="{repositoryUrlOverride ?? "https://github.com/KeelMatrix/NuGetReady"}" />
+                <readme>{readmeOverride ?? "README.md"}</readme>
+                <icon>icon.png</icon>
+                """;
         return $"""
             <?xml version="1.0" encoding="utf-8"?>
             <package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">

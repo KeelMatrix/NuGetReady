@@ -272,6 +272,7 @@ if ($Mode -eq "Tag") {
 }
 
 $shippingProjects = @()
+$seenPackageIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 foreach ($projectPath in Get-ChildItem -LiteralPath (Join-Path $root "src") -Filter "*.csproj" -File -Recurse) {
     try {
         $project = [xml](Read-RequiredFile $projectPath.FullName)
@@ -282,11 +283,174 @@ foreach ($projectPath in Get-ChildItem -LiteralPath (Join-Path $root "src") -Fil
 
     $packageId = Get-PropertyValue -Document $project -Name "PackageId"
     $isPackable = Get-PropertyValue -Document $project -Name "IsPackable"
-    if ($packageId -eq "KeelMatrix.NuGetReady" -or $isPackable -eq "true") {
-        $shippingProjects += [pscustomobject]@{
-            Path = $projectPath.FullName
-            Document = $project
-            PackageId = $packageId
+    if (-not [string]::IsNullOrWhiteSpace($isPackable) -and
+        -not $isPackable.Equals("true", [StringComparison]::OrdinalIgnoreCase) -and
+        -not $isPackable.Equals("false", [StringComparison]::OrdinalIgnoreCase)) {
+        Fail-Contract "Project IsPackable must be true or false: $($projectPath.FullName)."
+    }
+    if (-not [string]::IsNullOrWhiteSpace($isPackable) -and $isPackable.Equals("false", [StringComparison]::OrdinalIgnoreCase)) {
+        continue
+    }
+
+    if ([string]::IsNullOrWhiteSpace($packageId)) {
+        Fail-Contract "Every packable project under src must declare PackageId: $($projectPath.FullName)."
+    }
+    if (-not $seenPackageIds.Add($packageId)) {
+        Fail-Contract "Packable projects under src must not share package ID '$packageId'."
+    }
+
+    $shippingProjects += [pscustomobject]@{
+        Path = $projectPath.FullName
+        Document = $project
+        PackageId = $packageId
+    }
+}
+
+$websiteManifestPath = Join-Path $root "keelmatrix.website.json"
+$websiteManifest = $null
+try {
+    $websiteManifest = (Read-RequiredFile $websiteManifestPath) | ConvertFrom-Json -ErrorAction Stop
+}
+catch {
+    Fail-Contract "keelmatrix.website.json is not valid JSON."
+}
+
+if ($null -eq $websiteManifest -or $websiteManifest -isnot [System.Management.Automation.PSCustomObject]) {
+    Fail-Contract "keelmatrix.website.json must contain a JSON object."
+}
+$manifestFields = @($websiteManifest.PSObject.Properties | ForEach-Object { $_.Name })
+if ($manifestFields.Count -ne 2 -or $manifestFields -cnotcontains "schemaVersion" -or $manifestFields -cnotcontains "packages") {
+    Fail-Contract "keelmatrix.website.json must contain only schemaVersion and packages."
+}
+if (($websiteManifest.schemaVersion -isnot [int]) -and ($websiteManifest.schemaVersion -isnot [long])) {
+    Fail-Contract "keelmatrix.website.json schemaVersion must be the integer 1."
+}
+if ($websiteManifest.schemaVersion -ne 1) {
+    Fail-Contract "keelmatrix.website.json supports only schemaVersion 1."
+}
+if ($websiteManifest.packages -isnot [System.Management.Automation.PSCustomObject]) {
+    Fail-Contract "keelmatrix.website.json packages must be an object keyed by package ID."
+}
+
+$manifestPackageProperties = @($websiteManifest.packages.PSObject.Properties)
+$sourcePackageIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+foreach ($project in $shippingProjects) {
+    [void]$sourcePackageIds.Add($project.PackageId)
+}
+$manifestPackageIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+$primaryCount = 0
+foreach ($manifestPackageProperty in $manifestPackageProperties) {
+    $packageId = $manifestPackageProperty.Name
+    if (-not $manifestPackageIds.Add($packageId)) {
+        Fail-Contract "keelmatrix.website.json contains duplicate package ID '$packageId'."
+    }
+    if (-not $sourcePackageIds.Contains($packageId)) {
+        Fail-Contract "keelmatrix.website.json package '$packageId' does not match a packable project under src."
+    }
+
+    $classification = $manifestPackageProperty.Value
+    if ($classification -isnot [System.Management.Automation.PSCustomObject]) {
+        Fail-Contract "keelmatrix.website.json classification for '$packageId' must be an object."
+    }
+    $classificationFields = @($classification.PSObject.Properties | ForEach-Object { $_.Name })
+    if ($classificationFields.Count -ne 2 -or $classificationFields -cnotcontains "visibility" -or $classificationFields -cnotcontains "role") {
+        Fail-Contract "keelmatrix.website.json classification for '$packageId' must contain only visibility and role."
+    }
+    if ($classification.visibility -cnotin @("public-product", "internal-package")) {
+        Fail-Contract "keelmatrix.website.json visibility for '$packageId' must be public-product or internal-package."
+    }
+    if ($classification.role -cnotin @("primary", "component")) {
+        Fail-Contract "keelmatrix.website.json role for '$packageId' must be primary or component."
+    }
+    if ($classification.role -ceq "primary") {
+        $primaryCount++
+    }
+}
+
+if ($manifestPackageIds.Count -ne $sourcePackageIds.Count) {
+    Fail-Contract "keelmatrix.website.json package set must exactly match packable projects under src."
+}
+foreach ($packageId in $sourcePackageIds) {
+    if (-not $manifestPackageIds.Contains($packageId)) {
+        Fail-Contract "Packable package '$packageId' is missing from keelmatrix.website.json."
+    }
+}
+if ($primaryCount -ne 1) {
+    Fail-Contract "keelmatrix.website.json must declare exactly one primary package; found $primaryCount."
+}
+
+$canonicalRepositoryUrl = "https://github.com/KeelMatrix/NuGetReady"
+$canonicalPackageDescription = "Rehearse a NuGet release from the exact built artifacts and prove clean isolated consumer installation before publishing."
+foreach ($project in $shippingProjects) {
+    $classificationProperty = @($manifestPackageProperties | Where-Object { $_.Name -ceq $project.PackageId })
+    if ($classificationProperty.Count -ne 1) {
+        Fail-Contract "Packable package '$($project.PackageId)' must have exactly one manifest classification."
+    }
+    $classification = $classificationProperty[0].Value
+    $tagsValue = Get-PropertyValue -Document $project.Document -Name "PackageTags"
+    if ([string]::IsNullOrWhiteSpace($tagsValue)) {
+        Fail-Contract "Package '$($project.PackageId)' must declare PackageTags with website sentinels."
+    }
+    $tagValues = @($tagsValue.Split(';') | ForEach-Object { $_.Trim() })
+    $visibilityTags = @($tagValues | Where-Object { $_ -ieq "keelmatrix-public-product" -or $_ -ieq "keelmatrix-internal-package" })
+    $roleTags = @($tagValues | Where-Object { $_ -ieq "keelmatrix-primary" -or $_ -ieq "keelmatrix-component" })
+    if ($visibilityTags.Count -ne 1 -or $roleTags.Count -ne 1) {
+        Fail-Contract "Package '$($project.PackageId)' must have exactly one website visibility sentinel and one role sentinel."
+    }
+
+    $expectedVisibilityTag = if ($classification.visibility -ceq "public-product") { "keelmatrix-public-product" } else { "keelmatrix-internal-package" }
+    $expectedRoleTag = if ($classification.role -ceq "primary") { "keelmatrix-primary" } else { "keelmatrix-component" }
+    if (-not [String]::Equals($visibilityTags[0], $expectedVisibilityTag, [StringComparison]::Ordinal) -or
+        -not [String]::Equals($roleTags[0], $expectedRoleTag, [StringComparison]::Ordinal)) {
+        Fail-Contract "Package '$($project.PackageId)' website sentinel tags do not agree with keelmatrix.website.json."
+    }
+
+    $authors = Get-PropertyValue -Document $project.Document -Name "Authors"
+    if (-not [String]::Equals($authors, "KeelMatrix", [StringComparison]::Ordinal)) {
+        Fail-Contract "Package '$($project.PackageId)' Authors must be KeelMatrix."
+    }
+    $description = Get-PropertyValue -Document $project.Document -Name "Description"
+    if ([string]::IsNullOrWhiteSpace($description)) {
+        Fail-Contract "Package '$($project.PackageId)' must declare a truthful non-empty Description."
+    }
+    if ($project.PackageId -ceq "KeelMatrix.NuGetReady" -and
+        -not [String]::Equals($description, $canonicalPackageDescription, [StringComparison]::Ordinal)) {
+        Fail-Contract "KeelMatrix.NuGetReady Description must match the approved product description."
+    }
+
+    $repositoryUrl = Get-PropertyValue -Document $project.Document -Name "RepositoryUrl"
+    $projectUrl = Get-PropertyValue -Document $project.Document -Name "PackageProjectUrl"
+    if (-not [String]::Equals($repositoryUrl, $canonicalRepositoryUrl, [StringComparison]::Ordinal) -or
+        -not [String]::Equals($projectUrl, $canonicalRepositoryUrl, [StringComparison]::Ordinal)) {
+        Fail-Contract "Package '$($project.PackageId)' RepositoryUrl and PackageProjectUrl must be $canonicalRepositoryUrl without fragments."
+    }
+    if (-not [String]::Equals((Get-PropertyValue -Document $project.Document -Name "RepositoryType"), "git", [StringComparison]::Ordinal) -or
+        -not [String]::Equals((Get-PropertyValue -Document $project.Document -Name "PublishRepositoryUrl"), "true", [StringComparison]::OrdinalIgnoreCase)) {
+        Fail-Contract "Package '$($project.PackageId)' must declare git repository metadata and PublishRepositoryUrl=true."
+    }
+
+    $readmeFile = Get-PropertyValue -Document $project.Document -Name "PackageReadmeFile"
+    if ([string]::IsNullOrWhiteSpace($readmeFile) -or [System.IO.Path]::GetFileName($readmeFile) -cne $readmeFile) {
+        Fail-Contract "Package '$($project.PackageId)' PackageReadmeFile must name a root-level README file."
+    }
+    $projectDirectory = Split-Path -Parent $project.Path
+    if (-not (Test-Path -LiteralPath (Join-Path $projectDirectory $readmeFile) -PathType Leaf)) {
+        Fail-Contract "Package '$($project.PackageId)' PackageReadmeFile does not exist beside its project."
+    }
+    $readmePackItems = @($project.Document.SelectNodes("//*[local-name()='None']") | Where-Object {
+        [String]::Equals($_.GetAttribute("Include"), $readmeFile, [StringComparison]::Ordinal) -and
+        [String]::Equals($_.GetAttribute("Pack"), "true", [StringComparison]::OrdinalIgnoreCase) -and
+        [String]::Equals($_.GetAttribute("PackagePath"), $readmeFile, [StringComparison]::Ordinal)
+    })
+    if ($readmePackItems.Count -ne 1) {
+        Fail-Contract "Package '$($project.PackageId)' README must be packed at the package root and match PackageReadmeFile."
+    }
+
+    if ($project.PackageId -ceq "KeelMatrix.NuGetReady") {
+        if (-not [String]::Equals((Get-PropertyValue -Document $project.Document -Name "PackageType"), "DotnetTool", [StringComparison]::Ordinal) -or
+            -not [String]::Equals((Get-PropertyValue -Document $project.Document -Name "PackAsTool"), "true", [StringComparison]::OrdinalIgnoreCase) -or
+            -not [String]::Equals((Get-PropertyValue -Document $project.Document -Name "ToolCommandName"), "nugetready", [StringComparison]::Ordinal)) {
+            Fail-Contract "KeelMatrix.NuGetReady must be packaged as the nugetready .NET tool."
         }
     }
 }

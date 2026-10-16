@@ -16,6 +16,224 @@ public sealed class ReleaseContractTests
     }
 
     [Fact]
+    public void Website_manifest_and_source_tags_must_agree()
+    {
+        using var repository = SyntheticReleaseRepository.Create();
+        var manifestPath = Path.Combine(repository.Root.FullName, "keelmatrix.website.json");
+        File.WriteAllText(manifestPath, File.ReadAllText(manifestPath).Replace("public-product", "internal-package", StringComparison.Ordinal));
+
+        var result = repository.Validate(mode: "PreRelease", tagVersion: null);
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("sentinel tags do not agree", FlattenOutput(result.StandardError), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Website_manifest_must_match_the_complete_packable_source_package_set()
+    {
+        using var repository = SyntheticReleaseRepository.Create();
+        var extraProjectDirectory = Directory.CreateDirectory(Path.Combine(repository.Root.FullName, "src", "NuGetReady.Component"));
+        File.WriteAllText(Path.Combine(extraProjectDirectory.FullName, "NuGetReady.Component.csproj"), """
+            <Project Sdk="Microsoft.NET.Sdk">
+              <PropertyGroup>
+                <PackageId>KeelMatrix.NuGetReady.Component</PackageId>
+              </PropertyGroup>
+            </Project>
+            """);
+
+        var result = repository.Validate(mode: "PreRelease", tagVersion: null);
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("package set must exactly match", FlattenOutput(result.StandardError), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Explicitly_non_packable_source_projects_do_not_enter_the_manifest_package_set()
+    {
+        using var repository = SyntheticReleaseRepository.Create();
+        var projectDirectory = Directory.CreateDirectory(Path.Combine(repository.Root.FullName, "src", "NuGetReady.Internal"));
+        File.WriteAllText(Path.Combine(projectDirectory.FullName, "NuGetReady.Internal.csproj"), """
+            <Project Sdk="Microsoft.NET.Sdk">
+              <PropertyGroup>
+                <IsPackable>false</IsPackable>
+                <PackageId>KeelMatrix.NuGetReady.Internal</PackageId>
+              </PropertyGroup>
+            </Project>
+            """);
+
+        var result = repository.Validate(mode: "PreRelease", tagVersion: null);
+
+        Assert.Equal(0, result.ExitCode);
+    }
+
+    [Fact]
+    public void Website_manifest_must_have_exactly_one_primary_package()
+    {
+        using var repository = SyntheticReleaseRepository.Create();
+        var manifestPath = Path.Combine(repository.Root.FullName, "keelmatrix.website.json");
+        File.WriteAllText(manifestPath, File.ReadAllText(manifestPath).Replace("primary", "component", StringComparison.Ordinal));
+        ReplaceProjectProperty(repository, "PackageTags", "nuget;keelmatrix-public-product;keelmatrix-component");
+
+        var result = repository.Validate(mode: "PreRelease", tagVersion: null);
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("exactly one primary", FlattenOutput(result.StandardError), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Website_manifest_must_reject_duplicate_primary_packages()
+    {
+        using var repository = SyntheticReleaseRepository.Create();
+        var extraProjectDirectory = Directory.CreateDirectory(Path.Combine(repository.Root.FullName, "src", "NuGetReady.Component"));
+        File.WriteAllText(Path.Combine(extraProjectDirectory.FullName, "NuGetReady.Component.csproj"), """
+            <Project Sdk="Microsoft.NET.Sdk">
+              <PropertyGroup>
+                <IsPackable>true</IsPackable>
+                <PackageId>KeelMatrix.NuGetReady.Component</PackageId>
+                <PackageTags>nuget;keelmatrix-public-product;keelmatrix-primary</PackageTags>
+              </PropertyGroup>
+            </Project>
+            """);
+        File.WriteAllText(Path.Combine(repository.Root.FullName, "keelmatrix.website.json"), """
+            {
+              "schemaVersion": 1,
+              "packages": {
+                "KeelMatrix.NuGetReady": { "visibility": "public-product", "role": "primary" },
+                "KeelMatrix.NuGetReady.Component": { "visibility": "public-product", "role": "primary" }
+              }
+            }
+            """);
+
+        var result = repository.Validate(mode: "PreRelease", tagVersion: null);
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("exactly one primary package; found 2", FlattenOutput(result.StandardError), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Website_manifest_must_not_name_a_nonexistent_package()
+    {
+        using var repository = SyntheticReleaseRepository.Create();
+        File.WriteAllText(Path.Combine(repository.Root.FullName, "keelmatrix.website.json"), """
+            {
+              "schemaVersion": 1,
+              "packages": {
+                "KeelMatrix.NuGetReady": { "visibility": "public-product", "role": "primary" },
+                "KeelMatrix.NuGetReady.Missing": { "visibility": "public-product", "role": "component" }
+              }
+            }
+            """);
+
+        var result = repository.Validate(mode: "PreRelease", tagVersion: null);
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("does not match a packable project", FlattenOutput(result.StandardError), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("{\"schemaVersion\":1,\"packages\":{", "not valid JSON")]
+    [InlineData("[]", "must contain a JSON object")]
+    [InlineData("{\"schemaVersion\":1,\"packages\":{\"KeelMatrix.NuGetReady\":{\"visibility\":\"public-product\",\"role\":\"primary\"}},\"description\":\"copy\"}", "must contain only schemaVersion and packages")]
+    [InlineData("{\"schemaVersion\":2,\"packages\":{\"KeelMatrix.NuGetReady\":{\"visibility\":\"public-product\",\"role\":\"primary\"}}}", "supports only schemaVersion 1")]
+    [InlineData("{\"schemaVersion\":\"1\",\"packages\":{\"KeelMatrix.NuGetReady\":{\"visibility\":\"public-product\",\"role\":\"primary\"}}}", "schemaVersion must be the integer 1")]
+    [InlineData("{\"schemaVersion\":1,\"packages\":{\"KeelMatrix.NuGetReady\":{\"visibility\":\"public-product\",\"role\":\"primary\",\"description\":\"copy\"}}}", "contain only visibility and role")]
+    [InlineData("{\"schemaVersion\":1,\"packages\":{\"KeelMatrix.NuGetReady\":{\"visibility\":\"Public-Product\",\"role\":\"primary\"}}}", "visibility for 'KeelMatrix.NuGetReady'")]
+    [InlineData("{\"schemaVersion\":1,\"packages\":{\"KeelMatrix.NuGetReady\":{\"visibility\":\"public-product\",\"role\":\"Primary\"}}}", "role for 'KeelMatrix.NuGetReady'")]
+    public void Invalid_website_manifest_schemas_are_rejected(string manifest, string expectedMessage)
+    {
+        using var repository = SyntheticReleaseRepository.Create();
+        File.WriteAllText(Path.Combine(repository.Root.FullName, "keelmatrix.website.json"), manifest);
+
+        var result = repository.Validate(mode: "PreRelease", tagVersion: null);
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains(expectedMessage, FlattenOutput(result.StandardError), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("PackageTags", "nuget;keelmatrix-primary", "exactly one website visibility sentinel")]
+    [InlineData("PackageTags", "nuget;keelmatrix-public-product;keelmatrix-internal-package;keelmatrix-primary", "exactly one website visibility sentinel")]
+    [InlineData("PackageTags", "nuget;keelmatrix-public-product;keelmatrix-component", "do not agree")]
+    [InlineData("PackageTags", "nuget;KeelMatrix-public-product;keelmatrix-primary", "do not agree")]
+    [InlineData("PackageTags", "nuget;keelmatrix-public-product;KeelMatrix-primary", "do not agree")]
+    public void Invalid_website_sentinel_tag_sets_are_rejected(string propertyName, string value, string expectedMessage)
+    {
+        using var repository = SyntheticReleaseRepository.Create();
+        ReplaceProjectProperty(repository, propertyName, value);
+
+        var result = repository.Validate(mode: "PreRelease", tagVersion: null);
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains(expectedMessage, FlattenOutput(result.StandardError), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("PackageProjectUrl", "https://github.com/KeelMatrix/NuGetReady#readme", "RepositoryUrl and PackageProjectUrl")]
+    [InlineData("RepositoryUrl", "https://github.com/KeelMatrix/Other", "RepositoryUrl and PackageProjectUrl")]
+    [InlineData("Description", "A different package description.", "approved product description")]
+    [InlineData("PackageType", "Library", ".NET tool")]
+    [InlineData("PackageReadmeFile", "missing.md", "does not exist")]
+    public void Inaccurate_shipping_package_metadata_is_rejected(string propertyName, string value, string expectedMessage)
+    {
+        using var repository = SyntheticReleaseRepository.Create();
+        ReplaceProjectProperty(repository, propertyName, value);
+
+        var result = repository.Validate(mode: "PreRelease", tagVersion: null);
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains(expectedMessage, FlattenOutput(result.StandardError), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Package_readme_must_be_packed_at_the_package_root()
+    {
+        using var repository = SyntheticReleaseRepository.Create();
+        var projectPath = Path.Combine(repository.Root.FullName, "src", "KeelMatrix.NuGetReady", "KeelMatrix.NuGetReady.csproj");
+        File.WriteAllText(projectPath, File.ReadAllText(projectPath).Replace(
+            "    <None Include=\"README.md\" Pack=\"true\" PackagePath=\"README.md\" />",
+            string.Empty,
+            StringComparison.Ordinal));
+
+        var result = repository.Validate(mode: "PreRelease", tagVersion: null);
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("README must be packed at the package root", FlattenOutput(result.StandardError), StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string FlattenOutput(string value)
+    {
+        var result = new StringBuilder();
+        foreach (var line in value.Replace("\r", string.Empty, StringComparison.Ordinal).Split('\n', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var normalizedLine = line.Trim().TrimStart('|').Trim();
+            if (result.Length > 0)
+            {
+                result.Append(' ');
+            }
+
+            result.Append(normalizedLine);
+        }
+
+        return result.ToString();
+    }
+
+    private static void ReplaceProjectProperty(SyntheticReleaseRepository repository, string propertyName, string value)
+    {
+        var projectPath = Path.Combine(repository.Root.FullName, "src", "KeelMatrix.NuGetReady", "KeelMatrix.NuGetReady.csproj");
+        var project = File.ReadAllText(projectPath);
+        var openTag = $"<{propertyName}>";
+        var closeTag = $"</{propertyName}>";
+        var start = project.IndexOf(openTag, StringComparison.Ordinal);
+        var end = project.IndexOf(closeTag, start, StringComparison.Ordinal);
+        if (start < 0 || end < 0)
+        {
+            throw new Xunit.Sdk.XunitException($"Synthetic project does not declare {propertyName}.");
+        }
+
+        File.WriteAllText(projectPath, project[..(start + openTag.Length)] + value + project[end..]);
+    }
+
+    [Fact]
     public void A_changelog_with_only_an_unreleased_section_is_rejected_in_tag_mode()
     {
         using var repository = SyntheticReleaseRepository.Create("""
@@ -417,15 +635,40 @@ public sealed class ReleaseContractTests
                   }]
                 }
                 """, Encoding.UTF8);
+            File.WriteAllText(Path.Combine(root.FullName, "keelmatrix.website.json"), """
+                {
+                  "schemaVersion": 1,
+                  "packages": {
+                    "KeelMatrix.NuGetReady": {
+                      "visibility": "public-product",
+                      "role": "primary"
+                    }
+                  }
+                }
+                """, Encoding.UTF8);
 
             File.WriteAllText(Path.Combine(projectDirectory.FullName, "KeelMatrix.NuGetReady.csproj"), """
                 <Project Sdk="Microsoft.NET.Sdk">
                   <PropertyGroup>
                     <IsPackable>true</IsPackable>
+                    <PackAsTool>true</PackAsTool>
+                    <ToolCommandName>nugetready</ToolCommandName>
                     <PackageId>KeelMatrix.NuGetReady</PackageId>
+                    <PackageType>DotnetTool</PackageType>
+                    <Authors>KeelMatrix</Authors>
+                    <Description>Rehearse a NuGet release from the exact built artifacts and prove clean isolated consumer installation before publishing.</Description>
+                    <PackageTags>nuget;keelmatrix-public-product;keelmatrix-primary</PackageTags>
+                    <PackageProjectUrl>https://github.com/KeelMatrix/NuGetReady</PackageProjectUrl>
+                    <RepositoryUrl>https://github.com/KeelMatrix/NuGetReady</RepositoryUrl>
+                    <RepositoryType>git</RepositoryType>
+                    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+                    <PackageReadmeFile>README.md</PackageReadmeFile>
                     <PackageReleaseNotes>Initial release.</PackageReleaseNotes>
                   </PropertyGroup>
-                  <ItemGroup><PackageReference Include="KeelMatrix.Telemetry" /></ItemGroup>
+                  <ItemGroup>
+                    <PackageReference Include="KeelMatrix.Telemetry" />
+                    <None Include="README.md" Pack="true" PackagePath="README.md" />
+                  </ItemGroup>
                 </Project>
                 """, Encoding.UTF8);
 
