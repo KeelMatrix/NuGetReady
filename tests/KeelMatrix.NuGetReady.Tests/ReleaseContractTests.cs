@@ -25,7 +25,7 @@ public sealed class ReleaseContractTests
         var result = repository.Validate(mode: "PreRelease", tagVersion: null);
 
         Assert.NotEqual(0, result.ExitCode);
-        Assert.Contains("sentinel tags do not agree", FlattenOutput(result.StandardError), StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("sentinel tags do not agree", FlattenOutput(result), StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -44,7 +44,7 @@ public sealed class ReleaseContractTests
         var result = repository.Validate(mode: "PreRelease", tagVersion: null);
 
         Assert.NotEqual(0, result.ExitCode);
-        Assert.Contains("package set must exactly match", FlattenOutput(result.StandardError), StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("package set must exactly match", FlattenOutput(result), StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -77,7 +77,7 @@ public sealed class ReleaseContractTests
         var result = repository.Validate(mode: "PreRelease", tagVersion: null);
 
         Assert.NotEqual(0, result.ExitCode);
-        Assert.Contains("exactly one primary", FlattenOutput(result.StandardError), StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("exactly one primary", FlattenOutput(result), StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -107,7 +107,7 @@ public sealed class ReleaseContractTests
         var result = repository.Validate(mode: "PreRelease", tagVersion: null);
 
         Assert.NotEqual(0, result.ExitCode);
-        Assert.Contains("exactly one primary package; found 2", FlattenOutput(result.StandardError), StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("exactly one primary package; found 2", FlattenOutput(result), StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -127,7 +127,7 @@ public sealed class ReleaseContractTests
         var result = repository.Validate(mode: "PreRelease", tagVersion: null);
 
         Assert.NotEqual(0, result.ExitCode);
-        Assert.Contains("does not match a packable project", FlattenOutput(result.StandardError), StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("does not match a packable project", FlattenOutput(result), StringComparison.OrdinalIgnoreCase);
     }
 
     [Theory]
@@ -147,7 +147,7 @@ public sealed class ReleaseContractTests
         var result = repository.Validate(mode: "PreRelease", tagVersion: null);
 
         Assert.NotEqual(0, result.ExitCode);
-        Assert.Contains(expectedMessage, FlattenOutput(result.StandardError), StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(expectedMessage, FlattenOutput(result), StringComparison.OrdinalIgnoreCase);
     }
 
     [Theory]
@@ -164,7 +164,7 @@ public sealed class ReleaseContractTests
         var result = repository.Validate(mode: "PreRelease", tagVersion: null);
 
         Assert.NotEqual(0, result.ExitCode);
-        Assert.Contains(expectedMessage, FlattenOutput(result.StandardError), StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(expectedMessage, FlattenOutput(result), StringComparison.OrdinalIgnoreCase);
     }
 
     [Theory]
@@ -181,7 +181,7 @@ public sealed class ReleaseContractTests
         var result = repository.Validate(mode: "PreRelease", tagVersion: null);
 
         Assert.NotEqual(0, result.ExitCode);
-        Assert.Contains(expectedMessage, FlattenOutput(result.StandardError), StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(expectedMessage, FlattenOutput(result), StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -197,24 +197,25 @@ public sealed class ReleaseContractTests
         var result = repository.Validate(mode: "PreRelease", tagVersion: null);
 
         Assert.NotEqual(0, result.ExitCode);
-        Assert.Contains("README must be packed at the package root", FlattenOutput(result.StandardError), StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("README must be packed at the package root", FlattenOutput(result), StringComparison.OrdinalIgnoreCase);
     }
 
-    private static string FlattenOutput(string value)
+    private static string FlattenOutput(ProcessResult result)
     {
-        var result = new StringBuilder();
-        foreach (var line in value.Replace("\r", string.Empty, StringComparison.Ordinal).Split('\n', StringSplitOptions.RemoveEmptyEntries))
+        var flattened = new StringBuilder();
+        var output = result.StandardOutput + Environment.NewLine + result.StandardError;
+        foreach (var line in output.Replace("\r", string.Empty, StringComparison.Ordinal).Split('\n', StringSplitOptions.RemoveEmptyEntries))
         {
             var normalizedLine = line.Trim().TrimStart('|').Trim();
-            if (result.Length > 0)
+            if (flattened.Length > 0)
             {
-                result.Append(' ');
+                flattened.Append(' ');
             }
 
-            result.Append(normalizedLine);
+            flattened.Append(normalizedLine);
         }
 
-        return result.ToString();
+        return flattened.ToString();
     }
 
     private static void ReplaceProjectProperty(SyntheticReleaseRepository repository, string propertyName, string value)
