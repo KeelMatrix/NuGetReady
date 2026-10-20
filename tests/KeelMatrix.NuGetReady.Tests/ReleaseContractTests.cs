@@ -518,6 +518,8 @@ public sealed class ReleaseContractTests
         Assert.True(
             result.ExitCode == 0,
             $"Release contract validation failed.{Environment.NewLine}{result.StandardOutput}{Environment.NewLine}{result.StandardError}");
+        Assert.DoesNotContain("Nested PowerShell launch guard self-test passed", result.StandardOutput, StringComparison.Ordinal);
+        Assert.DoesNotContain("Nested PowerShell and .NET process launch guard passed", result.StandardOutput, StringComparison.Ordinal);
     }
 
     private static ProcessResult RunValidator(string script, string root, string mode, string expectedVersion, string? tagVersion)

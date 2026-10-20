@@ -1,6 +1,8 @@
 function Invoke-NestedPwsh {
     [CmdletBinding()]
     param(
+        [switch]$SuppressOutput,
+
         [Parameter(Mandatory = $true, Position = 0, ValueFromRemainingArguments = $true)]
         [object[]]$ArgumentList
     )
@@ -50,8 +52,10 @@ function Invoke-NestedPwsh {
         $standardError = $process.StandardError.ReadToEndAsync()
         $process.WaitForExit()
         $global:LASTEXITCODE = $process.ExitCode
-        [Console]::Out.Write($standardOutput.GetAwaiter().GetResult())
-        [Console]::Error.Write($standardError.GetAwaiter().GetResult())
+        if (-not $SuppressOutput) {
+            [Console]::Out.Write($standardOutput.GetAwaiter().GetResult())
+            [Console]::Error.Write($standardError.GetAwaiter().GetResult())
+        }
     }
     finally {
         $process.Dispose()
