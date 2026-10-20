@@ -33,6 +33,8 @@ function Invoke-NestedPwsh {
     $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
     $startInfo.FileName = $pwshExecutable
     $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
     $startInfo.CreateNoWindow = $true
     if ([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
             [System.Runtime.InteropServices.OSPlatform]::Windows)) {
@@ -44,8 +46,12 @@ function Invoke-NestedPwsh {
 
     $process = [System.Diagnostics.Process]::Start($startInfo)
     try {
+        $standardOutput = $process.StandardOutput.ReadToEndAsync()
+        $standardError = $process.StandardError.ReadToEndAsync()
         $process.WaitForExit()
         $global:LASTEXITCODE = $process.ExitCode
+        [Console]::Out.Write($standardOutput.GetAwaiter().GetResult())
+        [Console]::Error.Write($standardError.GetAwaiter().GetResult())
     }
     finally {
         $process.Dispose()
