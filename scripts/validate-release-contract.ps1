@@ -15,9 +15,9 @@ $ErrorActionPreference = "Stop"
 $repositoryRootPath = (Resolve-Path $RepositoryRoot).Path
 . (Join-Path $PSScriptRoot '../build/Invoke-NestedPwsh.ps1')
 $launchGuard = Join-Path $repositoryRootPath 'build/Test-NestedPwshLaunch.ps1'
-& $launchGuard -SelfTest
+Invoke-NestedPwsh -ArgumentList @('-NoProfile', '-NonInteractive', '-File', $launchGuard, '-SelfTest')
 if ($LASTEXITCODE -ne 0) { throw 'Nested PowerShell launch guard self-test failed.' }
-& $launchGuard
+Invoke-NestedPwsh -ArgumentList @('-NoProfile', '-NonInteractive', '-File', $launchGuard)
 if ($LASTEXITCODE -ne 0) { throw 'Nested PowerShell launch guard failed.' }
 
 function Fail-Contract {
