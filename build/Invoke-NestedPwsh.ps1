@@ -30,6 +30,24 @@ function Invoke-NestedPwsh {
 
     $pwshExecutable = 'pwsh'
     $nativeArguments = $pwshArguments.ToArray()
-    & $pwshExecutable @nativeArguments
-    $global:LASTEXITCODE = $LASTEXITCODE
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $pwshExecutable
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    if ([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
+            [System.Runtime.InteropServices.OSPlatform]::Windows)) {
+        $startInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+    }
+    foreach ($argument in $nativeArguments) {
+        [void]$startInfo.ArgumentList.Add([string]$argument)
+    }
+
+    $process = [System.Diagnostics.Process]::Start($startInfo)
+    try {
+        $process.WaitForExit()
+        $global:LASTEXITCODE = $process.ExitCode
+    }
+    finally {
+        $process.Dispose()
+    }
 }

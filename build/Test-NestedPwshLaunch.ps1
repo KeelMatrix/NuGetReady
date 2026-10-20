@@ -217,6 +217,8 @@ if ($SelfTest) {
         $csharpDirectPath = Join-Path $selfTestRoot 'direct.cs'
         $embeddedDotNetPath = Join-Path $selfTestRoot 'embedded-dotnet.cs'
         $embeddedDotNetSafePath = Join-Path $selfTestRoot 'embedded-dotnet-safe.cs'
+        $successfulProcessPath = Join-Path $selfTestRoot 'successful-process.ps1'
+        $failingProcessPath = Join-Path $selfTestRoot 'failing-process.ps1'
         [IO.File]::WriteAllText($directPath, '& pwsh -NoProfile')
         [IO.File]::WriteAllText($processPath, "Start-Process 'example.exe'")
         [IO.File]::WriteAllText($embeddedPath, @'
@@ -254,6 +256,8 @@ Process.Start(startInfo);
         [IO.File]::WriteAllText($csharpDirectPath, 'Process.Start("example.exe");')
         [IO.File]::WriteAllText($embeddedDotNetPath, 'var script = "$psi = [System.Diagnostics.ProcessStartInfo]::new(); $psi.UseShellExecute = $false; [System.Diagnostics.Process]::Start($psi);";')
         [IO.File]::WriteAllText($embeddedDotNetSafePath, 'var script = "$psi = [System.Diagnostics.ProcessStartInfo]::new(); $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true; [System.Diagnostics.Process]::Start($psi);";')
+        [IO.File]::WriteAllText($successfulProcessPath, 'exit 0')
+        [IO.File]::WriteAllText($failingProcessPath, 'exit 23')
         if (@(Get-LaunchViolations $directPath).Count -eq 0) {
             throw 'The guard self-test did not reject a direct nested PowerShell launch.'
         }
@@ -289,6 +293,16 @@ Process.Start(startInfo);
         }
         if (@(Get-CSharpLaunchViolations $embeddedDotNetSafePath).Count -ne 0) {
             throw 'The guard self-test rejected a contained embedded .NET process launch.'
+        }
+
+        . $helperPath
+        Invoke-NestedPwsh -ArgumentList @('-NoProfile', '-NonInteractive', '-File', $successfulProcessPath)
+        if ($global:LASTEXITCODE -ne 0) {
+            throw "The nested PowerShell helper did not preserve a successful child exit code: $global:LASTEXITCODE."
+        }
+        Invoke-NestedPwsh -ArgumentList @('-NoProfile', '-NonInteractive', '-File', $failingProcessPath)
+        if ($global:LASTEXITCODE -ne 23) {
+            throw "The nested PowerShell helper did not preserve a failing child exit code: $global:LASTEXITCODE."
         }
     }
     finally {
