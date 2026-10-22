@@ -23,6 +23,7 @@ if ($global:LASTEXITCODE -ne 0) { throw 'Nested PowerShell launch guard failed.'
 function Fail-Contract {
     param([string]$Message)
 
+    [Console]::Error.WriteLine("Release contract validation failed: $Message")
     throw "Release contract validation failed: $Message"
 }
 
