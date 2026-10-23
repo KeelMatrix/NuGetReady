@@ -217,6 +217,8 @@ if ($SelfTest) {
         $csharpDirectPath = Join-Path $selfTestRoot 'direct.cs'
         $embeddedDotNetPath = Join-Path $selfTestRoot 'embedded-dotnet.cs'
         $embeddedDotNetSafePath = Join-Path $selfTestRoot 'embedded-dotnet-safe.cs'
+        $successfulProcessPath = Join-Path $selfTestRoot 'successful-process.ps1'
+        $failingProcessPath = Join-Path $selfTestRoot 'failing-process.ps1'
         [IO.File]::WriteAllText($directPath, '& pwsh -NoProfile')
         [IO.File]::WriteAllText($processPath, "Start-Process 'example.exe'")
         [IO.File]::WriteAllText($embeddedPath, @'
@@ -254,6 +256,12 @@ Process.Start(startInfo);
         [IO.File]::WriteAllText($csharpDirectPath, 'Process.Start("example.exe");')
         [IO.File]::WriteAllText($embeddedDotNetPath, 'var script = "$psi = [System.Diagnostics.ProcessStartInfo]::new(); $psi.UseShellExecute = $false; [System.Diagnostics.Process]::Start($psi);";')
         [IO.File]::WriteAllText($embeddedDotNetSafePath, 'var script = "$psi = [System.Diagnostics.ProcessStartInfo]::new(); $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true; [System.Diagnostics.Process]::Start($psi);";')
+        [IO.File]::WriteAllText($successfulProcessPath, @'
+[Console]::Out.WriteLine('nested stdout marker')
+[Console]::Error.WriteLine('nested stderr marker')
+exit 0
+'@)
+        [IO.File]::WriteAllText($failingProcessPath, 'exit 23')
         if (@(Get-LaunchViolations $directPath).Count -eq 0) {
             throw 'The guard self-test did not reject a direct nested PowerShell launch.'
         }
@@ -289,6 +297,39 @@ Process.Start(startInfo);
         }
         if (@(Get-CSharpLaunchViolations $embeddedDotNetSafePath).Count -ne 0) {
             throw 'The guard self-test rejected a contained embedded .NET process launch.'
+        }
+
+        . $helperPath
+        $originalStandardOutput = [Console]::Out
+        $originalStandardError = [Console]::Error
+        $capturedStandardOutput = [IO.StringWriter]::new()
+        $capturedStandardError = [IO.StringWriter]::new()
+        try {
+            [Console]::SetOut($capturedStandardOutput)
+            [Console]::SetError($capturedStandardError)
+            Invoke-NestedPwsh -ArgumentList @('-NoProfile', '-NonInteractive', '-File', $successfulProcessPath)
+            $successfulExitCode = $global:LASTEXITCODE
+            $successfulStandardOutput = $capturedStandardOutput.ToString()
+            $successfulStandardError = $capturedStandardError.ToString()
+        }
+        finally {
+            [Console]::SetOut($originalStandardOutput)
+            [Console]::SetError($originalStandardError)
+            $capturedStandardOutput.Dispose()
+            $capturedStandardError.Dispose()
+        }
+        if ($successfulExitCode -ne 0) {
+            throw "The nested PowerShell helper did not preserve a successful child exit code: $successfulExitCode."
+        }
+        if (-not $successfulStandardOutput.Contains('nested stdout marker')) {
+            throw 'The nested PowerShell helper did not preserve child standard output.'
+        }
+        if (-not $successfulStandardError.Contains('nested stderr marker')) {
+            throw 'The nested PowerShell helper did not preserve child standard error.'
+        }
+        Invoke-NestedPwsh -ArgumentList @('-NoProfile', '-NonInteractive', '-File', $failingProcessPath)
+        if ($global:LASTEXITCODE -ne 23) {
+            throw "The nested PowerShell helper did not preserve a failing child exit code: $global:LASTEXITCODE."
         }
     }
     finally {

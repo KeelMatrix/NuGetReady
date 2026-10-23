@@ -15,14 +15,15 @@ $ErrorActionPreference = "Stop"
 $repositoryRootPath = (Resolve-Path $RepositoryRoot).Path
 . (Join-Path $PSScriptRoot '../build/Invoke-NestedPwsh.ps1')
 $launchGuard = Join-Path $repositoryRootPath 'build/Test-NestedPwshLaunch.ps1'
-& $launchGuard -SelfTest
-if ($LASTEXITCODE -ne 0) { throw 'Nested PowerShell launch guard self-test failed.' }
-& $launchGuard
-if ($LASTEXITCODE -ne 0) { throw 'Nested PowerShell launch guard failed.' }
+Invoke-NestedPwsh -SuppressOutput -ArgumentList @('-NoProfile', '-NonInteractive', '-File', $launchGuard, '-SelfTest')
+if ($global:LASTEXITCODE -ne 0) { throw 'Nested PowerShell launch guard self-test failed.' }
+Invoke-NestedPwsh -SuppressOutput -ArgumentList @('-NoProfile', '-NonInteractive', '-File', $launchGuard)
+if ($global:LASTEXITCODE -ne 0) { throw 'Nested PowerShell launch guard failed.' }
 
 function Fail-Contract {
     param([string]$Message)
 
+    [Console]::Error.WriteLine("Release contract validation failed: $Message")
     throw "Release contract validation failed: $Message"
 }
 
