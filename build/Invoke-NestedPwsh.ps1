@@ -1,6 +1,8 @@
 function Invoke-NestedPwsh {
     [CmdletBinding()]
     param(
+        [switch]$SuppressOutput,
+
         [Parameter(Mandatory = $true, Position = 0, ValueFromRemainingArguments = $true)]
         [object[]]$ArgumentList
     )
@@ -30,6 +32,32 @@ function Invoke-NestedPwsh {
 
     $pwshExecutable = 'pwsh'
     $nativeArguments = $pwshArguments.ToArray()
-    & $pwshExecutable @nativeArguments
-    $global:LASTEXITCODE = $LASTEXITCODE
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $pwshExecutable
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.CreateNoWindow = $true
+    if ([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
+            [System.Runtime.InteropServices.OSPlatform]::Windows)) {
+        $startInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+    }
+    foreach ($argument in $nativeArguments) {
+        [void]$startInfo.ArgumentList.Add([string]$argument)
+    }
+
+    $process = [System.Diagnostics.Process]::Start($startInfo)
+    try {
+        $standardOutput = $process.StandardOutput.ReadToEndAsync()
+        $standardError = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+        $global:LASTEXITCODE = $process.ExitCode
+        if (-not $SuppressOutput) {
+            [Console]::Out.Write($standardOutput.GetAwaiter().GetResult())
+            [Console]::Error.Write($standardError.GetAwaiter().GetResult())
+        }
+    }
+    finally {
+        $process.Dispose()
+    }
 }

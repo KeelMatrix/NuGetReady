@@ -108,7 +108,7 @@ function Assert-NuspecContract {
     Assert-Contract ($groups.Count -eq 1 -and $groups[0].targetFramework -eq "net8.0") "Expected one net8.0 dependency group."
     $dependencies = @($groups[0].SelectNodes("n:dependency", $namespace))
     $dependencyIds = @($dependencies | ForEach-Object { $_.id } | Sort-Object)
-    Assert-Contract (($dependencyIds -join ",") -eq "KeelMatrix.Telemetry,NuGet.Packaging,YamlDotNet") "Unexpected dependency set: $($dependencyIds -join ', ')."
+    Assert-Contract (($dependencyIds -join ",") -eq "KeelMatrix.Telemetry,NuGet.Packaging,System.Security.Cryptography.Pkcs,YamlDotNet") "Unexpected dependency set: $($dependencyIds -join ', ')."
     $telemetry = $dependencies | Where-Object { $_.id -eq "KeelMatrix.Telemetry" } | Select-Object -First 1
     Assert-Contract ($null -ne $telemetry) "KeelMatrix.Telemetry dependency is missing."
     Assert-Contract ($telemetry.version -eq "[0.1.1]") "KeelMatrix.Telemetry must be pinned to [0.1.1]."
@@ -117,6 +117,9 @@ function Assert-NuspecContract {
     Assert-Contract ($null -ne $yaml) "YamlDotNet dependency is missing."
     Assert-Contract ($yaml.version -eq "18.1.0") "YamlDotNet must use version 18.1.0."
     Assert-Contract ($yaml.exclude -eq "Build,Analyzers") "YamlDotNet dependency exclusions are incorrect."
+    $pkcs = $dependencies | Where-Object { $_.id -eq "System.Security.Cryptography.Pkcs" } | Select-Object -First 1
+    Assert-Contract ($null -ne $pkcs) "System.Security.Cryptography.Pkcs dependency is missing."
+    Assert-Contract ($pkcs.version -eq "8.0.2") "System.Security.Cryptography.Pkcs must be pinned to 8.0.2."
 }
 
 function Inspect-Archive {
